@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# bump_and_publish.sh — bump the caps-sa version in Cargo.toml, commit + tag
-# + push, and optionally `cargo publish` to crates.io.
+# bump_and_publish.sh — bump the caps-sa version in Cargo.toml + Cargo.lock,
+# commit + tag + push, and optionally `cargo publish` to crates.io.
 #
-# caps-sa is a library crate; Cargo.lock is gitignored (see .gitignore), so
-# this script only edits Cargo.toml. The workspace-level lockfile sitting one
-# directory up is regenerated automatically by `cargo check` / `cargo build`
-# runs in the parent workspace and is not part of the crate's git history.
+# Both Cargo.toml and the standalone Cargo.lock that lives next to it are
+# committed (see the 2023 Rust recommendation:
+# https://blog.rust-lang.org/2023/08/29/committing-lockfiles/). The
+# workspace-level lockfile one directory up belongs to the rustar-aligner
+# workspace and is irrelevant to a standalone clone of caps-sa.
 
 die() {
     echo "error: $*" >&2
@@ -22,8 +23,8 @@ Usage:
 
 Options:
   --publish  Publish to crates.io after bumping, committing, tagging, and pushing
-  --dry-run  Show what would be done without modifying Cargo.toml, creating
-             commits or tags, pushing, or publishing
+  --dry-run  Show what would be done without modifying Cargo.toml /
+             Cargo.lock, creating commits or tags, pushing, or publishing
   -h, --help Show this help message
 EOF
 }
@@ -84,10 +85,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 ROOT_CARGO="Cargo.toml"
+LOCKFILE="Cargo.lock"
 TAG="v${VERSION}"
 CRATE_NAME="caps-sa"
 TMP_TARGET_DIR=""
 MANIFEST_BACKUP=""
+LOCKFILE_BACKUP=""
 MANIFEST_UPDATED=false
 COMMIT_CREATED=false
 
@@ -98,18 +101,24 @@ cleanup() {
         rm -rf "$TMP_TARGET_DIR"
     fi
 
-    # If anything failed after we rewrote Cargo.toml but before the release
-    # commit landed, restore the manifest from backup so the working tree
-    # is left as we found it.
+    # If anything failed after we rewrote Cargo.toml / Cargo.lock but
+    # before the release commit landed, restore from backup so the
+    # working tree is left as we found it.
     if [[ "$status" -ne 0 && "$DRY_RUN" == false && "$MANIFEST_UPDATED" == true && "$COMMIT_CREATED" == false ]]; then
         if [[ -n "$MANIFEST_BACKUP" && -f "$MANIFEST_BACKUP" ]]; then
             cp "$MANIFEST_BACKUP" "$ROOT_CARGO"
-            echo "restored $ROOT_CARGO after failure" >&2
         fi
+        if [[ -n "$LOCKFILE_BACKUP" && -f "$LOCKFILE_BACKUP" ]]; then
+            cp "$LOCKFILE_BACKUP" "$LOCKFILE"
+        fi
+        echo "restored $ROOT_CARGO and $LOCKFILE after failure" >&2
     fi
 
     if [[ -n "$MANIFEST_BACKUP" && -f "$MANIFEST_BACKUP" ]]; then
         rm -f "$MANIFEST_BACKUP"
+    fi
+    if [[ -n "$LOCKFILE_BACKUP" && -f "$LOCKFILE_BACKUP" ]]; then
+        rm -f "$LOCKFILE_BACKUP"
     fi
 
     return "$status"
@@ -118,6 +127,7 @@ cleanup() {
 trap cleanup EXIT
 
 [[ -f "$ROOT_CARGO" ]] || die "not found: $ROOT_CARGO"
+[[ -f "$LOCKFILE" ]] || die "not found: $LOCKFILE (run \`cargo generate-lockfile\` first or commit the existing lockfile)"
 
 CURRENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
 [[ -n "$CURRENT_VERSION" ]] || die "could not determine current crate version from $ROOT_CARGO"
@@ -165,10 +175,14 @@ TMP_TARGET_DIR=""
 
 echo "Updating $ROOT_CARGO"
 echo "  version: $CURRENT_VERSION -> $VERSION"
+echo "Updating $LOCKFILE"
+echo "  ${CRATE_NAME} package entry: $CURRENT_VERSION -> $VERSION"
 
 if [[ "$DRY_RUN" == false ]]; then
     MANIFEST_BACKUP="$(mktemp "${TMPDIR:-/tmp}/caps-sa-Cargo.toml.XXXXXX")"
+    LOCKFILE_BACKUP="$(mktemp "${TMPDIR:-/tmp}/caps-sa-Cargo.lock.XXXXXX")"
     cp "$ROOT_CARGO" "$MANIFEST_BACKUP"
+    cp "$LOCKFILE" "$LOCKFILE_BACKUP"
 
     # Rewrite only the first `version = "..."` line — the one inside the
     # [package] table at the top of the manifest. Workspace dependency
@@ -177,14 +191,24 @@ if [[ "$DRY_RUN" == false ]]; then
     sed -i.bak "1,/^version = /s/^version = \".*\"/version = \"${VERSION}\"/" "$ROOT_CARGO"
     rm -f "${ROOT_CARGO}.bak"
 
+    # Rewrite the caps-sa entry's version in Cargo.lock. The lockfile
+    # lists each crate as `[[package]]` with `name = "caps-sa"` followed
+    # by `version = "..."` and then a `dependencies = [` block. Limit the
+    # sed range to that block so other packages aren't touched.
+    sed -i.bak "/^name = \"${CRATE_NAME}\"$/,/^dependencies = \\[$/s/^version = \".*\"/version = \"${VERSION}\"/" "$LOCKFILE"
+    rm -f "${LOCKFILE}.bak"
+
     MANIFEST_UPDATED=true
 else
-    echo "Dry-run: would rewrite $ROOT_CARGO"
+    echo "Dry-run: would rewrite $ROOT_CARGO and $LOCKFILE"
 fi
 
 if [[ "$DRY_RUN" == false ]]; then
     UPDATED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
+    UPDATED_LOCK_VERSION="$(sed -n "/^name = \"${CRATE_NAME}\"$/,/^dependencies = \\[$/s/^version = \"\(.*\)\"/\1/p" "$LOCKFILE" | head -1)"
+
     [[ "$UPDATED_VERSION" == "$VERSION" ]] || die "crate version update failed"
+    [[ "$UPDATED_LOCK_VERSION" == "$VERSION" ]] || die "lockfile version update failed"
 fi
 
 echo
@@ -199,7 +223,7 @@ else
     TMP_TARGET_DIR=""
 fi
 
-run git add "$ROOT_CARGO"
+run git add "$ROOT_CARGO" "$LOCKFILE"
 run git commit -m "chore(release): bump ${CRATE_NAME} to v${VERSION}"
 
 if [[ "$DRY_RUN" == false ]]; then
