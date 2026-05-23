@@ -248,6 +248,12 @@ impl<T: BucketRecord> ExtMemBucket<T> {
     ///
     /// Panics if the bucket is empty (no records were ever added) — callers
     /// should check `total_records() > 0` first.
+    ///
+    /// Currently unused by the Phase 2b sample-sort path (which loads each
+    /// partition fully into RAM via [`Self::load_all`]); retained for the
+    /// streaming p-way merge that may return as a future fast-path
+    /// fallback for non-repetitive inputs.
+    #[allow(dead_code)]
     pub fn open_reader(&mut self) -> io::Result<BufReader<File>> {
         self.flush()?;
         if let Some(w) = self.writer.as_mut() {

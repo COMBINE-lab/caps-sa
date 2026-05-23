@@ -159,8 +159,11 @@ pub(crate) fn merge_sort<S, I>(
 /// `x` / `lcp_x` and `y` / `lcp_y` must each be sorted with `lcp_*[0] == 0`
 /// and `lcp_*[i] = lcp(arr[i-1], arr[i])` for `i >= 1`. The result is written
 /// into `z` / `lcp_z` (length `x.len() + y.len()`).
+///
+/// Visible to the rest of the crate so the external-memory path can cascade
+/// 2-way merges across each partition's sub-subarrays during Phase 4.
 #[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + ctx
-fn merge<S, I>(
+pub(crate) fn merge<S, I>(
     text: &[S],
     x: &[I],
     y: &[I],
