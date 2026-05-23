@@ -318,13 +318,22 @@ where
     lo
 }
 
-/// Phase 4 + 5: for each partition, load its bucket into RAM, cascade
-/// 2-way LCP-enhanced merge across the sub-subarrays, and stream each
-/// merged position to `emit`.
+/// Phase 4 + 5: parallel-merge partitions in chunks of `num_threads`,
+/// emitting each chunk's results in lex order before starting the next.
 ///
-/// A single [`CascadeWorkspace`] is reused across all partitions so the
-/// only allocations per partition are the bucket `load_all` and the small
-/// `run_lens` book-keeping vector — no per-merge-step `Vec` allocations.
+/// Each worker thread holds its own [`CascadeWorkspace`] for the duration
+/// of one partition merge. Within a chunk, all `T` workspaces live in
+/// parallel; between chunks, they are dropped (so peak workspace memory
+/// scales with `T`, not with the number of partitions). The merged result
+/// for each partition is then drained sequentially via `emit` to preserve
+/// streaming-output order without ever holding the full SA in RAM.
+///
+/// Peak transient RAM ≈ `T × max_partition_size × 16 bytes` for the
+/// merged-result buffers, plus the workspaces themselves (~`2 × T ×
+/// max_partition_size × 16` bytes). On a typical run with `p = 4 × T`
+/// subarrays the per-partition size is `≈ n / p`, so this stays
+/// proportional to `n / 4 = 0.25 n` even at the peak — well below the
+/// in-memory path's `~4 n` working set.
 fn phase4_merge_and_emit<S, F>(
     text: &[S],
     partition_buckets: &mut [ExtMemBucket<SaLcp>],
@@ -335,18 +344,41 @@ where
     S: Ord + Copy + Sync,
     F: FnMut(u64) -> io::Result<()>,
 {
-    let mut workspace = CascadeWorkspace::new();
-    for bucket in partition_buckets.iter_mut() {
-        if bucket.total_records() == 0 {
-            continue;
-        }
-        let records = bucket.load_all()?;
-        let boundaries: Vec<usize> = bucket.boundaries().to_vec();
+    let n_partitions = partition_buckets.len();
+    if n_partitions == 0 {
+        return Ok(());
+    }
+    let chunk_size = rayon::current_num_threads().max(1);
 
-        let merged = workspace.cascade_merge(text, &records, &boundaries, max_ctx);
-        for &pos in merged {
-            emit(pos)?;
+    let mut start = 0;
+    while start < n_partitions {
+        let end = (start + chunk_size).min(n_partitions);
+        let chunk = &mut partition_buckets[start..end];
+
+        // Parallel-merge each non-empty bucket in this chunk. `par_iter_mut`
+        // preserves index order in the collected `Vec`, so the subsequent
+        // sequential emit yields positions in lex order.
+        let merged: Vec<Vec<u64>> = chunk
+            .par_iter_mut()
+            .map(|bucket| -> io::Result<Vec<u64>> {
+                if bucket.total_records() == 0 {
+                    return Ok(Vec::new());
+                }
+                let records = bucket.load_all()?;
+                let boundaries: Vec<usize> = bucket.boundaries().to_vec();
+                let mut workspace = CascadeWorkspace::new();
+                let result = workspace.cascade_merge(text, &records, &boundaries, max_ctx);
+                Ok(result.to_vec())
+            })
+            .collect::<Result<Vec<_>, io::Error>>()?;
+
+        for positions in merged {
+            for pos in positions {
+                emit(pos)?;
+            }
         }
+
+        start = end;
     }
     Ok(())
 }
