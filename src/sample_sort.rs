@@ -109,7 +109,10 @@ where
 /// Post: `sa` is sorted in ascending lexicographic order on
 /// `text[sa[i]..]`; `lcp_arr[0] = 0` and `lcp_arr[i] = lcp(text[sa[i-1]..],
 /// text[sa[i]..])` for `i >= 1`.
-fn merge_sort<S, I>(
+///
+/// Visible to the rest of the crate so the external-memory path can sort
+/// individual subarrays of positions using the same kernel.
+pub(crate) fn merge_sort<S, I>(
     text: &[S],
     sa: &mut [I],
     sa_w: &mut [I],

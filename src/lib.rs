@@ -17,9 +17,11 @@
 //! [CaPS-SA]: https://github.com/jamshed/CaPS-SA
 
 mod ext_bucket;
+mod ext_mem;
 mod lcp;
 mod sample_sort;
 
+pub use ext_mem::{ExtMemOpts, build_ext_mem};
 pub use lcp::{lcp, suffix_cmp};
 pub use sample_sort::{Opts, build_in_memory, build_in_memory_with_opts};
 
