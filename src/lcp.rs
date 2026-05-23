@@ -1,47 +1,133 @@
 //! Suffix comparison primitives over a generic text.
 //!
 //! Mirrors CaPS-SA's `Suffix_Array::LCP` family (see `include/Suffix_Array.hpp`
-//! and `include/Genomic_Text.hpp`). The generic `lcp` and `suffix_cmp`
-//! entry points dispatch at runtime to a [`u8`]-specialized SIMD path
-//! (AVX2 on x86_64, NEON on aarch64) when the symbol type is `u8`; for
-//! any other type, they fall back to a portable scalar byte-loop.
+//! and `include/Genomic_Text.hpp`). Performance-critical callers (the
+//! merge-sort and cascade-merge inner loops) construct a [`LcpDispatch`]
+//! **once** at the top of the SA build and pass it through. The dispatch
+//! holds a function pointer chosen by [`is_x86_feature_detected!`] /
+//! [`is_aarch64_feature_detected!`] at construction time, so the hot path
+//! is a single indirect call through a register — no per-call atomic
+//! loads, no per-call feature-detection branches, no per-call `TypeId`
+//! checks once monomorphization has resolved `S`.
 //!
-//! The `lcp_*` functions return the length of the common prefix of two
-//! suffixes, bounded by `max_ctx`. They do **not** decide ordering;
-//! callers resolve ordering from the symbol immediately past the common
-//! prefix (or, if both suffixes are exhausted within `max_ctx`, from
-//! their positions — the standard "shorter suffix is smaller"
-//! convention only triggers when the actual text length cuts the
-//! comparison off).
+//! The free-standing [`lcp`] / [`suffix_cmp`] / [`lcp_u8`] helpers remain
+//! for one-off callers (and for the tests in this file). They construct a
+//! [`LcpDispatch`] on every call and are correspondingly slower; algorithm
+//! kernels should prefer the methods on [`LcpDispatch`].
 
 use std::any::TypeId;
 use std::cmp::Ordering;
 
-/// Longest common prefix of the suffixes `text[p..]` and `text[q..]`,
-/// bounded by `max_ctx` symbols.
+/// A function-pointer dispatch for byte-text LCP. The architecture-specific
+/// pointer is selected once at construction by feature detection; later
+/// calls reduce to a register-resident indirect call.
 ///
-/// When `S` is `u8`, dispatches to AVX2 (x86_64) or NEON (aarch64) at
-/// runtime via [`is_x86_feature_detected!`] / [`is_aarch64_feature_detected!`];
-/// otherwise uses a scalar byte-loop. The `'static` bound is required
-/// for the `TypeId`-based runtime check.
+/// `LcpDispatch` is `Copy`, `Send`, and `Sync` (a function pointer is all
+/// three), so it threads freely through `rayon` boundaries.
+#[derive(Copy, Clone)]
+pub struct LcpDispatch {
+    lcp_u8_fn: LcpU8Fn,
+}
+
+/// Internal function-pointer type for the `u8`-specialized LCP path.
+/// `unsafe fn` because the AVX2 / NEON variants are `#[target_feature]`
+/// gated; the dispatch's owner has already verified CPU support.
+type LcpU8Fn = unsafe fn(&[u8], usize, usize, usize) -> usize;
+
+impl LcpDispatch {
+    /// Detect the best LCP implementation for this CPU. Cheap (a couple
+    /// of `is_*_feature_detected!` checks) but does still touch the
+    /// feature-detection cache, so call it **once** per top-level build.
+    pub fn detect() -> Self {
+        Self {
+            lcp_u8_fn: pick_lcp_u8_impl(),
+        }
+    }
+
+    /// Forced scalar dispatch — useful for tests and for clients that
+    /// want a deterministic baseline.
+    pub fn scalar() -> Self {
+        Self {
+            lcp_u8_fn: lcp_u8_scalar,
+        }
+    }
+
+    /// Longest common prefix of `text[p..]` and `text[q..]`, bounded by
+    /// `max_ctx`. Dispatches to the captured byte-text fast path when
+    /// `S` is `u8`; falls back to portable scalar for any other symbol
+    /// type.
+    #[inline]
+    pub fn lcp<S>(&self, text: &[S], p: usize, q: usize, max_ctx: usize) -> usize
+    where
+        S: Eq + 'static,
+    {
+        if TypeId::of::<S>() == TypeId::of::<u8>() {
+            // SAFETY: the `TypeId` check guarantees `S == u8`, so `&[S]`
+            // and `&[u8]` are the same type at runtime. We reinterpret
+            // the slice header without changing its length/alignment.
+            // After monomorphization on a concrete `S` and with LTO this
+            // whole branch folds to either the byte path or the scalar
+            // path with no runtime test.
+            let text_u8: &[u8] =
+                unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
+            return unsafe { (self.lcp_u8_fn)(text_u8, p, q, max_ctx) };
+        }
+        lcp_scalar(text, p, q, max_ctx)
+    }
+
+    /// Total order on two suffixes of `text`. Uses [`Self::lcp`] for the
+    /// shared prefix, then resolves the first differing symbol or — if
+    /// both suffixes are exhausted within `max_ctx` — orders by remaining
+    /// length (shorter is smaller, the convention SAIS and CaPS-SA use).
+    #[inline]
+    pub fn suffix_cmp<S>(&self, text: &[S], p: usize, q: usize, max_ctx: usize) -> Ordering
+    where
+        S: Ord + 'static,
+    {
+        let n = text.len();
+        let lim_p = n - p;
+        let lim_q = n - q;
+        let lim = lim_p.min(lim_q).min(max_ctx);
+        let common = self.lcp(text, p, q, max_ctx);
+        if common < lim {
+            text[p + common].cmp(&text[q + common])
+        } else {
+            lim_p.cmp(&lim_q)
+        }
+    }
+}
+
+/// One-off LCP. Constructs a fresh [`LcpDispatch`] on every call — fine
+/// for tests / introspection, slower than reusing one [`LcpDispatch`]
+/// across an algorithm's inner loop.
 #[inline]
 pub fn lcp<S>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usize
 where
     S: Eq + 'static,
 {
-    if TypeId::of::<S>() == TypeId::of::<u8>() {
-        // SAFETY: the `TypeId` check guarantees `S == u8`, so `&[S]` and
-        // `&[u8]` are the same type at runtime. We reinterpret the slice
-        // header without changing its length/alignment.
-        let text_u8: &[u8] =
-            unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-        return lcp_u8(text_u8, p, q, max_ctx);
-    }
-    lcp_scalar(text, p, q, max_ctx)
+    LcpDispatch::detect().lcp(text, p, q, max_ctx)
 }
 
-/// Generic scalar LCP fallback. Public so callers that already know
-/// their symbol type isn't `u8` can skip the dispatch.
+/// One-off suffix comparison; see [`lcp`] for the cost note.
+#[inline]
+pub fn suffix_cmp<S>(text: &[S], p: usize, q: usize, max_ctx: usize) -> Ordering
+where
+    S: Ord + 'static,
+{
+    LcpDispatch::detect().suffix_cmp(text, p, q, max_ctx)
+}
+
+/// One-off `u8`-typed LCP that auto-selects AVX2 / NEON / scalar. Skips
+/// the generic `TypeId` branch; otherwise equivalent in cost to
+/// [`lcp`] for byte texts.
+#[inline]
+pub fn lcp_u8(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+    let f = pick_lcp_u8_impl();
+    unsafe { f(text, p, q, max_ctx) }
+}
+
+/// Generic scalar LCP. Public so callers that already know their symbol
+/// type isn't `u8` can skip both dispatch and `TypeId` check.
 #[inline]
 pub fn lcp_scalar<S: Eq>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usize {
     let n = text.len();
@@ -58,24 +144,26 @@ pub fn lcp_scalar<S: Eq>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usiz
     i
 }
 
-/// `u8`-specialized LCP. Runtime-dispatches to AVX2 or NEON when the
-/// CPU supports it; otherwise scalar.
-#[inline]
-pub fn lcp_u8(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+/// Inspect this CPU's features and return the best [`LcpU8Fn`].
+fn pick_lcp_u8_impl() -> LcpU8Fn {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: feature check is positive.
-            return unsafe { lcp_u8_avx2(text, p, q, max_ctx) };
+            return lcp_u8_avx2;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
-            // SAFETY: feature check is positive.
-            return unsafe { lcp_u8_neon(text, p, q, max_ctx) };
+            return lcp_u8_neon;
         }
     }
+    lcp_u8_scalar
+}
+
+/// `unsafe fn`-typed scalar — wrapper around [`lcp_scalar`] so all three
+/// dispatch targets share the [`LcpU8Fn`] signature.
+unsafe fn lcp_u8_scalar(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
     lcp_scalar(text, p, q, max_ctx)
 }
 
@@ -105,7 +193,6 @@ unsafe fn lcp_u8_avx2(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize 
         }
         i += 32;
     }
-    // Tail: scalar.
     while i < lim {
         if text[p + i] != text[q + i] {
             return i;
@@ -116,8 +203,8 @@ unsafe fn lcp_u8_avx2(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize 
 }
 
 /// NEON path: 16-byte compares, locate the first differing byte via the
-/// "shrn by 4" movemask emulation — pack each `vceqq_u8` byte (`0xFF` or
-/// `0x00`) into 4 mask bits of a single 64-bit lane, then
+/// "shrn by 4" movemask emulation — pack each `vceqq_u8` byte
+/// (`0xFF` or `0x00`) into 4 mask bits of a single 64-bit lane, then
 /// `trailing_zeros / 4` gives the byte index.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
@@ -136,12 +223,10 @@ unsafe fn lcp_u8_neon(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize 
         // SAFETY: bounds ensured by the loop condition; unaligned loads.
         let va = unsafe { vld1q_u8(ptr.add(p + i)) };
         let vb = unsafe { vld1q_u8(ptr.add(q + i)) };
-        let eq = unsafe { vceqq_u8(va, vb) };
-        let narrow = unsafe { vshrn_n_u16::<4>(vreinterpretq_u16_u8(eq)) };
-        let mask = unsafe { vget_lane_u64::<0>(vreinterpret_u64_u8(narrow)) };
+        let eq = vceqq_u8(va, vb);
+        let narrow = vshrn_n_u16::<4>(vreinterpretq_u16_u8(eq));
+        let mask = vget_lane_u64::<0>(vreinterpret_u64_u8(narrow));
         if mask != u64::MAX {
-            // First differing nibble = first differing byte; 4 mask bits
-            // cover one byte of the original compare.
             return i + ((!mask).trailing_zeros() as usize / 4);
         }
         i += 16;
@@ -155,29 +240,6 @@ unsafe fn lcp_u8_neon(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize 
     i
 }
 
-/// Total order on two suffixes of `text`. Uses [`lcp`] to find the first
-/// differing symbol (so `u8` texts benefit from the SIMD path); when both
-/// suffixes are exhausted within `max_ctx`, the shorter remaining tail
-/// is smaller, matching the "$ is smallest" convention used by SAIS and
-/// CaPS-SA. With distinct end-sentinels in `text`, that branch is
-/// unreachable for distinct positions.
-#[inline]
-pub fn suffix_cmp<S>(text: &[S], p: usize, q: usize, max_ctx: usize) -> Ordering
-where
-    S: Ord + 'static,
-{
-    let n = text.len();
-    let lim_p = n - p;
-    let lim_q = n - q;
-    let lim = lim_p.min(lim_q).min(max_ctx);
-    let common = lcp(text, p, q, max_ctx);
-    if common < lim {
-        text[p + common].cmp(&text[q + common])
-    } else {
-        lim_p.cmp(&lim_q)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,7 +249,8 @@ mod tests {
         let text = b"banana";
         // suffix at 0: "banana", at 1: "anana". LCP = 0 (b vs a).
         assert_eq!(lcp(text, 0, 1, usize::MAX), 0);
-        // suffix at 1: "anana", at 3: "ana". LCP = 3 ("ana"), then diff (n vs end).
+        // suffix at 1: "anana", at 3: "ana". LCP = 3 ("ana"), then diff
+        // (n vs end).
         assert_eq!(lcp(text, 1, 3, usize::MAX), 3);
     }
 
@@ -217,8 +280,8 @@ mod tests {
         assert_eq!(suffix_cmp(text, 1, 1, usize::MAX), Ordering::Equal);
     }
 
-    /// SIMD vs scalar agreement across pathological positions: long
-    /// runs of identical bytes (exercises full-vector equal branches),
+    /// SIMD vs scalar agreement across pathological positions: long runs
+    /// of identical bytes (exercises full-vector equal branches),
     /// 32-byte and 16-byte boundary differences (covers AVX2 and NEON
     /// chunk sizes), and unaligned tail bytes.
     #[test]
@@ -226,23 +289,17 @@ mod tests {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xA5A5);
 
-        // (1) Long aaaa run with one mismatched byte at varying offsets.
         for diff_at in [0usize, 1, 31, 32, 33, 63, 64, 65, 100] {
-            let mut text: Vec<u8> = vec![b'A'; 200];
-            text[diff_at] = b'C';
-            // Compare suffix(0) and suffix(0) shifted by 0 — they're
-            // equal. So compare suffix(0) with a copy where the byte
-            // differs at diff_at:
-            // we build a 400-byte text where the first 200 are AAA... C ...AAA
-            // and the next 200 are pure A's; compare suffix(200) (all-A)
-            // with suffix(0) (has C at diff_at).
+            // Build a 400-byte text: first half is "AAA…CAAAA…" with C at
+            // `diff_at`, second half is all A's. The LCP between suffix
+            // 200 (all-A) and suffix 0 (has C at diff_at) is exactly
+            // diff_at.
             let mut combined = vec![b'A'; 400];
             combined[diff_at] = b'C';
             let got = lcp(&combined, 0, 200, usize::MAX);
             assert_eq!(got, diff_at, "wrong LCP at diff_at={diff_at}");
         }
 
-        // (2) Random texts cross-checked against scalar.
         for &n in &[1usize, 32, 33, 200, 1000] {
             let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..4u8)).collect();
             for _ in 0..20 {
@@ -253,5 +310,18 @@ mod tests {
                 assert_eq!(got, want, "p={p} q={q} text={text:?}");
             }
         }
+    }
+
+    /// Verify the cached-dispatch path matches both scalar and the
+    /// one-off helper on a tricky case spanning AVX2/NEON vector
+    /// boundaries.
+    #[test]
+    fn dispatch_struct_matches_oneoff_and_scalar() {
+        let scalar = LcpDispatch::scalar();
+        let detected = LcpDispatch::detect();
+        let mut text: Vec<u8> = vec![b'A'; 200];
+        text[64] = b'T'; // diff right at the second AVX2 boundary
+        assert_eq!(scalar.lcp(&text, 0, 100, usize::MAX), 64 - 0);
+        assert_eq!(detected.lcp(&text, 0, 100, usize::MAX), 64 - 0);
     }
 }

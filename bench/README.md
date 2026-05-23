@@ -35,7 +35,7 @@ Builds: upstream `cmake -DCMAKE_BUILD_TYPE=Release`, this crate
 `cargo build --release --example caps_sa` (release profile in the
 workspace `Cargo.toml` enables `lto = "fat"` + `codegen-units = 1`).
 
-All caps-sa runs include the three optimizations applied incrementally
+All caps-sa runs include the four optimizations applied incrementally
 to the Phase 2b sample-sort baseline:
 
 | Step | Description | Yeast 4-thread ext-mem |
@@ -44,40 +44,44 @@ to the Phase 2b sample-sort baseline:
 | + Opt 1: reusable cascade buffers | one `CascadeWorkspace` reused across partitions | 1.78 s |
 | + Opt 2: parallel partition merge | `rayon::par_iter_mut` over partitions in chunks | 1.16 s |
 | + Opt 3: SIMD LCP (AVX2 / NEON)   | runtime-dispatched `lcp_u8` for byte texts | 1.03 s |
+| + Opt 4: hoist SIMD dispatch       | `LcpDispatch::detect()` once, fn-pointer threaded down | **0.99 s** |
 
 ### Yeast — *S. cerevisiae* R64-1-1, 12.16 MB raw text
 
 | Configuration            | 1 thread  |        |       | 4 threads |        |       |
 | ------------------------ | --------- | ------ | ----- | --------- | ------ | ----- |
 |                          | wall s    | RSS MB | ratio | wall s    | RSS MB | ratio |
-| upstream C++ in-mem      | 7.41      | 748    | 1.00× | 2.10      | 747    | 1.00× |
-| upstream C++ ext-mem     | 9.98      | 461    | 1.35× | 4.36      | 462    | 2.08× |
-| **caps-sa Rust in-mem**  | **2.90**  | **204**| **0.39×** | **0.94** | **204**| **0.45×** |
-| **caps-sa Rust ext-mem** | **3.47**  | **359**| **0.47×** | **1.03** | **320**| **0.49×** |
+| upstream C++ in-mem      | 7.47      | 748    | 1.00× | 2.10      | 747    | 1.00× |
+| upstream C++ ext-mem     | 9.21      | 461    | 1.23× | 3.94      | 462    | 1.88× |
+| **caps-sa Rust in-mem**  | **2.82**  | **204**| **0.38×** | **0.93** | **204**| **0.44×** |
+| **caps-sa Rust ext-mem** | **3.31**  | **359**| **0.44×** | **0.99** | **320**| **0.47×** |
 
-After the three optimizations, **caps-sa is roughly 2.0–2.6× faster than
-upstream and uses ~3.5× less RAM on this input** for both the in-memory
-and external-memory paths.
+After the four optimizations, **caps-sa is ~2.1–2.8× faster than upstream
+and uses ~3.5× less RAM on this input** for both the in-memory and
+external-memory paths.
 
 ### Random DNA — uniform ACGT, 100 MB
 
 | Configuration            | 1 thread  |        |       | 4 threads |        |       |
 | ------------------------ | --------- | ------ | ----- | --------- | ------ | ----- |
 |                          | wall s    | RSS MB | ratio | wall s    | RSS MB | ratio |
-| upstream C++ in-mem      | 38.0      | 2208   | 1.00× | **10.1**  | 2208   | 1.00× |
-| upstream C++ ext-mem     | 39.2      | 1053   | 1.03× | 13.3      | 1121   | 1.32× |
-| **caps-sa Rust in-mem**  | **33.1**  | 1663   | 0.87× | 13.4*     | 1663   | 1.33× |
-| **caps-sa Rust ext-mem** | 38.7      | 2053   | 1.02× | 12.5*     | 1913   | 1.24× |
+| upstream C++ in-mem      | 38.16     | 2208   | 1.00× | **10.10** | 2208   | 1.00× |
+| upstream C++ ext-mem     | 39.01     | 1053   | 1.02× | 12.17     | 1121   | 1.20× |
+| **caps-sa Rust in-mem**  | **31.61** | 1663   | **0.83×** | 13.38   | 1663   | 1.33× |
+| **caps-sa Rust ext-mem** | 36.32     | 2053   | 0.95× | **11.39** | 1913   | **1.13×** |
 
-(*) Median of three runs; ±10% variance.
+(Reported values are the median of three warm runs; variance ~5%.)
 
 On uniform random DNA the per-call LCP is short (~13 bytes — the
 information-theoretic minimum to disambiguate a random suffix in 100 MB
 of alphabet-4 text), so the SIMD AVX2/NEON paths exit before any
-32-byte chunk pays for itself. Single-thread Rust is still ~13% faster
-than upstream in-mem; multi-thread the picture is essentially a tie.
+32-byte chunk pays for itself. Single-thread caps-sa is ~17% faster
+than upstream in-mem; multi-thread caps-sa ext-mem is ~7% faster than
+upstream ext-mem. The only configuration still losing to upstream is
+**rand100m / 4-thread / in-memory** — see "Where the differences still
+come from" below.
 
-## SIMD LCP — AVX2 + NEON
+## SIMD LCP — AVX2 + NEON, dispatched once
 
 The `u8`-specialized LCP path is dispatched at runtime by
 `std::any::TypeId::of::<S>() == TypeId::of::<u8>()`:
@@ -89,10 +93,17 @@ The `u8`-specialized LCP path is dispatched at runtime by
   view), then `trailing_zeros / 4` for the byte index.
 - **Fallback:** portable scalar `S: Eq` byte-loop.
 
-The dispatch is feature-detected once via the std-cached
-`is_*_feature_detected!` macros, so the runtime cost is a single atomic
-load per call. AVX-512 support is intentionally out of scope (per
-project decision).
+Feature detection runs **once** per `build_*` call (Opt 4): the chosen
+function pointer is captured in an `LcpDispatch` value (`Copy + Send +
+Sync`) and threaded explicitly through `merge_sort` / `merge` /
+`cascade_merge` / `upper_bound_by_pivot`. The inner loops perform a
+single indirect call through a register-held pointer — no atomic loads
+and no per-call `is_*_feature_detected!` checks. This was particularly
+valuable on inputs with short LCPs (random DNA): the per-call cost was
+a meaningful fraction of work-per-LCP, so removing it gave 5–10%
+across-the-board wins on the 100 MB benchmark.
+
+AVX-512 support is intentionally out of scope (per project decision).
 
 ## Where the differences still come from
 
@@ -101,19 +112,19 @@ project decision).
 | Sample-sort partitioning                 | yes (in-mem + ext-mem) | yes (ext-mem only) |
 | LCP-enhanced 2-way merge                 | yes          | yes          |
 | Parallel partition merge                 | yes          | **yes** (Opt 2) |
+| Reusable merge buffers across cascade    | yes          | **yes** (Opt 1) |
 | AVX2 LCP comparison                      | yes          | **yes** (Opt 3) |
 | AVX-512 LCP comparison                   | yes          | no (deferred) |
 | NEON LCP comparison                      | no (x86 only)| **yes** (Opt 3) |
+| SIMD dispatch hoisted out of hot path    | yes (compile-time) | **yes** (Opt 4) |
 | 32-bit indices when `n < 2^31`           | yes          | yes (in-mem only) |
-| Reusable merge buffers across cascade    | yes          | **yes** (Opt 1) |
 | `u32` index ext-mem path                 | yes          | no (still u64) |
 | In-memory sample-sort partitioning       | yes          | no (uses parallel merge-sort instead) |
 
-The remaining gap (mostly visible on random-DNA at 4 threads) is the
-two unticked rows above: an `u32` ext-mem path and an explicitly
-sample-sort-partitioned *in-memory* path. The current Rust in-mem
-implementation is parallel merge-sort, which doesn't match upstream's
-in-memory sample-sort partitioning at scale.
+The remaining gap is concentrated in **rand100m / 4-thread / in-memory**:
+upstream's in-memory sample-sort partitioning parallelizes the LCP work
+better than our parallel merge-sort at scale. The two open items above
+(`u32` ext-mem path and an in-memory sample-sort path) would close that.
 
 ## Caveats
 

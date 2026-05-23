@@ -31,7 +31,7 @@
 //!   symbol scan and compare.
 
 use crate::Index;
-use crate::lcp::lcp;
+use crate::lcp::LcpDispatch;
 use rayon::join;
 
 /// Tunable options for SA construction.
@@ -88,6 +88,11 @@ where
     let mut lcp_arr: Vec<I> = vec![I::zero(); n];
     let mut lcp_w: Vec<I> = vec![I::zero(); n];
 
+    // Choose the LCP implementation once for the whole build; the captured
+    // function pointer travels through the recursion in a register, so the
+    // inner merge loop pays no atomic load or feature-detection branch.
+    let dispatch = LcpDispatch::detect();
+
     merge_sort(
         text,
         &mut sa,
@@ -95,6 +100,7 @@ where
         &mut lcp_arr,
         &mut lcp_w,
         opts.max_context,
+        dispatch,
     );
 
     sa
@@ -112,6 +118,7 @@ where
 ///
 /// Visible to the rest of the crate so the external-memory path can sort
 /// individual subarrays of positions using the same kernel.
+#[allow(clippy::too_many_arguments)] // 4 buffers + text + ctx + dispatch
 pub(crate) fn merge_sort<S, I>(
     text: &[S],
     sa: &mut [I],
@@ -119,6 +126,7 @@ pub(crate) fn merge_sort<S, I>(
     lcp_arr: &mut [I],
     lcp_w: &mut [I],
     max_ctx: usize,
+    dispatch: LcpDispatch,
 ) where
     S: Ord + Copy + Sync + 'static,
     I: Index,
@@ -142,14 +150,16 @@ pub(crate) fn merge_sort<S, I>(
     let (lcp_w_l, lcp_w_r) = lcp_w.split_at_mut(mid);
 
     join(
-        || merge_sort(text, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx),
-        || merge_sort(text, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx),
+        || merge_sort(text, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx, dispatch),
+        || merge_sort(text, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx, dispatch),
     );
 
     // Merge the two sorted halves (still living in `sa`) into the workspace,
     // then copy the workspace back into the destination so the caller's
     // postcondition holds on `sa` / `lcp_arr`.
-    merge(text, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx);
+    merge(
+        text, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx, dispatch,
+    );
     sa.copy_from_slice(sa_w);
     lcp_arr.copy_from_slice(lcp_w);
 }
@@ -162,7 +172,7 @@ pub(crate) fn merge_sort<S, I>(
 ///
 /// Visible to the rest of the crate so the external-memory path can cascade
 /// 2-way merges across each partition's sub-subarrays during Phase 4.
-#[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + ctx
+#[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + ctx + dispatch
 pub(crate) fn merge<S, I>(
     text: &[S],
     x: &[I],
@@ -172,6 +182,7 @@ pub(crate) fn merge<S, I>(
     z: &mut [I],
     lcp_z: &mut [I],
     max_ctx: usize,
+    dispatch: LcpDispatch,
 ) where
     S: Ord + Copy + 'static,
     I: Index,
@@ -225,7 +236,7 @@ pub(crate) fn merge<S, I>(
             let lim_a = n_text - p_a;
             let lim_b = n_text - p_b;
             let remaining_ctx = max_ctx.saturating_sub(m);
-            let ext = lcp(text, p_a + m, p_b + m, remaining_ctx);
+            let ext = dispatch.lcp(text, p_a + m, p_b + m, remaining_ctx);
             let total = m + ext;
             let a_smaller = if total < lim_a && total < lim_b {
                 text[p_a + total] < text[p_b + total]

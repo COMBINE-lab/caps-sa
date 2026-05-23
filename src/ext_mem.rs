@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::ext_bucket::{ExtMemBucket, SaLcp};
-use crate::lcp::suffix_cmp;
+use crate::lcp::LcpDispatch;
 use crate::sample_sort;
 
 /// Tunable options for [`build_ext_mem`].
@@ -94,21 +94,35 @@ where
 
     let p = effective_subproblem_count(n, opts.subproblem_count);
 
+    // Choose the LCP implementation once for the whole build. The
+    // captured function pointer rides through every phase (and across
+    // rayon thread boundaries — `LcpDispatch` is `Copy + Send + Sync`),
+    // so inner merge loops pay no atomic load or feature-detection
+    // branch per call.
+    let dispatch = LcpDispatch::detect();
+
     // Phase 1: sort each subarray; sample uniformly; spill (pos, lcp).
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill(text, n, p, opts)?;
+    let (mut subarray_buckets, samples) = phase1_sort_sample_spill(text, n, p, opts, dispatch)?;
 
     // Phase 2: globally sort samples; pick p-1 pivots.
-    let pivots = phase2_select_pivots(text, samples, p, opts.max_context);
+    let pivots = phase2_select_pivots(text, samples, p, opts.max_context, dispatch);
 
     // Phase 3: distribute each subarray into per-partition buckets.
-    let mut partition_buckets = phase3_distribute(text, &mut subarray_buckets, &pivots, p, opts)?;
+    let mut partition_buckets =
+        phase3_distribute(text, &mut subarray_buckets, &pivots, p, opts, dispatch)?;
 
     // Subarray buckets are no longer needed — drop early to release
     // their disk space.
     drop(subarray_buckets);
 
     // Phase 4 & 5: per-partition cascade merge + stream output.
-    phase4_merge_and_emit(text, &mut partition_buckets, opts.max_context, &mut emit)
+    phase4_merge_and_emit(
+        text,
+        &mut partition_buckets,
+        opts.max_context,
+        &mut emit,
+        dispatch,
+    )
 }
 
 fn effective_subproblem_count(n: usize, requested: usize) -> usize {
@@ -130,6 +144,7 @@ fn phase1_sort_sample_spill<S>(
     n: usize,
     p: usize,
     opts: &ExtMemOpts,
+    dispatch: LcpDispatch,
 ) -> io::Result<(Vec<ExtMemBucket<SaLcp>>, Vec<u64>)>
 where
     S: Ord + Copy + Sync + 'static,
@@ -161,6 +176,7 @@ where
                 &mut lcp_arr,
                 &mut lcp_w,
                 opts.max_context,
+                dispatch,
             );
 
             // Pull `samples_per_subarray` evenly-spaced positions out of
@@ -222,7 +238,13 @@ fn evenly_spaced<T: Copy>(xs: &[T], count: usize) -> Vec<T> {
 
 /// Phase 2: globally sort the pooled samples and pick `p − 1` pivots at
 /// evenly-spaced ranks.
-fn phase2_select_pivots<S>(text: &[S], mut samples: Vec<u64>, p: usize, max_ctx: usize) -> Vec<u64>
+fn phase2_select_pivots<S>(
+    text: &[S],
+    mut samples: Vec<u64>,
+    p: usize,
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+) -> Vec<u64>
 where
     S: Ord + Copy + Sync + 'static,
 {
@@ -233,7 +255,15 @@ where
     let mut sa_w = vec![0u64; n_samples];
     let mut lcp = vec![0u64; n_samples];
     let mut lcp_w = vec![0u64; n_samples];
-    sample_sort::merge_sort(text, &mut samples, &mut sa_w, &mut lcp, &mut lcp_w, max_ctx);
+    sample_sort::merge_sort(
+        text,
+        &mut samples,
+        &mut sa_w,
+        &mut lcp,
+        &mut lcp_w,
+        max_ctx,
+        dispatch,
+    );
 
     // p-1 pivots at evenly-spaced ranks across the sorted sample pool.
     (1..p).map(|j| samples[(j * n_samples) / p]).collect()
@@ -245,12 +275,14 @@ where
 /// boundaries, and append each sub-subarray to the corresponding partition
 /// bucket. Marks a [`ExtMemBucket::mark_boundary`] after each non-empty
 /// contribution so the per-partition merge can recover the runs.
+#[allow(clippy::too_many_arguments)]
 fn phase3_distribute<S>(
     text: &[S],
     subarray_buckets: &mut [ExtMemBucket<SaLcp>],
     pivots: &[u64],
     p: usize,
     opts: &ExtMemOpts,
+    dispatch: LcpDispatch,
 ) -> io::Result<Vec<ExtMemBucket<SaLcp>>>
 where
     S: Ord + Copy + 'static,
@@ -275,6 +307,7 @@ where
                 pivot,
                 text,
                 opts.max_context,
+                dispatch,
             ));
         }
         splits.push(records.len());
@@ -302,7 +335,13 @@ where
 /// Upper-bound binary search: returns the first index `i` such that the
 /// suffix at `records[i].pos` is **strictly greater than** the suffix at
 /// `pivot`.
-fn upper_bound_by_pivot<S>(records: &[SaLcp], pivot: u64, text: &[S], max_ctx: usize) -> usize
+fn upper_bound_by_pivot<S>(
+    records: &[SaLcp],
+    pivot: u64,
+    text: &[S],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+) -> usize
 where
     S: Ord + Copy + 'static,
 {
@@ -310,7 +349,7 @@ where
     let mut hi = records.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        match suffix_cmp(text, records[mid].pos as usize, pivot as usize, max_ctx) {
+        match dispatch.suffix_cmp(text, records[mid].pos as usize, pivot as usize, max_ctx) {
             Ordering::Greater => hi = mid,
             Ordering::Equal | Ordering::Less => lo = mid + 1,
         }
@@ -339,6 +378,7 @@ fn phase4_merge_and_emit<S, F>(
     partition_buckets: &mut [ExtMemBucket<SaLcp>],
     max_ctx: usize,
     emit: &mut F,
+    dispatch: LcpDispatch,
 ) -> io::Result<()>
 where
     S: Ord + Copy + Sync + 'static,
@@ -367,7 +407,8 @@ where
                 let records = bucket.load_all()?;
                 let boundaries: Vec<usize> = bucket.boundaries().to_vec();
                 let mut workspace = CascadeWorkspace::new();
-                let result = workspace.cascade_merge(text, &records, &boundaries, max_ctx);
+                let result =
+                    workspace.cascade_merge(text, &records, &boundaries, max_ctx, dispatch);
                 Ok(result.to_vec())
             })
             .collect::<Result<Vec<_>, io::Error>>()?;
@@ -428,6 +469,7 @@ impl CascadeWorkspace {
         records: &[SaLcp],
         boundaries: &[usize],
         max_ctx: usize,
+        dispatch: LcpDispatch,
     ) -> &'a [u64]
     where
         S: Ord + Copy + 'static,
@@ -454,7 +496,7 @@ impl CascadeWorkspace {
 
         let mut src_is_a = true;
         while run_lens.len() > 1 {
-            run_lens = self.merge_one_level(src_is_a, &run_lens, text, max_ctx);
+            run_lens = self.merge_one_level(src_is_a, &run_lens, text, max_ctx, dispatch);
             src_is_a = !src_is_a;
         }
 
@@ -476,6 +518,7 @@ impl CascadeWorkspace {
         run_lens: &[usize],
         text: &[S],
         max_ctx: usize,
+        dispatch: LcpDispatch,
     ) -> Vec<usize>
     where
         S: Ord + Copy + 'static,
@@ -524,6 +567,7 @@ impl CascadeWorkspace {
                     &mut dst_sa[dst_off..dst_end],
                     &mut dst_lcp[dst_off..dst_end],
                     max_ctx,
+                    dispatch,
                 );
                 new_lens.push(l1 + l2);
                 src_off = xy_end;
