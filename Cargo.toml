@@ -17,3 +17,8 @@ tempfile = "3"
 
 [dev-dependencies]
 rand = "0.10"
+
+# Reproducible head-to-head against upstream C++ CaPS-SA. See `bench/`.
+[[example]]
+name = "caps_sa"
+path = "examples/caps_sa.rs"
