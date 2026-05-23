@@ -84,7 +84,7 @@ impl ExtMemOpts {
 /// smaller when one runs off the end" tie-break.
 pub fn build_ext_mem<S, F>(text: &[S], opts: &ExtMemOpts, mut emit: F) -> io::Result<()>
 where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
     F: FnMut(u64) -> io::Result<()>,
 {
     let n = text.len();
@@ -132,7 +132,7 @@ fn phase1_sort_sample_spill<S>(
     opts: &ExtMemOpts,
 ) -> io::Result<(Vec<ExtMemBucket<SaLcp>>, Vec<u64>)>
 where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
 {
     let chunk_size = n.div_ceil(p);
     let samples_target_total = sample_target_total(n, p);
@@ -224,7 +224,7 @@ fn evenly_spaced<T: Copy>(xs: &[T], count: usize) -> Vec<T> {
 /// evenly-spaced ranks.
 fn phase2_select_pivots<S>(text: &[S], mut samples: Vec<u64>, p: usize, max_ctx: usize) -> Vec<u64>
 where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
 {
     if p <= 1 || samples.is_empty() {
         return Vec::new();
@@ -253,7 +253,7 @@ fn phase3_distribute<S>(
     opts: &ExtMemOpts,
 ) -> io::Result<Vec<ExtMemBucket<SaLcp>>>
 where
-    S: Ord + Copy,
+    S: Ord + Copy + 'static,
 {
     let mut partition_buckets: Vec<ExtMemBucket<SaLcp>> = (0..p)
         .map(|j| ExtMemBucket::new(&opts.work_dir, format!("part{j}")))
@@ -304,7 +304,7 @@ where
 /// `pivot`.
 fn upper_bound_by_pivot<S>(records: &[SaLcp], pivot: u64, text: &[S], max_ctx: usize) -> usize
 where
-    S: Ord + Copy,
+    S: Ord + Copy + 'static,
 {
     let mut lo = 0;
     let mut hi = records.len();
@@ -341,7 +341,7 @@ fn phase4_merge_and_emit<S, F>(
     emit: &mut F,
 ) -> io::Result<()>
 where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
     F: FnMut(u64) -> io::Result<()>,
 {
     let n_partitions = partition_buckets.len();
@@ -430,7 +430,7 @@ impl CascadeWorkspace {
         max_ctx: usize,
     ) -> &'a [u64]
     where
-        S: Ord + Copy,
+        S: Ord + Copy + 'static,
     {
         let n = records.len();
         if n == 0 {
@@ -478,7 +478,7 @@ impl CascadeWorkspace {
         max_ctx: usize,
     ) -> Vec<usize>
     where
-        S: Ord + Copy,
+        S: Ord + Copy + 'static,
     {
         // Destructure self so the borrow checker can see the two sides as
         // disjoint locals — we borrow one immutably and the other mutably.

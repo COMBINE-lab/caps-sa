@@ -64,7 +64,7 @@ impl Default for Opts {
 /// smaller than all of `S`.
 pub fn build_in_memory<S, I>(text: &[S]) -> Vec<I>
 where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
     I: Index,
 {
     build_in_memory_with_opts(text, &Opts::default())
@@ -73,7 +73,7 @@ where
 /// Variant of [`build_in_memory`] that accepts tuning options.
 pub fn build_in_memory_with_opts<S, I>(text: &[S], opts: &Opts) -> Vec<I>
 where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
     I: Index,
 {
     let n = text.len();
@@ -120,7 +120,7 @@ pub(crate) fn merge_sort<S, I>(
     lcp_w: &mut [I],
     max_ctx: usize,
 ) where
-    S: Ord + Copy + Sync,
+    S: Ord + Copy + Sync + 'static,
     I: Index,
 {
     let n = sa.len();
@@ -173,7 +173,7 @@ pub(crate) fn merge<S, I>(
     lcp_z: &mut [I],
     max_ctx: usize,
 ) where
-    S: Ord + Copy,
+    S: Ord + Copy + 'static,
     I: Index,
 {
     let len_x = x.len();
