@@ -1,0 +1,18 @@
+[package]
+name = "caps-sa"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["COMBINE-lab"]
+description = "Cache-friendly, parallel, sample-sort-based suffix array construction (Rust port of CaPS-SA)"
+keywords = ["suffix-array", "string", "sorting", "lcp"]
+categories = ["algorithms", "data-structures"]
+repository = "https://github.com/COMBINE-lab/caps-sa"
+readme = "README.md"
+
+[dependencies]
+rayon = "1"
+
+[dev-dependencies]
+rand = "0.10"
