@@ -321,6 +321,10 @@ where
 /// Phase 4 + 5: for each partition, load its bucket into RAM, cascade
 /// 2-way LCP-enhanced merge across the sub-subarrays, and stream each
 /// merged position to `emit`.
+///
+/// A single [`CascadeWorkspace`] is reused across all partitions so the
+/// only allocations per partition are the bucket `load_all` and the small
+/// `run_lens` book-keeping vector — no per-merge-step `Vec` allocations.
 fn phase4_merge_and_emit<S, F>(
     text: &[S],
     partition_buckets: &mut [ExtMemBucket<SaLcp>],
@@ -331,6 +335,7 @@ where
     S: Ord + Copy + Sync,
     F: FnMut(u64) -> io::Result<()>,
 {
+    let mut workspace = CascadeWorkspace::new();
     for bucket in partition_buckets.iter_mut() {
         if bucket.total_records() == 0 {
             continue;
@@ -338,67 +343,173 @@ where
         let records = bucket.load_all()?;
         let boundaries: Vec<usize> = bucket.boundaries().to_vec();
 
-        let merged = cascade_merge(text, &records, &boundaries, max_ctx);
-        for pos in merged {
+        let merged = workspace.cascade_merge(text, &records, &boundaries, max_ctx);
+        for &pos in merged {
             emit(pos)?;
         }
     }
     Ok(())
 }
 
-/// Cascade 2-way LCP-enhanced merges across the sub-subarrays of one
-/// partition (delimited by `boundaries`) until a single sorted run
-/// remains. Returns its position list.
-fn cascade_merge<S>(
-    text: &[S],
-    records: &[SaLcp],
-    boundaries: &[usize],
-    max_ctx: usize,
-) -> Vec<u64>
-where
-    S: Ord + Copy,
-{
-    // Extract each sub-subarray into separate SA / LCP slices — the
-    // existing `merge` kernel is SOA-shaped.
-    let mut runs: Vec<(Vec<u64>, Vec<u64>)> = (0..boundaries.len().saturating_sub(1))
-        .filter_map(|i| {
-            let lo = boundaries[i];
-            let hi = boundaries[i + 1];
-            if lo >= hi {
-                return None;
-            }
-            let sa: Vec<u64> = records[lo..hi].iter().map(|r| r.pos).collect();
-            let lcp: Vec<u64> = records[lo..hi].iter().map(|r| r.lcp).collect();
-            Some((sa, lcp))
-        })
-        .collect();
+/// Reusable ping-pong scratch for the partition cascade merge.
+///
+/// Holds two `(sa, lcp)` buffers each sized to the largest partition seen.
+/// The cascade alternates reads from one side and writes to the other,
+/// flipping a `src_is_a` flag after each level. Avoids the
+/// per-level allocations that the previous immutable-`Vec` cascade
+/// performed for every pair of sub-subarrays.
+struct CascadeWorkspace {
+    a_sa: Vec<u64>,
+    a_lcp: Vec<u64>,
+    b_sa: Vec<u64>,
+    b_lcp: Vec<u64>,
+}
 
-    if runs.is_empty() {
-        return Vec::new();
+impl CascadeWorkspace {
+    fn new() -> Self {
+        Self {
+            a_sa: Vec::new(),
+            a_lcp: Vec::new(),
+            b_sa: Vec::new(),
+            b_lcp: Vec::new(),
+        }
     }
 
-    while runs.len() > 1 {
-        let mut next: Vec<(Vec<u64>, Vec<u64>)> = Vec::with_capacity(runs.len().div_ceil(2));
-        let mut iter = runs.into_iter();
-        while let Some((sa1, lcp1)) = iter.next() {
-            match iter.next() {
-                None => next.push((sa1, lcp1)),
-                Some((sa2, lcp2)) => {
-                    let total = sa1.len() + sa2.len();
-                    let mut z_sa = vec![0u64; total];
-                    let mut z_lcp = vec![0u64; total];
-                    sample_sort::merge(
-                        text, &sa1, &sa2, &lcp1, &lcp2, &mut z_sa, &mut z_lcp, max_ctx,
-                    );
-                    next.push((z_sa, z_lcp));
-                }
+    /// Grow all four buffers to at least `n` elements. The contents past
+    /// the cascade's actual run lengths are don't-care.
+    fn ensure_capacity(&mut self, n: usize) {
+        if self.a_sa.len() < n {
+            self.a_sa.resize(n, 0);
+            self.a_lcp.resize(n, 0);
+            self.b_sa.resize(n, 0);
+            self.b_lcp.resize(n, 0);
+        }
+    }
+
+    /// Cascade 2-way LCP-enhanced merges across the sub-subarrays of one
+    /// partition (delimited by `boundaries`) until a single sorted run
+    /// remains. Returns a borrow of the buffer slot holding the final
+    /// sorted positions.
+    fn cascade_merge<'a, S>(
+        &'a mut self,
+        text: &[S],
+        records: &[SaLcp],
+        boundaries: &[usize],
+        max_ctx: usize,
+    ) -> &'a [u64]
+    where
+        S: Ord + Copy,
+    {
+        let n = records.len();
+        if n == 0 {
+            return &self.a_sa[..0];
+        }
+        self.ensure_capacity(n);
+
+        // Initialize side A in SOA form from the AOS `records`, and
+        // collect the lengths of the non-empty sub-subarrays.
+        let mut run_lens: Vec<usize> = boundaries
+            .windows(2)
+            .filter_map(|w| {
+                let l = w[1] - w[0];
+                if l > 0 { Some(l) } else { None }
+            })
+            .collect();
+        for (i, r) in records.iter().enumerate() {
+            self.a_sa[i] = r.pos;
+            self.a_lcp[i] = r.lcp;
+        }
+
+        let mut src_is_a = true;
+        while run_lens.len() > 1 {
+            run_lens = self.merge_one_level(src_is_a, &run_lens, text, max_ctx);
+            src_is_a = !src_is_a;
+        }
+
+        if src_is_a {
+            &self.a_sa[..n]
+        } else {
+            &self.b_sa[..n]
+        }
+    }
+
+    /// Pair the runs in `run_lens` (last odd one passes through unchanged),
+    /// running each pair through the LCP-enhanced 2-way merge from the
+    /// `src_is_a`-selected buffer side into the other. Returns the new
+    /// run-length list (each entry is the sum of the two it replaced, or
+    /// the carry-over for an odd tail).
+    fn merge_one_level<S>(
+        &mut self,
+        src_is_a: bool,
+        run_lens: &[usize],
+        text: &[S],
+        max_ctx: usize,
+    ) -> Vec<usize>
+    where
+        S: Ord + Copy,
+    {
+        // Destructure self so the borrow checker can see the two sides as
+        // disjoint locals — we borrow one immutably and the other mutably.
+        let Self {
+            a_sa,
+            a_lcp,
+            b_sa,
+            b_lcp,
+        } = self;
+        let (src_sa, src_lcp, dst_sa, dst_lcp) = if src_is_a {
+            (
+                a_sa.as_slice(),
+                a_lcp.as_slice(),
+                b_sa.as_mut_slice(),
+                b_lcp.as_mut_slice(),
+            )
+        } else {
+            (
+                b_sa.as_slice(),
+                b_lcp.as_slice(),
+                a_sa.as_mut_slice(),
+                a_lcp.as_mut_slice(),
+            )
+        };
+
+        let mut new_lens = Vec::with_capacity(run_lens.len().div_ceil(2));
+        let mut src_off = 0usize;
+        let mut dst_off = 0usize;
+        let mut i = 0;
+        while i < run_lens.len() {
+            let l1 = run_lens[i];
+            if i + 1 < run_lens.len() {
+                let l2 = run_lens[i + 1];
+                let x_end = src_off + l1;
+                let xy_end = x_end + l2;
+                let dst_end = dst_off + l1 + l2;
+                sample_sort::merge(
+                    text,
+                    &src_sa[src_off..x_end],
+                    &src_sa[x_end..xy_end],
+                    &src_lcp[src_off..x_end],
+                    &src_lcp[x_end..xy_end],
+                    &mut dst_sa[dst_off..dst_end],
+                    &mut dst_lcp[dst_off..dst_end],
+                    max_ctx,
+                );
+                new_lens.push(l1 + l2);
+                src_off = xy_end;
+                dst_off = dst_end;
+                i += 2;
+            } else {
+                // Odd run carries over unchanged.
+                let end = dst_off + l1;
+                dst_sa[dst_off..end].copy_from_slice(&src_sa[src_off..src_off + l1]);
+                dst_lcp[dst_off..end].copy_from_slice(&src_lcp[src_off..src_off + l1]);
+                new_lens.push(l1);
+                src_off += l1;
+                dst_off = end;
+                i += 1;
             }
         }
-        runs = next;
+        new_lens
     }
-
-    let (sa, _lcp) = runs.into_iter().next().unwrap();
-    sa
 }
 
 #[cfg(test)]
