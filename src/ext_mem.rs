@@ -734,7 +734,23 @@ where
     if n_partitions == 0 {
         return Ok(());
     }
-    let chunk_size = rayon::current_num_threads().max(1);
+    // `chunk_size = 4 × num_threads` (not `= num_threads`): with one
+    // partition per thread per chunk, rayon's `par_iter_mut` assigns
+    // 1-to-1 with no opportunity to steal, and the chunk's wall is
+    // set by its slowest partition. Sample-sort partition sizes vary
+    // ~2× from random sampling, so the slow tail leaves ~half the
+    // cores idle waiting (observed: 52% parallel efficiency on
+    // GRCh38 / 32 t).
+    //
+    // Bumping the chunk to `4 × num_threads` gives rayon four
+    // partitions per thread to dispatch — fast threads can steal from
+    // slow neighbours, smoothing out the size variance. Peak RAM
+    // grows linearly: each in-flight merged partition holds its
+    // result `Vec<I>` (~3 MB at human-genome scale with `u32`
+    // indices), so the chunk's transient cost goes from `32 × 3 MB =
+    // 96 MB` to `128 × 3 MB = 384 MB` — well within the budget we
+    // already spend on phase 1.
+    let chunk_size = rayon::current_num_threads().max(1) * 4;
 
     // Per-thread CPU-µs accumulators for the two parallel sub-steps. They
     // add across threads, so the printed values are CPU-time (sum), not

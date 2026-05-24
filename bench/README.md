@@ -94,13 +94,13 @@ come from" below.
 |                          | wall (min) | RSS (GB)    | vs upstream |
 | upstream C++ in-mem      | 10.50      | 49.60       | 0.96× / 7.68× |
 | upstream C++ ext-mem     | 10.93      | 6.46        | 1.00× / 1.00× |
-| **caps-sa Rust ext-mem** | **10.47**  | **5.03**    | **0.96× / 0.78×** |
+| **caps-sa Rust ext-mem** | **10.14**  | **4.98**    | **0.93× / 0.77×** |
 | caps-sa Rust in-mem-ss   | 11.64      | 55.00       | 1.07× / 8.52× |
 
 `vs upstream` columns are relative to upstream ext-mem (the natural
-peer-to-peer comparison). **caps-sa ext-mem is now ~4% faster than
-upstream ext-mem on wall time and uses 22% less RAM** — and it
-matches upstream's in-mem path on wall while using 10× less RAM.
+peer-to-peer comparison). **caps-sa ext-mem is now ~7% faster than
+upstream ext-mem on wall time and uses 23% less RAM** — and it beats
+upstream's in-mem path by 3% on wall while using 10× less RAM.
 
 Note: the 200 MB human-slice profile in the section below predicted a
 larger phase-1 win than the full-genome run delivered (28% on the
@@ -134,7 +134,61 @@ Phase 2b ext-mem implementation:
 | + filesystem caching / rerun variance                        | −0.8 min | −0.11 GB (→ 4.99) |
 | + AVX-512 hybrid LCP (Opt 5)                                 | **−0.85 min** (→ 10.47) | ~0 (→ 5.03) |
 | + Pooled bucket files (Opt 6)                                | +0.3 min (→ 10.78, noise) | **−0.31 GB** (→ 4.72) |
-| **Net (v1 → today's tip)**                                   | **−0.15 min** | **−35.11 GB (−88%)** |
+| + Phase 4 chunk-size = 4·num_threads (Opt 7)                  | **−0.64 min** (→ 10.14) | ~0 (→ 4.98) |
+| **Net (v1 → today's tip)**                                   | **−0.77 min** | **−34.85 GB (−88%)** |
+
+### Phase 4 chunk-size — unblock rayon work-stealing (Opt 7)
+
+Profiling the post-pool human run revealed that **phase 4's parallel
+efficiency was only 52%** (CPU 2 274 s into wall 139 s on 32 cores)
+while phase 1 ran at ~89%. The cause was structural:
+
+`phase4_merge_and_emit` walks the `p` partition buckets in chunks of
+`chunk_size = num_threads`, each chunk processed by a single
+`par_iter_mut`. With one partition per thread per chunk, rayon has no
+splittable work to redistribute — the chunk's wall is set by its
+slowest partition, and the other threads idle. Sample-sort partition
+sizes vary ~2× from random sampling, so this tail-straggler effect
+compounds across the ~256 chunks of the GRCh38 run (`p = 8192`,
+`num_threads = 32`).
+
+Bumping the chunk to `4 × num_threads` gives rayon four partitions
+per thread initially. Fast threads steal from slow ones, smoothing
+the variance. Peak RAM grows by the additional in-flight merged
+partitions — each holds a `Vec<I>` of ~3 MB at human-genome scale
+with `u32` indices, so a chunk of 128 partitions costs ~400 MB
+transient (vs the previous ~100 MB). Well within the budget already
+spent on phase 1.
+
+Empirical impact (AMD EPYC 9575F / Zen 5):
+
+```
+                       phase 4 wall      phase 4 speedup vs 32 cores
+                       before   after    before   after
+rand100m 32t           10.07 s   3.38 s   2.6×    7.9×
+GRCh38 32t            138.89 s  98.30 s  16.6×   22.9×   (52% → 72% eff.)
+
+                       total wall
+                       before   after    Δ
+rand100m 32t           11.22 s   4.51 s   −60%
+hum200m 32t           ~57 s     ~56 s   ≈0%        (phase 1 dominates here)
+GRCh38 32t             10.78 m  10.14 m  **−6%**
+```
+
+The win is concentrated where phase 4 is a meaningful share of total
+wall — the marquee human-genome run lost 38 s and the small-input
+rand100m bench more than halved. Workloads dominated by phase 1
+(long-LCP, repeat-rich genomic regions; the hum200m slice) see no
+change because phase 1 isn't the thing we fixed.
+
+We also tried injecting `_mm_prefetch::<_MM_HINT_T0>` 256 bytes
+ahead of the AVX-512 loads in `lcp_u8_avx512`. Hum200m, rand100m,
+and the full GRCh38 bench all showed indistinguishable wall vs the
+bare loop (in fact slightly faster without the extra instructions).
+The Zen 5 hardware prefetcher recognises the strided 64-byte access
+pattern and is already issuing the same loads — software prefetch
+was redundant and adds inner-loop work for nothing. Reverted; the
+`lcp_u8_avx512` loop stays bare.
 
 ### Pooled bucket files — fewer fds, friendlier on NFS (Opt 6)
 

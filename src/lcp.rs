@@ -215,6 +215,16 @@ unsafe fn lcp_u8_avx512(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usiz
         i += 32;
     }
     // 64-byte body: LCP exceeds 32 bytes, run at AVX-512 stride.
+    //
+    // We tried software prefetching (`_mm_prefetch::<_MM_HINT_T0>(ptr+256)`)
+    // inside this loop on the theory that overlapping the next stride's
+    // memory fetch with current-iteration execution would shave the
+    // dominant phase 1 wall. It did not: hum200m, rand100m, and the
+    // full GRCh38 32t bench all showed indistinguishable wall vs the
+    // bare loop. The Zen 5 hardware prefetcher recognises the strided
+    // pattern and is already issuing the same loads, so the explicit
+    // hint just adds inner-loop instructions for no benefit. Left bare
+    // for clarity.
     while i + 64 <= lim {
         // SAFETY: bounds ensured by the loop condition; unaligned loads.
         let va = unsafe { _mm512_loadu_si512(ptr.add(p + i) as *const __m512i) };
