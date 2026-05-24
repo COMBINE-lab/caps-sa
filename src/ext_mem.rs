@@ -36,7 +36,7 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 
 use crate::Index;
-use crate::ext_bucket::{ExtMemBucket, SaLcp};
+use crate::ext_bucket::{BucketRecord, BucketStore, ExtMemBucket, InMemBucket, SaLcp};
 use crate::lcp::LcpDispatch;
 use crate::sample_sort;
 
@@ -150,46 +150,157 @@ fn build_ext_mem_inner<S, I, F>(
 where
     S: Ord + Copy + Sync + 'static,
     I: Index,
-    SaLcp<I>: crate::ext_bucket::BucketRecord,
+    SaLcp<I>: BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
 {
     let n = source.len();
     if n == 0 {
         return Ok(());
     }
-
     let p = effective_subproblem_count(n, opts.subproblem_count);
-
-    // Choose the LCP implementation once for the whole build. The
-    // captured function pointer rides through every phase (and across
-    // rayon thread boundaries — `LcpDispatch` is `Copy + Send + Sync`),
-    // so inner merge loops pay no atomic load or feature-detection
-    // branch per call.
     let dispatch = LcpDispatch::detect();
+    let work_dir = opts.work_dir.clone();
 
-    // Phase 1: sort each subarray; sample uniformly; spill (pos, lcp).
-    let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill::<S, I>(text, &source, p, opts, dispatch)?;
+    let sub_factory = |i: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("sub{i}"));
+    let part_factory = |j: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("part{j}"));
 
-    // Phase 2: globally sort samples; pick p-1 pivots.
+    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, _, _>(
+        text,
+        &source,
+        p,
+        opts,
+        dispatch,
+        sub_factory,
+    )?;
     let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
-
-    // Phase 3: distribute each subarray into per-partition buckets.
-    let mut partition_buckets =
-        phase3_distribute::<S, I>(text, &mut subarray_buckets, &pivots, p, opts, dispatch)?;
-
-    // Subarray buckets are no longer needed — drop early to release
-    // their disk space.
+    let mut partition_buckets = phase3_distribute::<S, I, _, _>(
+        text,
+        &mut subarray_buckets,
+        &pivots,
+        p,
+        opts,
+        dispatch,
+        part_factory,
+    )?;
     drop(subarray_buckets);
-
-    // Phase 4 & 5: per-partition cascade merge + stream output.
-    phase4_merge_and_emit::<S, I, F>(
+    phase4_merge_and_emit::<S, I, _, F>(
         text,
         &mut partition_buckets,
         opts.max_context,
         &mut emit,
         dispatch,
     )
+}
+
+/// Same algorithm as [`build_ext_mem_inner`] but with the disk-backed
+/// [`ExtMemBucket`] replaced by [`InMemBucket`] throughout — phase 1
+/// sorts each subarray and keeps the result in a `Vec<SaLcp<I>>`,
+/// phase 3 distributes into in-RAM partition Vecs, phase 4 cascade-
+/// merges the in-RAM partitions. No disk I/O.
+///
+/// Trades RAM for wall time: peak memory is ~`n × sizeof(SaLcp<I>)`
+/// (the post-phase-1 records sitting around until phase 3 consumes
+/// them), so ~25 GB on the human genome with `I = u32`. In exchange,
+/// the disk-spill / distribute-write / partition-load round-trip is
+/// gone — useful on machines with enough RAM to hold the working set.
+fn build_in_memory_ss_inner<S, I, F>(
+    text: &[S],
+    source: PositionSource<'_>,
+    opts: &ExtMemOpts,
+    mut emit: F,
+) -> io::Result<()>
+where
+    S: Ord + Copy + Sync + 'static,
+    I: Index,
+    SaLcp<I>: BucketRecord,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    let n = source.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let p = effective_subproblem_count(n, opts.subproblem_count);
+    let dispatch = LcpDispatch::detect();
+
+    let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
+
+    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, _, _>(
+        text,
+        &source,
+        p,
+        opts,
+        dispatch,
+        factory,
+    )?;
+    let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
+    let mut partition_buckets = phase3_distribute::<S, I, _, _>(
+        text,
+        &mut subarray_buckets,
+        &pivots,
+        p,
+        opts,
+        dispatch,
+        factory,
+    )?;
+    drop(subarray_buckets);
+    phase4_merge_and_emit::<S, I, _, F>(
+        text,
+        &mut partition_buckets,
+        opts.max_context,
+        &mut emit,
+        dispatch,
+    )
+}
+
+/// In-memory variant of the sample-sort algorithm used by
+/// [`build_ext_mem`]. Skips all disk I/O at the cost of holding the
+/// (`pos`, `lcp`) records in RAM throughout. Picks `u32` records when
+/// `n ≤ 2³²`, falls back to `u64` otherwise. The caller's `emit`
+/// closure is called once per output position in lex order, just like
+/// in the ext-mem path.
+pub fn build_in_memory_sample_sort<S, F>(
+    text: &[S],
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Ord + Copy + Sync + 'static,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if text.len() <= u32::MAX as usize + 1 {
+        build_in_memory_ss_inner::<S, u32, F>(text, PositionSource::Identity(text.len()), opts, emit)
+    } else {
+        build_in_memory_ss_inner::<S, u64, F>(text, PositionSource::Identity(text.len()), opts, emit)
+    }
+}
+
+/// Subset-positions variant of [`build_in_memory_sample_sort`]. Same
+/// shape as [`build_ext_mem_for_positions`].
+pub fn build_in_memory_sample_sort_for_positions<S, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Ord + Copy + Sync + 'static,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    if text.len() <= u32::MAX as usize + 1 {
+        build_in_memory_ss_inner::<S, u32, F>(
+            text,
+            PositionSource::Subset(&positions),
+            opts,
+            emit,
+        )
+    } else {
+        build_in_memory_ss_inner::<S, u64, F>(
+            text,
+            PositionSource::Subset(&positions),
+            opts,
+            emit,
+        )
+    }
 }
 
 /// Source of the positions to sort. The all-suffixes case
@@ -275,30 +386,34 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
 /// `p` (target chunk ~ 64 K records), per-task scratch is ~18 MiB on
 /// human-scale inputs, so the `num_threads × per_task_scratch` peak
 /// stays bounded even though we don't reuse buffers across iterations.
-fn phase1_sort_sample_spill<S, I>(
+#[allow(clippy::too_many_arguments)]
+fn phase1_sort_sample_spill<S, I, B, MkB>(
     text: &[S],
     source: &PositionSource<'_>,
     p: usize,
     opts: &ExtMemOpts,
     dispatch: LcpDispatch,
-) -> io::Result<(Vec<ExtMemBucket<SaLcp<I>>>, Vec<I>)>
+    mk_bucket: MkB,
+) -> io::Result<(Vec<B>, Vec<I>)>
 where
     S: Ord + Copy + Sync + 'static,
     I: Index,
-    SaLcp<I>: crate::ext_bucket::BucketRecord,
+    SaLcp<I>: BucketRecord,
+    B: BucketStore<SaLcp<I>> + Send,
+    MkB: Fn(usize) -> B + Send + Sync,
 {
     let n = source.len();
     let chunk_size = n.div_ceil(p);
     let samples_target_total = sample_target_total(n, p);
 
-    let per_subarray: Vec<(ExtMemBucket<SaLcp<I>>, Vec<I>)> = (0..p)
+    let per_subarray: Vec<(B, Vec<I>)> = (0..p)
         .into_par_iter()
         .map(|i| {
             let start = (i * chunk_size).min(n);
             let end = ((i + 1) * chunk_size).min(n);
             let len = end - start;
 
-            let mut bucket = ExtMemBucket::new(&opts.work_dir, format!("sub{i}"));
+            let mut bucket = mk_bucket(i);
             if len == 0 {
                 return Ok::<_, io::Error>((bucket, Vec::new()));
             }
@@ -427,22 +542,24 @@ where
 /// boundaries is internally sorted. Both properties hold under
 /// arbitrary thread interleaving.
 #[allow(clippy::too_many_arguments)]
-fn phase3_distribute<S, I>(
+fn phase3_distribute<S, I, B, MkB>(
     text: &[S],
-    subarray_buckets: &mut [ExtMemBucket<SaLcp<I>>],
+    subarray_buckets: &mut [B],
     pivots: &[I],
     p: usize,
     opts: &ExtMemOpts,
     dispatch: LcpDispatch,
-) -> io::Result<Vec<ExtMemBucket<SaLcp<I>>>>
+    mk_bucket: MkB,
+) -> io::Result<Vec<B>>
 where
     S: Ord + Copy + Sync + 'static,
     I: Index,
-    SaLcp<I>: crate::ext_bucket::BucketRecord,
+    SaLcp<I>: BucketRecord,
+    B: BucketStore<SaLcp<I>> + Send,
+    MkB: Fn(usize) -> B + Send + Sync,
 {
-    let partition_buckets: Vec<Mutex<ExtMemBucket<SaLcp<I>>>> = (0..p)
-        .map(|j| Mutex::new(ExtMemBucket::new(&opts.work_dir, format!("part{j}"))))
-        .collect();
+    let _ = opts; // work_dir is used only by the ext-mem factory closure now
+    let partition_buckets: Vec<Mutex<B>> = (0..p).map(|j| Mutex::new(mk_bucket(j))).collect();
 
     subarray_buckets
         .par_iter_mut()
@@ -535,9 +652,9 @@ where
 /// subarrays the per-partition size is `≈ n / p`, so this stays
 /// proportional to `n / 4 = 0.25 n` even at the peak — well below the
 /// in-memory path's `~4 n` working set.
-fn phase4_merge_and_emit<S, I, F>(
+fn phase4_merge_and_emit<S, I, B, F>(
     text: &[S],
-    partition_buckets: &mut [ExtMemBucket<SaLcp<I>>],
+    partition_buckets: &mut [B],
     max_ctx: usize,
     emit: &mut F,
     dispatch: LcpDispatch,
@@ -545,7 +662,8 @@ fn phase4_merge_and_emit<S, I, F>(
 where
     S: Ord + Copy + Sync + 'static,
     I: Index,
-    SaLcp<I>: crate::ext_bucket::BucketRecord,
+    SaLcp<I>: BucketRecord,
+    B: BucketStore<SaLcp<I>> + Send,
     F: FnMut(u64) -> io::Result<()>,
 {
     let n_partitions = partition_buckets.len();
@@ -888,6 +1006,47 @@ mod tests {
                 want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
                 let got = ext_mem_for_positions(&text, positions, p);
                 assert_eq!(got, want, "subset ext-mem mismatch n={n} p={p}");
+            }
+        }
+    }
+
+    fn in_memory_sample_sort(text: &[u8], p: usize) -> Vec<u64> {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: p,
+            work_dir: dir.path().to_path_buf(),
+            ..ExtMemOpts::default()
+        };
+        let mut out: Vec<u64> = Vec::with_capacity(text.len());
+        build_in_memory_sample_sort(text, &opts, |pos| {
+            out.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn in_memory_sample_sort_matches_in_memory() {
+        for text in [b"banana" as &[u8], b"mississippi", b"abracadabra"] {
+            let want: Vec<u32> = build_in_memory(text);
+            let want64: Vec<u64> = want.iter().map(|&x| x as u64).collect();
+            let got = in_memory_sample_sort(text, 0);
+            assert_eq!(got, want64, "in-mem sample-sort mismatch on {text:?}");
+        }
+    }
+
+    #[test]
+    fn in_memory_sample_sort_random_byte_texts() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0DE_C0DE);
+        for &n in &[16usize, 200, 2000] {
+            for &p in &[1usize, 4, 16] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..6u8)).collect();
+                let want: Vec<u32> = build_in_memory(&text);
+                let want64: Vec<u64> = want.iter().map(|&x| x as u64).collect();
+                let got = in_memory_sample_sort(&text, p);
+                assert_eq!(got, want64, "in-mem ss mismatch n={n} p={p}");
             }
         }
     }

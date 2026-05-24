@@ -105,6 +105,91 @@ impl BucketRecord for SaLcp<u64> {
 /// per bucket; for 16-byte records that's 2048 entries. We use the same.
 const DEFAULT_BUFFER_RECORDS: usize = 2048;
 
+/// Common interface for the disk-backed [`ExtMemBucket`] and the
+/// pure-RAM [`InMemBucket`]. Lets the ext-mem sample-sort algorithm
+/// run with either storage strategy without source duplication.
+pub trait BucketStore<T>: Send {
+    fn add_slice(&mut self, rs: &[T]) -> io::Result<()>;
+    fn mark_boundary(&mut self);
+    fn total_records(&self) -> usize;
+    fn boundaries(&self) -> &[usize];
+    fn load_all(&mut self) -> io::Result<Vec<T>>;
+}
+
+/// Pure-RAM analogue of [`ExtMemBucket`] for the in-memory sample-sort
+/// path. Records accumulate in a `Vec<T>`; `load_all` takes the vector
+/// (leaving the bucket empty) — same API shape as the disk-backed
+/// bucket so the sample-sort phases work against either via the
+/// [`BucketStore`] trait.
+pub struct InMemBucket<T> {
+    records: Vec<T>,
+    boundaries: Vec<usize>,
+}
+
+impl<T: Copy> InMemBucket<T> {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            boundaries: vec![0],
+        }
+    }
+}
+
+impl<T: Copy> Default for InMemBucket<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy + Send + Sync> BucketStore<T> for InMemBucket<T> {
+    fn add_slice(&mut self, rs: &[T]) -> io::Result<()> {
+        self.records.extend_from_slice(rs);
+        Ok(())
+    }
+
+    fn mark_boundary(&mut self) {
+        let last = *self.boundaries.last().unwrap();
+        let now = self.records.len();
+        if now != last {
+            self.boundaries.push(now);
+        }
+    }
+
+    fn total_records(&self) -> usize {
+        self.records.len()
+    }
+
+    fn boundaries(&self) -> &[usize] {
+        &self.boundaries
+    }
+
+    fn load_all(&mut self) -> io::Result<Vec<T>> {
+        Ok(std::mem::take(&mut self.records))
+    }
+}
+
+impl<T: BucketRecord> BucketStore<T> for ExtMemBucket<T> {
+    fn add_slice(&mut self, rs: &[T]) -> io::Result<()> {
+        ExtMemBucket::add_slice(self, rs)
+    }
+
+    fn mark_boundary(&mut self) {
+        ExtMemBucket::mark_boundary(self)
+    }
+
+    fn total_records(&self) -> usize {
+        ExtMemBucket::total_records(self)
+    }
+
+    fn boundaries(&self) -> &[usize] {
+        ExtMemBucket::boundaries(self)
+    }
+
+    fn load_all(&mut self) -> io::Result<Vec<T>> {
+        ExtMemBucket::load_all(self)
+    }
+}
+
 /// Disk-spilling sequence of `T` records.
 ///
 /// Newly added records first go to an in-memory buffer; when the buffer

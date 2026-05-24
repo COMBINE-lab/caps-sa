@@ -21,7 +21,10 @@ mod ext_mem;
 mod lcp;
 mod sample_sort;
 
-pub use ext_mem::{ExtMemOpts, build_ext_mem, build_ext_mem_for_positions};
+pub use ext_mem::{
+    ExtMemOpts, build_ext_mem, build_ext_mem_for_positions, build_in_memory_sample_sort,
+    build_in_memory_sample_sort_for_positions,
+};
 pub use lcp::{LcpDispatch, lcp, lcp_scalar, lcp_u8, suffix_cmp};
 pub use sample_sort::{
     Opts, build_in_memory, build_in_memory_for_positions, build_in_memory_for_positions_with_opts,

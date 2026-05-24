@@ -18,12 +18,13 @@ use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
 
-use caps_sa::{ExtMemOpts, build_ext_mem, build_in_memory};
+use caps_sa::{ExtMemOpts, build_ext_mem, build_in_memory, build_in_memory_sample_sort};
 
 struct Args {
     input: PathBuf,
     output: PathBuf,
     ext_mem: bool,
+    in_mem_ss: bool,
     subproblem_count: usize,
     threads: Option<usize>,
 }
@@ -32,6 +33,7 @@ fn parse_args() -> Args {
     let argv: Vec<String> = env::args().collect();
     let mut positional: Vec<String> = Vec::new();
     let mut ext_mem = false;
+    let mut in_mem_ss = false;
     let mut subproblem_count: usize = 0;
     let mut threads: Option<usize> = None;
     let mut i = 1;
@@ -39,6 +41,10 @@ fn parse_args() -> Args {
         match argv[i].as_str() {
             "--ext-mem" => {
                 ext_mem = true;
+                i += 1;
+            }
+            "--in-mem-ss" => {
+                in_mem_ss = true;
                 i += 1;
             }
             "--subproblem-count" => {
@@ -57,7 +63,7 @@ fn parse_args() -> Args {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: caps_sa <input> <output> [--ext-mem] \
+                    "usage: caps_sa <input> <output> [--ext-mem | --in-mem-ss] \
                      [--subproblem-count N] [--threads N]"
                 );
                 process::exit(0);
@@ -79,6 +85,7 @@ fn parse_args() -> Args {
         input: PathBuf::from(&positional[0]),
         output: PathBuf::from(&positional[1]),
         ext_mem,
+        in_mem_ss,
         subproblem_count,
         threads,
     }
@@ -104,13 +111,10 @@ fn main() -> std::io::Result<()> {
     );
 
     // Pick the narrowest index type that can address `text`. The
-    // ext-mem path keeps `u64` for now (its API and bucket records are
-    // hard-coded to `u64`); the in-mem path narrows to `u32` whenever
-    // every suffix position fits, which on a 64-bit `usize` host means
-    // `n <= u32::MAX + 1 = 2^32`. This matches what upstream CaPS-SA
-    // does with its `uint32_t` SA (good for ≤ 4 GB inputs — including
-    // the full human genome at n ≈ 3.1 × 10⁹).
-    let use_u32 = text.len() <= (u32::MAX as usize) + 1 && !args.ext_mem;
+    // sample-sort paths (ext-mem and in-mem-ss) handle the u32/u64
+    // dispatch internally and always emit u64; only the plain in-mem
+    // merge-sort path needs to be widened/narrowed at this CLI layer.
+    let use_u32 = text.len() <= (u32::MAX as usize) + 1 && !args.ext_mem && !args.in_mem_ss;
     let n_entries: usize;
     let build_elapsed;
     let write_elapsed;
@@ -133,31 +137,37 @@ fn main() -> std::io::Result<()> {
         }
         writer.flush()?;
         write_elapsed = write_start.elapsed();
-    } else if args.ext_mem {
+    } else if args.ext_mem || args.in_mem_ss {
         // Stream the SA straight from caps-sa's emit closure to the
-        // output file. The previous version accumulated each emitted
-        // `u64` into a `Vec<u64>` first, which silently turned the
-        // ext-mem path's bounded-memory contract into a `~8 × n` RAM
-        // hit at output time. Streaming here keeps peak RSS proportional
-        // to the algorithm's actual working set (text + workspace +
-        // bucket buffers).
+        // output file. Both sample-sort paths share this streaming
+        // shape; the only difference is whether the working buckets
+        // are disk-backed (ext-mem) or RAM-only (in-mem-ss).
         let opts = ExtMemOpts {
             subproblem_count: args.subproblem_count,
             ..ExtMemOpts::default()
         };
         let writer = std::cell::RefCell::new(BufWriter::new(fs::File::create(&args.output)?));
         let mut count = 0usize;
+        let mode_label = if args.ext_mem { "ext-mem" } else { "in-mem-ss" };
         let build_start = Instant::now();
-        build_ext_mem(&text, &opts, |pos| {
-            count += 1;
-            writer.borrow_mut().write_all(&pos.to_le_bytes())?;
-            Ok(())
-        })?;
+        if args.ext_mem {
+            build_ext_mem(&text, &opts, |pos| {
+                count += 1;
+                writer.borrow_mut().write_all(&pos.to_le_bytes())?;
+                Ok(())
+            })?;
+        } else {
+            build_in_memory_sample_sort(&text, &opts, |pos| {
+                count += 1;
+                writer.borrow_mut().write_all(&pos.to_le_bytes())?;
+                Ok(())
+            })?;
+        }
         build_elapsed = build_start.elapsed();
         writer.borrow_mut().flush()?;
         n_entries = count;
         eprintln!(
-            "build: mode=ext-mem(u64,stream) n={n_entries} entries in {:.3}s",
+            "build: mode={mode_label}(u64,stream) n={n_entries} entries in {:.3}s",
             build_elapsed.as_secs_f64()
         );
         write_elapsed = std::time::Duration::ZERO;
