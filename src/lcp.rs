@@ -148,6 +148,13 @@ pub fn lcp_scalar<S: Eq>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usiz
 fn pick_lcp_u8_impl() -> LcpU8Fn {
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX-512BW gives us a 64-byte byte-compare returning a 64-bit
+        // mask register directly — no movemask intrinsic, no extract.
+        // Both `f` (foundation) and `bw` (byte/word ops, for the
+        // `_mm512_cmpeq_epi8_mask` we use) are required.
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
+            return lcp_u8_avx512;
+        }
         if std::is_x86_feature_detected!("avx2") {
             return lcp_u8_avx2;
         }
@@ -165,6 +172,79 @@ fn pick_lcp_u8_impl() -> LcpU8Fn {
 /// dispatch targets share the [`LcpU8Fn`] signature.
 unsafe fn lcp_u8_scalar(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
     lcp_scalar(text, p, q, max_ctx)
+}
+
+/// AVX-512BW path: 64-byte vector compares; `_mm512_cmpeq_epi8_mask`
+/// returns the per-byte equality mask straight in a 64-bit `__mmask64`
+/// register (no movemask round-trip), and `(!mask).trailing_zeros()`
+/// gives the first differing byte.
+///
+/// The function leads with a single 32-byte AVX2 step. This keeps the
+/// short-LCP regime (random DNA, where every call typically resolves in
+/// the first ≤16 bytes) at AVX2's per-call cost — a 64-byte load + ZMM
+/// register usage on a call that exits inside the first 32 bytes is
+/// wasted work. Once we've established the LCP exceeds 32 bytes we
+/// switch to the 64-byte stride for the rest of the comparison, which
+/// is the regime the upstream genome bench (and `lcp_u8_avx512`'s
+/// reason for existing) actually hits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn lcp_u8_avx512(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+    use std::arch::x86_64::{
+        __m256i, __m512i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm512_cmpeq_epi8_mask, _mm512_loadu_si512,
+    };
+    let n = text.len();
+    let lim_p = n.saturating_sub(p).min(max_ctx);
+    let lim_q = n.saturating_sub(q).min(max_ctx);
+    let lim = lim_p.min(lim_q);
+    let ptr = text.as_ptr();
+
+    let mut i = 0usize;
+    // 32-byte head: AVX2 compare. If it resolves the LCP we never touch
+    // a ZMM register.
+    if i + 32 <= lim {
+        // SAFETY: AVX2 is implied by AVX-512F; bounds checked above.
+        let va = unsafe { _mm256_loadu_si256(ptr.add(p + i) as *const __m256i) };
+        let vb = unsafe { _mm256_loadu_si256(ptr.add(q + i) as *const __m256i) };
+        let eq = _mm256_cmpeq_epi8(va, vb);
+        let mask = _mm256_movemask_epi8(eq) as u32;
+        if mask != u32::MAX {
+            return i + (!mask).trailing_zeros() as usize;
+        }
+        i += 32;
+    }
+    // 64-byte body: LCP exceeds 32 bytes, run at AVX-512 stride.
+    while i + 64 <= lim {
+        // SAFETY: bounds ensured by the loop condition; unaligned loads.
+        let va = unsafe { _mm512_loadu_si512(ptr.add(p + i) as *const __m512i) };
+        let vb = unsafe { _mm512_loadu_si512(ptr.add(q + i) as *const __m512i) };
+        let mask = _mm512_cmpeq_epi8_mask(va, vb);
+        if mask != u64::MAX {
+            return i + (!mask).trailing_zeros() as usize;
+        }
+        i += 64;
+    }
+    // 32-byte tail: covers the case where the residue past the 64-byte
+    // loop is between 32 and 63 bytes.
+    if i + 32 <= lim {
+        // SAFETY: bounds checked above.
+        let va = unsafe { _mm256_loadu_si256(ptr.add(p + i) as *const __m256i) };
+        let vb = unsafe { _mm256_loadu_si256(ptr.add(q + i) as *const __m256i) };
+        let eq = _mm256_cmpeq_epi8(va, vb);
+        let mask = _mm256_movemask_epi8(eq) as u32;
+        if mask != u32::MAX {
+            return i + (!mask).trailing_zeros() as usize;
+        }
+        i += 32;
+    }
+    while i < lim {
+        if text[p + i] != text[q + i] {
+            return i;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// AVX2 path: 32-byte vector compares, locate the first differing byte
@@ -319,7 +399,23 @@ mod tests {
         let detected = LcpDispatch::detect();
         let mut text: Vec<u8> = vec![b'A'; 200];
         text[64] = b'T'; // diff right at the second AVX2 boundary
-        assert_eq!(scalar.lcp(&text, 0, 100, usize::MAX), 64 - 0);
-        assert_eq!(detected.lcp(&text, 0, 100, usize::MAX), 64 - 0);
+        assert_eq!(scalar.lcp(&text, 0, 100, usize::MAX), 64);
+        assert_eq!(detected.lcp(&text, 0, 100, usize::MAX), 64);
+    }
+
+    /// Exercise the AVX-512 64-byte stride and the 32-byte tail: place
+    /// the differing byte at offsets that straddle each boundary
+    /// (0/63/64/65/95/96/97/127/128) and confirm the dispatched path
+    /// agrees with scalar. On a non-AVX-512 host this devolves to the
+    /// other SIMD paths but still verifies correctness.
+    #[test]
+    fn avx512_boundary_agreement() {
+        let detected = LcpDispatch::detect();
+        for diff_at in [0usize, 1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 200] {
+            let mut text = vec![b'A'; 512];
+            text[diff_at] = b'G';
+            let got = detected.lcp(&text, 0, 256, usize::MAX);
+            assert_eq!(got, diff_at, "diff_at={diff_at}");
+        }
     }
 }
