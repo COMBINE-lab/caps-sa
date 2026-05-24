@@ -77,13 +77,48 @@ where
     I: Index,
 {
     let n = text.len();
+    let positions: Vec<I> = (0..n).map(I::from_usize).collect();
+    build_in_memory_for_positions_with_opts(text, positions, opts)
+}
+
+/// Sort the caller-supplied `positions` by the lexicographic order of
+/// their suffixes in `text`. Returns the positions reordered so that
+/// `text[output[i]..]` is the i-th smallest suffix among the input set.
+///
+/// Equivalent to [`build_in_memory`] for the special case
+/// `positions = (0..text.len()).collect()`; the explicit-positions form
+/// lets callers skip suffixes they don't want included in the sort —
+/// e.g. STAR-style genome indexing where only ACGT-starting positions
+/// participate in the SA, avoiding the O(n) work of sorting and then
+/// discarding the spacer-starting positions inside bin-padding.
+///
+/// The suffix at each position is still the slice `text[position..]`;
+/// no positions are dropped from the input. To filter, the caller
+/// constructs `positions` with only the indices they want.
+pub fn build_in_memory_for_positions<S, I>(text: &[S], positions: Vec<I>) -> Vec<I>
+where
+    S: Ord + Copy + Sync + 'static,
+    I: Index,
+{
+    build_in_memory_for_positions_with_opts(text, positions, &Opts::default())
+}
+
+/// Variant of [`build_in_memory_for_positions`] that accepts tuning options.
+pub fn build_in_memory_for_positions_with_opts<S, I>(
+    text: &[S],
+    positions: Vec<I>,
+    opts: &Opts,
+) -> Vec<I>
+where
+    S: Ord + Copy + Sync + 'static,
+    I: Index,
+{
+    let n = positions.len();
     if n == 0 {
         return Vec::new();
     }
 
-    // Identity permutation; merge-sort will reorder in place (via a scratch
-    // buffer of equal size).
-    let mut sa: Vec<I> = (0..n).map(I::from_usize).collect();
+    let mut sa: Vec<I> = positions;
     let mut sa_w: Vec<I> = vec![I::zero(); n];
     let mut lcp_arr: Vec<I> = vec![I::zero(); n];
     let mut lcp_w: Vec<I> = vec![I::zero(); n];
@@ -359,6 +394,45 @@ mod tests {
             let got: Vec<u32> = build_in_memory(&text);
             let want = brute_force_sa(&text);
             assert_eq!(got, want, "mismatch on random text len={n}");
+        }
+    }
+
+    #[test]
+    fn for_positions_full_set_matches_build_in_memory() {
+        // Same output as build_in_memory when positions is the identity.
+        let text = b"banana";
+        let want: Vec<u32> = build_in_memory(text);
+        let positions: Vec<u32> = (0..text.len() as u32).collect();
+        let got = build_in_memory_for_positions(text, positions);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn for_positions_subset_matches_brute_force() {
+        // Sort only the even positions of "mississippi" by their
+        // suffixes; verify against brute force.
+        let text = b"mississippi";
+        let positions: Vec<u32> = (0..text.len() as u32).step_by(2).collect();
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(text, positions);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn for_positions_random_subsets() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFEED);
+        for &n in &[33usize, 200, 1000] {
+            let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..6u8)).collect();
+            // Random subset of positions.
+            let mut positions: Vec<u32> = (0..n as u32).collect();
+            // Drop a random ~30%.
+            positions.retain(|_| rng.random_range(0..10) < 7);
+            let mut want = positions.clone();
+            want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+            let got = build_in_memory_for_positions(&text, positions);
+            assert_eq!(got, want, "subset sort mismatch n={n}");
         }
     }
 

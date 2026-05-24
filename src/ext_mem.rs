@@ -82,12 +82,52 @@ impl ExtMemOpts {
 /// Equivalent in semantics to [`crate::build_in_memory`]: produces a
 /// standard lexicographic suffix array with the "shorter suffix is
 /// smaller when one runs off the end" tie-break.
-pub fn build_ext_mem<S, F>(text: &[S], opts: &ExtMemOpts, mut emit: F) -> io::Result<()>
+pub fn build_ext_mem<S, F>(text: &[S], opts: &ExtMemOpts, emit: F) -> io::Result<()>
 where
     S: Ord + Copy + Sync + 'static,
     F: FnMut(u64) -> io::Result<()>,
 {
-    let n = text.len();
+    build_ext_mem_inner(text, PositionSource::Identity(text.len()), opts, emit)
+}
+
+/// Like [`build_ext_mem`] but sorts only the caller-supplied
+/// `positions` by the lexicographic order of their suffixes in `text`.
+/// Suffix content is always `text[position..]`; no positions are
+/// dropped from the input. To filter, the caller constructs
+/// `positions` with only the indices they want.
+///
+/// This lets STAR-style genome indexing skip the bin-padding
+/// pathology: pass only the ACGT-starting positions and the
+/// spacer-suffix work disappears.
+///
+/// `positions` does not need to be pre-sorted in any way.
+pub fn build_ext_mem_for_positions<S, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Ord + Copy + Sync + 'static,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    // We hold a reference to `positions` for the duration of the build;
+    // `phase1_sort_sample_spill` copies each chunk out. The Vec is
+    // dropped once phase 1 returns.
+    build_ext_mem_inner(text, PositionSource::Subset(&positions), opts, emit)
+}
+
+fn build_ext_mem_inner<S, F>(
+    text: &[S],
+    source: PositionSource<'_>,
+    opts: &ExtMemOpts,
+    mut emit: F,
+) -> io::Result<()>
+where
+    S: Ord + Copy + Sync + 'static,
+    F: FnMut(u64) -> io::Result<()>,
+{
+    let n = source.len();
     if n == 0 {
         return Ok(());
     }
@@ -102,7 +142,8 @@ where
     let dispatch = LcpDispatch::detect();
 
     // Phase 1: sort each subarray; sample uniformly; spill (pos, lcp).
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill(text, n, p, opts, dispatch)?;
+    let (mut subarray_buckets, samples) =
+        phase1_sort_sample_spill(text, &source, p, opts, dispatch)?;
 
     // Phase 2: globally sort samples; pick p-1 pivots.
     let pivots = phase2_select_pivots(text, samples, p, opts.max_context, dispatch);
@@ -125,6 +166,41 @@ where
     )
 }
 
+/// Source of the positions to sort. The all-suffixes case
+/// ([`PositionSource::Identity`]) avoids materialising a `Vec<u64>` of
+/// length `n`, which on the human genome would itself be ~25 GB.
+enum PositionSource<'a> {
+    Identity(usize),
+    Subset(&'a [u64]),
+}
+
+impl<'a> PositionSource<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Identity(n) => *n,
+            Self::Subset(p) => p.len(),
+        }
+    }
+
+    /// Fill `dst` with positions for the half-open subarray range
+    /// `[start, start + dst.len())`. For [`PositionSource::Identity`]
+    /// this generates the contiguous integer range on the fly; for
+    /// [`PositionSource::Subset`] it copies from the caller's slice.
+    fn fill_chunk(&self, start: usize, dst: &mut [u64]) {
+        match self {
+            Self::Identity(_) => {
+                for (i, slot) in dst.iter_mut().enumerate() {
+                    *slot = (start + i) as u64;
+                }
+            }
+            Self::Subset(p) => {
+                let end = start + dst.len();
+                dst.copy_from_slice(&p[start..end]);
+            }
+        }
+    }
+}
+
 fn effective_subproblem_count(n: usize, requested: usize) -> usize {
     if n == 0 {
         return 0;
@@ -141,7 +217,7 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
 /// `(position, lcp)` records to its own [`ExtMemBucket`].
 fn phase1_sort_sample_spill<S>(
     text: &[S],
-    n: usize,
+    source: &PositionSource<'_>,
     p: usize,
     opts: &ExtMemOpts,
     dispatch: LcpDispatch,
@@ -149,6 +225,7 @@ fn phase1_sort_sample_spill<S>(
 where
     S: Ord + Copy + Sync + 'static,
 {
+    let n = source.len();
     let chunk_size = n.div_ceil(p);
     let samples_target_total = sample_target_total(n, p);
 
@@ -165,7 +242,8 @@ where
             }
 
             // In-memory sort of this subarray with LCP maintenance.
-            let mut sa: Vec<u64> = (start as u64..end as u64).collect();
+            let mut sa: Vec<u64> = vec![0u64; len];
+            source.fill_chunk(start, &mut sa);
             let mut sa_w = vec![0u64; len];
             let mut lcp_arr = vec![0u64; len];
             let mut lcp_w = vec![0u64; len];
@@ -664,6 +742,58 @@ mod tests {
                 let mut text: Vec<u8> = (0..n).map(|_| rng.random_range(0..5u8)).collect();
                 text.push(200);
                 assert_matches_in_memory(&text, p);
+            }
+        }
+    }
+
+    fn ext_mem_for_positions(text: &[u8], positions: Vec<u64>, p: usize) -> Vec<u64> {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: p,
+            work_dir: dir.path().to_path_buf(),
+            ..ExtMemOpts::default()
+        };
+        let mut out: Vec<u64> = Vec::with_capacity(positions.len());
+        build_ext_mem_for_positions(text, positions, &opts, |pos| {
+            out.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn ext_mem_for_positions_full_set_matches_ext_mem() {
+        let text = b"mississippi";
+        let want = ext_mem_sa(text, 3);
+        let positions: Vec<u64> = (0..text.len() as u64).collect();
+        let got = ext_mem_for_positions(text, positions, 3);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ext_mem_for_positions_subset_matches_brute_force() {
+        let text = b"mississippi";
+        let positions: Vec<u64> = (0..text.len() as u64).step_by(2).collect();
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = ext_mem_for_positions(text, positions, 4);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ext_mem_for_positions_random_subsets() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0DE);
+        for &n in &[50usize, 500, 2000] {
+            for &p in &[1usize, 3, 8] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..5u8)).collect();
+                let mut positions: Vec<u64> = (0..n as u64).collect();
+                positions.retain(|_| rng.random_range(0..10) < 7);
+                let mut want = positions.clone();
+                want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+                let got = ext_mem_for_positions(&text, positions, p);
+                assert_eq!(got, want, "subset ext-mem mismatch n={n} p={p}");
             }
         }
     }

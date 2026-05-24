@@ -21,9 +21,12 @@ mod ext_mem;
 mod lcp;
 mod sample_sort;
 
-pub use ext_mem::{ExtMemOpts, build_ext_mem};
+pub use ext_mem::{ExtMemOpts, build_ext_mem, build_ext_mem_for_positions};
 pub use lcp::{LcpDispatch, lcp, lcp_scalar, lcp_u8, suffix_cmp};
-pub use sample_sort::{Opts, build_in_memory, build_in_memory_with_opts};
+pub use sample_sort::{
+    Opts, build_in_memory, build_in_memory_for_positions, build_in_memory_for_positions_with_opts,
+    build_in_memory_with_opts,
+};
 
 /// Trait implemented by integer types usable as suffix array indices.
 ///
