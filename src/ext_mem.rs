@@ -516,10 +516,12 @@ where
                 }
                 let records = bucket.load_all()?;
                 let boundaries: Vec<usize> = bucket.boundaries().to_vec();
-                let mut workspace = CascadeWorkspace::new();
-                let result =
-                    workspace.cascade_merge(text, &records, &boundaries, max_ctx, dispatch);
-                Ok(result.to_vec())
+                let workspace = CascadeWorkspace::new();
+                // `cascade_merge` consumes the workspace and returns
+                // the result side directly — the other three buffers
+                // drop along with `workspace` here, without an
+                // intermediate `to_vec()` copy.
+                Ok(workspace.cascade_merge(text, &records, &boundaries, max_ctx, dispatch))
             })
             .collect::<Result<Vec<_>, io::Error>>()?;
 
@@ -571,22 +573,26 @@ impl CascadeWorkspace {
 
     /// Cascade 2-way LCP-enhanced merges across the sub-subarrays of one
     /// partition (delimited by `boundaries`) until a single sorted run
-    /// remains. Returns a borrow of the buffer slot holding the final
-    /// sorted positions.
-    fn cascade_merge<'a, S>(
-        &'a mut self,
+    /// remains. **Consumes the workspace** and returns the result side
+    /// as a `Vec<u64>`; the other three buffers (`a_lcp`, the opposing
+    /// `*_sa`, the opposing `*_lcp`) drop immediately. This shape lets
+    /// the caller skip the per-partition `to_vec()` round-trip that
+    /// would otherwise sit briefly alongside all four workspace buffers
+    /// at peak.
+    fn cascade_merge<S>(
+        mut self,
         text: &[S],
         records: &[SaLcp],
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
-    ) -> &'a [u64]
+    ) -> Vec<u64>
     where
         S: Ord + Copy + 'static,
     {
         let n = records.len();
         if n == 0 {
-            return &self.a_sa[..0];
+            return Vec::new();
         }
         self.ensure_capacity(n);
 
@@ -610,11 +616,12 @@ impl CascadeWorkspace {
             src_is_a = !src_is_a;
         }
 
-        if src_is_a {
-            &self.a_sa[..n]
-        } else {
-            &self.b_sa[..n]
-        }
+        // Take ownership of the buffer holding the result, truncate to
+        // the actual record count, drop the other three buffers with
+        // `self` going out of scope.
+        let mut result = if src_is_a { self.a_sa } else { self.b_sa };
+        result.truncate(n);
+        result
     }
 
     /// Pair the runs in `run_lens` (last odd one passes through unchanged),
