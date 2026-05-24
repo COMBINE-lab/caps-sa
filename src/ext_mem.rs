@@ -32,6 +32,7 @@ use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -39,6 +40,17 @@ use crate::Index;
 use crate::ext_bucket::{BucketRecord, BucketStore, ExtMemBucket, InMemBucket, SaLcp};
 use crate::lcp::LcpDispatch;
 use crate::sample_sort;
+
+/// Emit a phase-timing line to stderr if `CAPS_SA_PROFILE` is set in
+/// the environment. Used to localise where the ext-mem path spends its
+/// time without paying the cost of always logging — see
+/// `bench/README.md` "Where AVX-512 helps and where it doesn't" for
+/// how this is used.
+fn profile_log(message: &str) {
+    if std::env::var_os("CAPS_SA_PROFILE").is_some() {
+        eprintln!("caps-sa profile  {message}");
+    }
+}
 
 /// Tunable options for [`build_ext_mem`].
 #[derive(Clone, Debug)]
@@ -151,12 +163,30 @@ where
     let dispatch = LcpDispatch::detect();
     let work_dir = opts.work_dir.clone();
 
+    profile_log(&format!(
+        "build_ext_mem n={n} p={p} index_width={}b",
+        std::mem::size_of::<I>() * 8
+    ));
+
     let sub_factory = |i: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("sub{i}"));
     let part_factory = |j: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("part{j}"));
 
+    let t = Instant::now();
     let (mut subarray_buckets, samples) =
         phase1_sort_sample_spill::<S, I, _, _>(text, &source, p, opts, dispatch, sub_factory)?;
+    profile_log(&format!(
+        "phase1 (sort+sample+spill) {:.3}s",
+        t.elapsed().as_secs_f64()
+    ));
+
+    let t = Instant::now();
     let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
+    profile_log(&format!(
+        "phase2 (select pivots)      {:.3}s",
+        t.elapsed().as_secs_f64()
+    ));
+
+    let t = Instant::now();
     let mut partition_buckets = phase3_distribute::<S, I, _, _>(
         text,
         &mut subarray_buckets,
@@ -166,14 +196,26 @@ where
         dispatch,
         part_factory,
     )?;
+    profile_log(&format!(
+        "phase3 (distribute)          {:.3}s",
+        t.elapsed().as_secs_f64()
+    ));
+
     drop(subarray_buckets);
-    phase4_merge_and_emit::<S, I, _, F>(
+
+    let t = Instant::now();
+    let result = phase4_merge_and_emit::<S, I, _, F>(
         text,
         &mut partition_buckets,
         opts.max_context,
         &mut emit,
         dispatch,
-    )
+    );
+    profile_log(&format!(
+        "phase4 (merge+emit)          {:.3}s",
+        t.elapsed().as_secs_f64()
+    ));
+    result
 }
 
 /// Same algorithm as [`build_ext_mem_inner`] but with the disk-backed
@@ -646,6 +688,15 @@ where
     }
     let chunk_size = rayon::current_num_threads().max(1);
 
+    // Per-thread CPU-µs accumulators for the two parallel sub-steps. They
+    // add across threads, so the printed values are CPU-time (sum), not
+    // wall-time; the ratio between them still tells us where the work is.
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    let profile = std::env::var_os("CAPS_SA_PROFILE").is_some();
+    let load_us = AtomicU64::new(0);
+    let merge_us = AtomicU64::new(0);
+    let mut emit_secs: f64 = 0.0;
+
     let mut start = 0;
     while start < n_partitions {
         let end = (start + chunk_size).min(n_partitions);
@@ -660,25 +711,48 @@ where
                 if bucket.total_records() == 0 {
                     return Ok(Vec::new());
                 }
+                let t = Instant::now();
                 let records = bucket.load_all()?;
                 let boundaries: Vec<usize> = bucket.boundaries().to_vec();
+                if profile {
+                    load_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+                }
+
+                let t = Instant::now();
                 let workspace = CascadeWorkspace::<I>::new();
                 // `cascade_merge` consumes the workspace and returns
                 // the result side directly — the other three buffers
                 // drop along with `workspace` here, without an
                 // intermediate `to_vec()` copy.
-                Ok(workspace.cascade_merge(text, &records, &boundaries, max_ctx, dispatch))
+                let result =
+                    workspace.cascade_merge(text, &records, &boundaries, max_ctx, dispatch);
+                if profile {
+                    merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+                }
+                Ok(result)
             })
             .collect::<Result<Vec<_>, io::Error>>()?;
 
+        let t = Instant::now();
         for positions in merged {
             for pos in positions {
                 // Widen back to the public `u64` emit contract.
                 emit(pos.to_usize() as u64)?;
             }
         }
+        if profile {
+            emit_secs += t.elapsed().as_secs_f64();
+        }
 
         start = end;
+    }
+    if profile {
+        profile_log(&format!(
+            "phase4 breakdown CPU: load {:.3}s merge {:.3}s; wall emit {:.3}s",
+            load_us.load(AtomicOrdering::Relaxed) as f64 * 1e-6,
+            merge_us.load(AtomicOrdering::Relaxed) as f64 * 1e-6,
+            emit_secs,
+        ));
     }
     Ok(())
 }
