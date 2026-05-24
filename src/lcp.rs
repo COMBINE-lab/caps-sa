@@ -172,9 +172,7 @@ unsafe fn lcp_u8_scalar(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usiz
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn lcp_u8_avx2(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
-    use std::arch::x86_64::{
-        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    };
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
     let n = text.len();
     let lim_p = n.saturating_sub(p).min(max_ctx);
     let lim_q = n.saturating_sub(q).min(max_ctx);

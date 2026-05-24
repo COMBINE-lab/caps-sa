@@ -125,19 +125,9 @@ where
     // `phase1_sort_sample_spill` copies each chunk out. The Vec is
     // dropped once phase 1 returns.
     if text.len() <= u32::MAX as usize + 1 {
-        build_ext_mem_inner::<S, u32, F>(
-            text,
-            PositionSource::Subset(&positions),
-            opts,
-            emit,
-        )
+        build_ext_mem_inner::<S, u32, F>(text, PositionSource::Subset(&positions), opts, emit)
     } else {
-        build_ext_mem_inner::<S, u64, F>(
-            text,
-            PositionSource::Subset(&positions),
-            opts,
-            emit,
-        )
+        build_ext_mem_inner::<S, u64, F>(text, PositionSource::Subset(&positions), opts, emit)
     }
 }
 
@@ -164,14 +154,8 @@ where
     let sub_factory = |i: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("sub{i}"));
     let part_factory = |j: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("part{j}"));
 
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, _, _>(
-        text,
-        &source,
-        p,
-        opts,
-        dispatch,
-        sub_factory,
-    )?;
+    let (mut subarray_buckets, samples) =
+        phase1_sort_sample_spill::<S, I, _, _>(text, &source, p, opts, dispatch, sub_factory)?;
     let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
     let mut partition_buckets = phase3_distribute::<S, I, _, _>(
         text,
@@ -224,14 +208,8 @@ where
 
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
 
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, _, _>(
-        text,
-        &source,
-        p,
-        opts,
-        dispatch,
-        factory,
-    )?;
+    let (mut subarray_buckets, samples) =
+        phase1_sort_sample_spill::<S, I, _, _>(text, &source, p, opts, dispatch, factory)?;
     let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
     let mut partition_buckets = phase3_distribute::<S, I, _, _>(
         text,
@@ -258,19 +236,25 @@ where
 /// `n ≤ 2³²`, falls back to `u64` otherwise. The caller's `emit`
 /// closure is called once per output position in lex order, just like
 /// in the ext-mem path.
-pub fn build_in_memory_sample_sort<S, F>(
-    text: &[S],
-    opts: &ExtMemOpts,
-    emit: F,
-) -> io::Result<()>
+pub fn build_in_memory_sample_sort<S, F>(text: &[S], opts: &ExtMemOpts, emit: F) -> io::Result<()>
 where
     S: Ord + Copy + Sync + 'static,
     F: FnMut(u64) -> io::Result<()>,
 {
     if text.len() <= u32::MAX as usize + 1 {
-        build_in_memory_ss_inner::<S, u32, F>(text, PositionSource::Identity(text.len()), opts, emit)
+        build_in_memory_ss_inner::<S, u32, F>(
+            text,
+            PositionSource::Identity(text.len()),
+            opts,
+            emit,
+        )
     } else {
-        build_in_memory_ss_inner::<S, u64, F>(text, PositionSource::Identity(text.len()), opts, emit)
+        build_in_memory_ss_inner::<S, u64, F>(
+            text,
+            PositionSource::Identity(text.len()),
+            opts,
+            emit,
+        )
     }
 }
 
@@ -287,19 +271,9 @@ where
     F: FnMut(u64) -> io::Result<()>,
 {
     if text.len() <= u32::MAX as usize + 1 {
-        build_in_memory_ss_inner::<S, u32, F>(
-            text,
-            PositionSource::Subset(&positions),
-            opts,
-            emit,
-        )
+        build_in_memory_ss_inner::<S, u32, F>(text, PositionSource::Subset(&positions), opts, emit)
     } else {
-        build_in_memory_ss_inner::<S, u64, F>(
-            text,
-            PositionSource::Subset(&positions),
-            opts,
-            emit,
-        )
+        build_in_memory_ss_inner::<S, u64, F>(text, PositionSource::Subset(&positions), opts, emit)
     }
 }
 

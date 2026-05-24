@@ -455,7 +455,8 @@ mod tests {
     fn round_trip_with_spill() {
         let dir = tempdir().unwrap();
         // Buffer capacity 3 → spill happens on the 4th, 7th, 10th add.
-        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::with_buffer_records(dir.path(), "spill", 3);
+        let mut b: ExtMemBucket<SaLcp<u64>> =
+            ExtMemBucket::with_buffer_records(dir.path(), "spill", 3);
         for i in 0..10 {
             b.add(SaLcp { pos: i, lcp: 0 }).unwrap();
         }
@@ -470,7 +471,8 @@ mod tests {
     #[test]
     fn add_slice_bulk_path() {
         let dir = tempdir().unwrap();
-        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::with_buffer_records(dir.path(), "bulk", 4);
+        let mut b: ExtMemBucket<SaLcp<u64>> =
+            ExtMemBucket::with_buffer_records(dir.path(), "bulk", 4);
         // Bulk insert larger than buffer → should hit the disk fast path.
         let mut input: Vec<SaLcp<u64>> = (0..100).map(|i| SaLcp { pos: i, lcp: 0 }).collect();
         b.add_slice(&input).unwrap();
