@@ -31,6 +31,7 @@
 use std::cmp::Ordering;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rayon::prelude::*;
 
@@ -207,15 +208,13 @@ impl<'a> PositionSource<'a> {
 /// work (which scales as `O(p² · log(n/p))`, sequentially) and a
 /// higher temp-file count.
 const PHASE1_TARGET_CHUNK: usize = 65_536;
-/// Hard cap on the number of subarrays. With phase 3 currently
-/// sequential, scaling `p` past a couple of thousand causes the
-/// `O(p²)` distribute pass to swamp the rest of the algorithm at
-/// human-genome scale (measured: `p = 8192` doubled the wall time
-/// relative to `p = 128` on GRCh38 at 32 threads, even though it cut
-/// peak RSS to ~6 GB). 2048 keeps phase 3 sub-second on a 3 GB input
-/// while pushing per-task scratch low enough for `T × n/p` workspace
-/// to fit comfortably alongside the loaded text.
-const PHASE1_MAX_PARTITIONS: usize = 2048;
+/// Hard cap on the number of subarrays. Matches upstream CaPS-SA's
+/// default of 8192 — phase 3 is now parallelised across rayon
+/// workers (each subarray distributes independently into per-partition
+/// `Mutex<ExtMemBucket>` slots), so the `O(p²)` sequential distribute
+/// of the original design no longer constrains us. The cap is still
+/// finite to keep the temp-file count bounded.
+const PHASE1_MAX_PARTITIONS: usize = 8192;
 
 fn effective_subproblem_count(n: usize, requested: usize) -> usize {
     if n == 0 {
@@ -379,12 +378,22 @@ where
     (1..p).map(|j| samples[(j * n_samples) / p]).collect()
 }
 
-/// Phase 3: walk each subarray (sequentially in this v1 — locks would be
-/// the only complication of a parallel version, deferred to a follow-up),
-/// load it into RAM, binary-search the pivots to find its `p` sub-subarray
-/// boundaries, and append each sub-subarray to the corresponding partition
-/// bucket. Marks a [`ExtMemBucket::mark_boundary`] after each non-empty
-/// contribution so the per-partition merge can recover the runs.
+/// Phase 3: walk each subarray *in parallel*, load it into RAM,
+/// binary-search the pivots to find its `p` sub-subarray boundaries,
+/// and append each sub-subarray to the corresponding partition bucket.
+///
+/// Partition buckets are wrapped in a [`Mutex`] each so multiple
+/// threads can write to different partitions concurrently without
+/// shard-merging afterwards. With `p` in the thousands and `T` in the
+/// tens, lock contention is negligible (probability that two threads
+/// want the same partition at the same instant is `~T/p`); the lock
+/// scope per acquisition is one `add_slice` + `mark_boundary` of a
+/// few-KB sub-subarray.
+///
+/// Phase 4 doesn't care about the relative order of sub-subarrays
+/// within a partition — only that each one between consecutive
+/// boundaries is internally sorted. Both properties hold under
+/// arbitrary thread interleaving.
 #[allow(clippy::too_many_arguments)]
 fn phase3_distribute<S>(
     text: &[S],
@@ -395,51 +404,59 @@ fn phase3_distribute<S>(
     dispatch: LcpDispatch,
 ) -> io::Result<Vec<ExtMemBucket<SaLcp>>>
 where
-    S: Ord + Copy + 'static,
+    S: Ord + Copy + Sync + 'static,
 {
-    let mut partition_buckets: Vec<ExtMemBucket<SaLcp>> = (0..p)
-        .map(|j| ExtMemBucket::new(&opts.work_dir, format!("part{j}")))
+    let partition_buckets: Vec<Mutex<ExtMemBucket<SaLcp>>> = (0..p)
+        .map(|j| Mutex::new(ExtMemBucket::new(&opts.work_dir, format!("part{j}"))))
         .collect();
 
-    for sub_bucket in subarray_buckets.iter_mut() {
-        if sub_bucket.total_records() == 0 {
-            continue;
-        }
-        let records = sub_bucket.load_all()?;
-
-        // Find p-1 split points by binary-searching each pivot's *upper
-        // bound* in the sorted subarray.
-        let mut splits = Vec::with_capacity(p + 1);
-        splits.push(0usize);
-        for &pivot in pivots {
-            splits.push(upper_bound_by_pivot(
-                &records,
-                pivot,
-                text,
-                opts.max_context,
-                dispatch,
-            ));
-        }
-        splits.push(records.len());
-
-        // Distribute each sub-subarray. Reset the first record's `lcp` to
-        // 0 so the per-partition merge sees a well-formed boundary.
-        for j in 0..p {
-            let lo = splits[j];
-            let hi = splits[j + 1];
-            if lo >= hi {
-                continue;
+    subarray_buckets
+        .par_iter_mut()
+        .try_for_each(|sub_bucket| -> io::Result<()> {
+            if sub_bucket.total_records() == 0 {
+                return Ok(());
             }
-            let mut sub: Vec<SaLcp> = records[lo..hi].to_vec();
-            sub[0].lcp = 0;
-            partition_buckets[j].add_slice(&sub)?;
-            partition_buckets[j].mark_boundary();
-        }
-        // `records` is dropped at end of loop iteration; the subarray
-        // bucket's underlying file is removed when it eventually drops.
-    }
+            let records = sub_bucket.load_all()?;
 
-    Ok(partition_buckets)
+            // Find p-1 split points by binary-searching each pivot's
+            // *upper bound* in the sorted subarray.
+            let mut splits = Vec::with_capacity(p + 1);
+            splits.push(0usize);
+            for &pivot in pivots {
+                splits.push(upper_bound_by_pivot(
+                    &records,
+                    pivot,
+                    text,
+                    opts.max_context,
+                    dispatch,
+                ));
+            }
+            splits.push(records.len());
+
+            // Distribute each sub-subarray. Reset the first record's
+            // `lcp` to 0 so the per-partition merge sees a well-formed
+            // boundary.
+            for j in 0..p {
+                let lo = splits[j];
+                let hi = splits[j + 1];
+                if lo >= hi {
+                    continue;
+                }
+                let mut sub: Vec<SaLcp> = records[lo..hi].to_vec();
+                sub[0].lcp = 0;
+                let mut bucket = partition_buckets[j].lock().unwrap();
+                bucket.add_slice(&sub)?;
+                bucket.mark_boundary();
+            }
+            Ok(())
+        })?;
+
+    // Unwrap the Mutexes — at this point only this thread holds
+    // references, so the locks are uncontended.
+    Ok(partition_buckets
+        .into_iter()
+        .map(|m| m.into_inner().expect("partition mutex poisoned"))
+        .collect())
 }
 
 /// Upper-bound binary search: returns the first index `i` such that the
