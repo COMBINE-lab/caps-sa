@@ -103,11 +103,14 @@ fn main() -> std::io::Result<()> {
         read_elapsed.as_secs_f64()
     );
 
-    // Pick the narrowest index type that can address `text`. u32 (and
-    // upstream's `i32` SA) lets the whole working set live in half the
-    // cache footprint when `n < 2^31`, which is a big win on
-    // moderately-large inputs.
-    let use_u32 = text.len() < (1usize << 31) && !args.ext_mem;
+    // Pick the narrowest index type that can address `text`. The
+    // ext-mem path keeps `u64` for now (its API and bucket records are
+    // hard-coded to `u64`); the in-mem path narrows to `u32` whenever
+    // every suffix position fits, which on a 64-bit `usize` host means
+    // `n <= u32::MAX + 1 = 2^32`. This matches what upstream CaPS-SA
+    // does with its `uint32_t` SA (good for ≤ 4 GB inputs — including
+    // the full human genome at n ≈ 3.1 × 10⁹).
+    let use_u32 = text.len() <= (u32::MAX as usize) + 1 && !args.ext_mem;
     let n_entries: usize;
     let build_elapsed;
     let write_elapsed;
@@ -130,28 +133,42 @@ fn main() -> std::io::Result<()> {
         }
         writer.flush()?;
         write_elapsed = write_start.elapsed();
-    } else {
-        let build_start = Instant::now();
-        let sa: Vec<u64> = if args.ext_mem {
-            let opts = ExtMemOpts {
-                subproblem_count: args.subproblem_count,
-                ..ExtMemOpts::default()
-            };
-            let mut out: Vec<u64> = Vec::with_capacity(text.len());
-            build_ext_mem(&text, &opts, |pos| {
-                out.push(pos);
-                Ok(())
-            })?;
-            out
-        } else {
-            let _ = args.subproblem_count;
-            build_in_memory(&text)
+    } else if args.ext_mem {
+        // Stream the SA straight from caps-sa's emit closure to the
+        // output file. The previous version accumulated each emitted
+        // `u64` into a `Vec<u64>` first, which silently turned the
+        // ext-mem path's bounded-memory contract into a `~8 × n` RAM
+        // hit at output time. Streaming here keeps peak RSS proportional
+        // to the algorithm's actual working set (text + workspace +
+        // bucket buffers).
+        let opts = ExtMemOpts {
+            subproblem_count: args.subproblem_count,
+            ..ExtMemOpts::default()
         };
+        let writer = std::cell::RefCell::new(BufWriter::new(fs::File::create(&args.output)?));
+        let mut count = 0usize;
+        let build_start = Instant::now();
+        build_ext_mem(&text, &opts, |pos| {
+            count += 1;
+            writer.borrow_mut().write_all(&pos.to_le_bytes())?;
+            Ok(())
+        })?;
+        build_elapsed = build_start.elapsed();
+        writer.borrow_mut().flush()?;
+        n_entries = count;
+        eprintln!(
+            "build: mode=ext-mem(u64,stream) n={n_entries} entries in {:.3}s",
+            build_elapsed.as_secs_f64()
+        );
+        write_elapsed = std::time::Duration::ZERO;
+    } else {
+        let _ = args.subproblem_count;
+        let build_start = Instant::now();
+        let sa: Vec<u64> = build_in_memory(&text);
         build_elapsed = build_start.elapsed();
         n_entries = sa.len();
         eprintln!(
-            "build: mode={}(u64) n={n_entries} entries in {:.3}s",
-            if args.ext_mem { "ext-mem" } else { "in-mem" },
+            "build: mode=in-mem(u64) n={n_entries} entries in {:.3}s",
             build_elapsed.as_secs_f64()
         );
         let write_start = Instant::now();
