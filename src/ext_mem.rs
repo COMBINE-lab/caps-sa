@@ -37,7 +37,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::Index;
-use crate::ext_bucket::{BucketRecord, BucketStore, ExtMemBucket, InMemBucket, SaLcp};
+use crate::ext_bucket::{BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp};
 use crate::lcp::LcpDispatch;
 use crate::sample_sort;
 
@@ -63,6 +63,19 @@ pub struct ExtMemOpts {
     pub subproblem_count: usize,
     /// Directory for temp files. Defaults to [`std::env::temp_dir`].
     pub work_dir: PathBuf,
+    /// Number of physical files in the bucket pool (one pool for the
+    /// phase-1 subarray buckets and a second for the phase-3 partition
+    /// buckets). `0` (default) picks `rayon::current_num_threads()` —
+    /// the right answer in practice: one writable inode per worker
+    /// keeps kernel-level write contention bounded.
+    ///
+    /// The `2 × p` logical buckets (typically thousands at genome
+    /// scale) collapse onto this pool of anonymous tempfiles via
+    /// `bucket_id % physical_file_count`. Larger values lower kernel
+    /// write contention; smaller values are kinder to networked
+    /// filesystems with high metadata cost. The `CAPS_SA_N_PHYS` env
+    /// var overrides this for one-off benches.
+    pub physical_file_count: usize,
 }
 
 impl Default for ExtMemOpts {
@@ -71,6 +84,7 @@ impl Default for ExtMemOpts {
             max_context: usize::MAX,
             subproblem_count: 0,
             work_dir: std::env::temp_dir(),
+            physical_file_count: 0,
         }
     }
 }
@@ -163,13 +177,26 @@ where
     let dispatch = LcpDispatch::detect();
     let work_dir = opts.work_dir.clone();
 
+    // Pool the `2 × p` bucket files into one anonymous tempfile per
+    // worker thread. With `p` in the thousands and `num_threads` in
+    // the dozens this collapses the openat/close/unlink budget from
+    // ~3·p (per-bucket-file path) to N (per-worker-file pool),
+    // eliminating the metadata-syscall pain on networked filesystems
+    // and the open-file-handle limit headache on tiny inputs. Per-
+    // bucket in-memory buffers and write volumes are unchanged, so
+    // local-disk wall time is neutral or marginally improved. See
+    // `bench/README.md` for the empirical sizing.
+    let n_phys = effective_physical_file_count(opts.physical_file_count);
+    let phase1_pool = BucketPool::new(n_phys, &work_dir)?;
+    let phase3_pool = BucketPool::new(n_phys, &work_dir)?;
+
     profile_log(&format!(
-        "build_ext_mem n={n} p={p} index_width={}b",
+        "build_ext_mem n={n} p={p} index_width={}b n_phys={n_phys}",
         std::mem::size_of::<I>() * 8
     ));
 
-    let sub_factory = |i: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("sub{i}"));
-    let part_factory = |j: usize| ExtMemBucket::<SaLcp<I>>::new(&work_dir, format!("part{j}"));
+    let sub_factory = |i: usize| phase1_pool.new_bucket::<SaLcp<I>>(i);
+    let part_factory = |j: usize| phase3_pool.new_bucket::<SaLcp<I>>(j);
 
     let t = Instant::now();
     let (mut subarray_buckets, samples) =
@@ -371,6 +398,27 @@ const PHASE1_TARGET_CHUNK: usize = 65_536;
 /// of the original design no longer constrains us. The cap is still
 /// finite to keep the temp-file count bounded.
 const PHASE1_MAX_PARTITIONS: usize = 8192;
+
+/// Resolve [`ExtMemOpts::physical_file_count`] for the current build.
+/// `0` (the default) means "let the runtime decide"; we pick
+/// `rayon::current_num_threads()` so the pool has one inode per
+/// concurrent writer, which empirically matches per-bucket-file wall
+/// time while collapsing thousands of small files into dozens of
+/// large ones. The `CAPS_SA_N_PHYS` env var overrides at the call
+/// site for benchmarks.
+fn effective_physical_file_count(requested: usize) -> usize {
+    if let Some(v) = std::env::var("CAPS_SA_N_PHYS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= 1)
+    {
+        return v;
+    }
+    if requested >= 1 {
+        return requested;
+    }
+    rayon::current_num_threads().max(1)
+}
 
 fn effective_subproblem_count(n: usize, requested: usize) -> usize {
     if n == 0 {

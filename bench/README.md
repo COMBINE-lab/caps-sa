@@ -133,7 +133,76 @@ Phase 2b ext-mem implementation:
 | + generic `SaLcp<I>` → `u32` for `n ≤ 2³²`                  | −0.0 | −3.03 GB (→ 5.10) |
 | + filesystem caching / rerun variance                        | −0.8 min | −0.11 GB (→ 4.99) |
 | + AVX-512 hybrid LCP (Opt 5)                                 | **−0.85 min** (→ 10.47) | ~0 (→ 5.03) |
-| **Net (v1 → today's tip)**                                   | **−0.45 min** | **−34.80 GB (−87%)** |
+| + Pooled bucket files (Opt 6)                                | +0.3 min (→ 10.78, noise) | **−0.31 GB** (→ 4.72) |
+| **Net (v1 → today's tip)**                                   | **−0.15 min** | **−35.11 GB (−88%)** |
+
+### Pooled bucket files — fewer fds, friendlier on NFS (Opt 6)
+
+The sample-sort algorithm needs `2·p` bucket-shaped storage regions
+(`p` for the phase-1 subarray spills, `p` for the phase-3 partition
+intermediate). With `p` auto-scaling to 8192 on the human genome,
+that's 16 384 backing files in the original design — one
+`NamedTempFile` per bucket. Three real-world headaches:
+
+- Open-file-handle limits. Some workstation shells default to
+  `RLIMIT_NOFILE = 1024`; many HPC nodes cap at 4096. 16 K files
+  blows through both.
+- NFS metadata cost. Each `openat`/`unlink` on a networked filesystem
+  is a synchronous server roundtrip (5–50 ms typical). 16 K of them
+  is minutes of pure metadata traffic before any data is moved.
+- Inode pressure on the filesystem (some tmpfs / scratch volumes are
+  inode-constrained).
+
+The fix is straightforward: pool the buckets onto a small set of
+anonymous tempfiles. `BucketPool::new(n_phys, work_dir)` opens
+`n_phys` already-unlinked tempfiles up front; each
+`PooledExtMemBucket` holds an `Arc<PhysicalFile>` to one of them and
+appends its flushes at offsets handed out by a per-file
+`AtomicU64::fetch_add`. Multiple threads in `pwrite` on the same fd
+don't conflict at disjoint offsets — the kernel serialises by
+`(fd, offset_range)` and the cursor allocates disjoint ranges,
+making the write path lock-free at user level.
+
+`load_all` reads the bucket's recorded extents back via `pread`. The
+extents per bucket are `O(records / buffer_records)` — small in
+absolute terms (a few hundred for a phase-4 partition at human scale),
+so the extent metadata is a few MB total across all buckets.
+
+`ExtMemOpts::physical_file_count = 0` (the default) resolves to
+`rayon::current_num_threads()` — one writable inode per worker, which
+empirically matches per-bucket-file wall time on rand100m, hum200m,
+yeast, and the full human genome. Callers who want to override (e.g.
+on a host with extreme file-descriptor or contention pressure) can
+set the field directly, or override at runtime via the
+`CAPS_SA_N_PHYS` env var.
+
+#### Empirical impact (AMD EPYC 9575F / Zen 5)
+
+```
+                              per-bucket files     pooled (N = num_threads)
+rand100m 32t openat calls           9 168                     76
+rand100m 32t unlink calls           3 052                      0   (anonymous)
+rand100m 32t wall                 ~11.2 s                  ~11.1 s
+rand100m 32t RSS                   632 MB                   610 MB
+human   32t wall                  10.47 min                10.78 min   (≈ run variance)
+human   32t RSS                    5.03 GB                  4.72 GB   (−6%)
+human   32t bucket files           16 384                       64
+```
+
+The wall time is **at parity** within run-to-run variance on every
+input we tested; RAM is **slightly lower** because we drop the
+per-bucket `BufWriter` + `NamedTempFile` metadata. The file-count
+collapse from `2·p` to `2·N` is the qualitative win — no more open-
+file-handle headaches, no more NFS metadata wall.
+
+A separate empirical guard for the `*_for_positions` rustar-aligner
+integration lives at [`examples/pathology_bench.rs`](../examples/pathology_bench.rs):
+it builds a synthetic spacer-padding fixture (the kind rustar-aligner
+hands us when `genomeChrBinNbits` rounds a small chromosome up to a
+much larger padded text) and times `build_ext_mem` (sort everything)
+against `build_ext_mem_for_positions` (sort only the kept positions)
+on the same fixture, showing **6–10× speedups** on padding-dominated
+inputs. The pool change leaves this gap intact.
 
 ### Where AVX-512 helps and where it doesn't — the measurement
 
