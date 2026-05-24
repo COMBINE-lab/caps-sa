@@ -51,17 +51,38 @@ impl BucketRecord for u64 {
 }
 
 /// A `(position, lcp)` pair — the workhorse record for the Phase 2b
-/// sample-sort partitioned merge, where each disk-spilled run carries an
-/// LCP value alongside each position. Unused in the Phase 2 v1 streaming
-/// p-way merge (which spills bare `u64` positions).
+/// sample-sort partitioned merge, where each disk-spilled run carries
+/// an LCP value alongside each position. Generic over the index width
+/// so genome-scale inputs that fit in `u32` (anything below ~4 GB) can
+/// use the 8-byte record, halving phase-1 spill / phase-4 partition
+/// bytes.
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct SaLcp {
-    pub pos: u64,
-    pub lcp: u64,
+pub struct SaLcp<I> {
+    pub pos: I,
+    pub lcp: I,
 }
 
-impl BucketRecord for SaLcp {
+impl BucketRecord for SaLcp<u32> {
+    const SIZE: usize = 8;
+
+    #[inline]
+    fn write_to(&self, out: &mut [u8]) {
+        debug_assert_eq!(out.len(), 8);
+        out[0..4].copy_from_slice(&self.pos.to_le_bytes());
+        out[4..8].copy_from_slice(&self.lcp.to_le_bytes());
+    }
+
+    #[inline]
+    fn read_from(bytes: &[u8]) -> Self {
+        debug_assert_eq!(bytes.len(), 8);
+        let pos = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let lcp = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        SaLcp { pos, lcp }
+    }
+}
+
+impl BucketRecord for SaLcp<u64> {
     const SIZE: usize = 16;
 
     #[inline]
@@ -327,7 +348,7 @@ mod tests {
     #[test]
     fn round_trip_below_buffer() {
         let dir = tempdir().unwrap();
-        let mut b: ExtMemBucket<SaLcp> = ExtMemBucket::new(dir.path(), "test");
+        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::new(dir.path(), "test");
         for i in 0..10 {
             b.add(SaLcp { pos: i, lcp: i * 2 }).unwrap();
         }
@@ -349,7 +370,7 @@ mod tests {
     fn round_trip_with_spill() {
         let dir = tempdir().unwrap();
         // Buffer capacity 3 → spill happens on the 4th, 7th, 10th add.
-        let mut b: ExtMemBucket<SaLcp> = ExtMemBucket::with_buffer_records(dir.path(), "spill", 3);
+        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::with_buffer_records(dir.path(), "spill", 3);
         for i in 0..10 {
             b.add(SaLcp { pos: i, lcp: 0 }).unwrap();
         }
@@ -364,9 +385,9 @@ mod tests {
     #[test]
     fn add_slice_bulk_path() {
         let dir = tempdir().unwrap();
-        let mut b: ExtMemBucket<SaLcp> = ExtMemBucket::with_buffer_records(dir.path(), "bulk", 4);
+        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::with_buffer_records(dir.path(), "bulk", 4);
         // Bulk insert larger than buffer → should hit the disk fast path.
-        let mut input: Vec<SaLcp> = (0..100).map(|i| SaLcp { pos: i, lcp: 0 }).collect();
+        let mut input: Vec<SaLcp<u64>> = (0..100).map(|i| SaLcp { pos: i, lcp: 0 }).collect();
         b.add_slice(&input).unwrap();
         assert_eq!(b.total_records(), 100);
         // Add a few singles to populate the buffer afterwards.
@@ -381,7 +402,7 @@ mod tests {
     #[test]
     fn boundaries_track_sub_subarrays() {
         let dir = tempdir().unwrap();
-        let mut b: ExtMemBucket<SaLcp> = ExtMemBucket::new(dir.path(), "bounds");
+        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::new(dir.path(), "bounds");
         for i in 0..3 {
             b.add(SaLcp { pos: i, lcp: 0 }).unwrap();
         }
@@ -405,7 +426,7 @@ mod tests {
     #[test]
     fn empty_bucket() {
         let dir = tempdir().unwrap();
-        let mut b: ExtMemBucket<SaLcp> = ExtMemBucket::new(dir.path(), "empty");
+        let mut b: ExtMemBucket<SaLcp<u64>> = ExtMemBucket::new(dir.path(), "empty");
         assert_eq!(b.total_records(), 0);
         let loaded = b.load_all().unwrap();
         assert!(loaded.is_empty());

@@ -35,6 +35,7 @@ use std::sync::Mutex;
 
 use rayon::prelude::*;
 
+use crate::Index;
 use crate::ext_bucket::{ExtMemBucket, SaLcp};
 use crate::lcp::LcpDispatch;
 use crate::sample_sort;
@@ -88,7 +89,15 @@ where
     S: Ord + Copy + Sync + 'static,
     F: FnMut(u64) -> io::Result<()>,
 {
-    build_ext_mem_inner(text, PositionSource::Identity(text.len()), opts, emit)
+    // Dispatch on text size: when every suffix position fits in `u32`
+    // (n ≤ 2^32), use the narrow record type to halve all the SaLcp
+    // bytes — bucket disk I/O, phase-1 records, and the per-partition
+    // load in phase 4.
+    if text.len() <= u32::MAX as usize + 1 {
+        build_ext_mem_inner::<S, u32, F>(text, PositionSource::Identity(text.len()), opts, emit)
+    } else {
+        build_ext_mem_inner::<S, u64, F>(text, PositionSource::Identity(text.len()), opts, emit)
+    }
 }
 
 /// Like [`build_ext_mem`] but sorts only the caller-supplied
@@ -115,10 +124,24 @@ where
     // We hold a reference to `positions` for the duration of the build;
     // `phase1_sort_sample_spill` copies each chunk out. The Vec is
     // dropped once phase 1 returns.
-    build_ext_mem_inner(text, PositionSource::Subset(&positions), opts, emit)
+    if text.len() <= u32::MAX as usize + 1 {
+        build_ext_mem_inner::<S, u32, F>(
+            text,
+            PositionSource::Subset(&positions),
+            opts,
+            emit,
+        )
+    } else {
+        build_ext_mem_inner::<S, u64, F>(
+            text,
+            PositionSource::Subset(&positions),
+            opts,
+            emit,
+        )
+    }
 }
 
-fn build_ext_mem_inner<S, F>(
+fn build_ext_mem_inner<S, I, F>(
     text: &[S],
     source: PositionSource<'_>,
     opts: &ExtMemOpts,
@@ -126,6 +149,8 @@ fn build_ext_mem_inner<S, F>(
 ) -> io::Result<()>
 where
     S: Ord + Copy + Sync + 'static,
+    I: Index,
+    SaLcp<I>: crate::ext_bucket::BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
 {
     let n = source.len();
@@ -144,21 +169,21 @@ where
 
     // Phase 1: sort each subarray; sample uniformly; spill (pos, lcp).
     let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill(text, &source, p, opts, dispatch)?;
+        phase1_sort_sample_spill::<S, I>(text, &source, p, opts, dispatch)?;
 
     // Phase 2: globally sort samples; pick p-1 pivots.
-    let pivots = phase2_select_pivots(text, samples, p, opts.max_context, dispatch);
+    let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
 
     // Phase 3: distribute each subarray into per-partition buckets.
     let mut partition_buckets =
-        phase3_distribute(text, &mut subarray_buckets, &pivots, p, opts, dispatch)?;
+        phase3_distribute::<S, I>(text, &mut subarray_buckets, &pivots, p, opts, dispatch)?;
 
     // Subarray buckets are no longer needed — drop early to release
     // their disk space.
     drop(subarray_buckets);
 
     // Phase 4 & 5: per-partition cascade merge + stream output.
-    phase4_merge_and_emit(
+    phase4_merge_and_emit::<S, I, F>(
         text,
         &mut partition_buckets,
         opts.max_context,
@@ -184,19 +209,23 @@ impl<'a> PositionSource<'a> {
     }
 
     /// Fill `dst` with positions for the half-open subarray range
-    /// `[start, start + dst.len())`. For [`PositionSource::Identity`]
-    /// this generates the contiguous integer range on the fly; for
-    /// [`PositionSource::Subset`] it copies from the caller's slice.
-    fn fill_chunk(&self, start: usize, dst: &mut [u64]) {
+    /// `[start, start + dst.len())`, narrowing the caller's `u64`
+    /// positions into `I` via [`Index::from_usize`]. For
+    /// [`PositionSource::Identity`] this generates the contiguous
+    /// integer range on the fly; for [`PositionSource::Subset`] it
+    /// reads from the caller's slice.
+    fn fill_chunk<I: Index>(&self, start: usize, dst: &mut [I]) {
         match self {
             Self::Identity(_) => {
                 for (i, slot) in dst.iter_mut().enumerate() {
-                    *slot = (start + i) as u64;
+                    *slot = I::from_usize(start + i);
                 }
             }
             Self::Subset(p) => {
                 let end = start + dst.len();
-                dst.copy_from_slice(&p[start..end]);
+                for (slot, &v) in dst.iter_mut().zip(p[start..end].iter()) {
+                    *slot = I::from_usize(v as usize);
+                }
             }
         }
     }
@@ -246,21 +275,23 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
 /// `p` (target chunk ~ 64 K records), per-task scratch is ~18 MiB on
 /// human-scale inputs, so the `num_threads × per_task_scratch` peak
 /// stays bounded even though we don't reuse buffers across iterations.
-fn phase1_sort_sample_spill<S>(
+fn phase1_sort_sample_spill<S, I>(
     text: &[S],
     source: &PositionSource<'_>,
     p: usize,
     opts: &ExtMemOpts,
     dispatch: LcpDispatch,
-) -> io::Result<(Vec<ExtMemBucket<SaLcp>>, Vec<u64>)>
+) -> io::Result<(Vec<ExtMemBucket<SaLcp<I>>>, Vec<I>)>
 where
     S: Ord + Copy + Sync + 'static,
+    I: Index,
+    SaLcp<I>: crate::ext_bucket::BucketRecord,
 {
     let n = source.len();
     let chunk_size = n.div_ceil(p);
     let samples_target_total = sample_target_total(n, p);
 
-    let per_subarray: Vec<(ExtMemBucket<SaLcp>, Vec<u64>)> = (0..p)
+    let per_subarray: Vec<(ExtMemBucket<SaLcp<I>>, Vec<I>)> = (0..p)
         .into_par_iter()
         .map(|i| {
             let start = (i * chunk_size).min(n);
@@ -273,11 +304,11 @@ where
             }
 
             // In-memory sort of this subarray with LCP maintenance.
-            let mut sa: Vec<u64> = vec![0u64; len];
+            let mut sa: Vec<I> = vec![I::zero(); len];
             source.fill_chunk(start, &mut sa);
-            let mut sa_w = vec![0u64; len];
-            let mut lcp_arr = vec![0u64; len];
-            let mut lcp_w = vec![0u64; len];
+            let mut sa_w = vec![I::zero(); len];
+            let mut lcp_arr = vec![I::zero(); len];
+            let mut lcp_w = vec![I::zero(); len];
             sample_sort::merge_sort(
                 text,
                 &mut sa,
@@ -297,10 +328,10 @@ where
             // Spill (position, lcp) records to the bucket. `lcp[0]`
             // remains 0 (set by the merge-sort base case), making each
             // subarray its own well-formed LCP-annotated sorted run.
-            let records: Vec<SaLcp> = sa
+            let records: Vec<SaLcp<I>> = sa
                 .iter()
                 .zip(lcp_arr.iter())
-                .map(|(&p, &l)| SaLcp { pos: p, lcp: l })
+                .map(|(&pos, &lcp)| SaLcp { pos, lcp })
                 .collect();
             bucket.add_slice(&records)?;
 
@@ -347,23 +378,24 @@ fn evenly_spaced<T: Copy>(xs: &[T], count: usize) -> Vec<T> {
 
 /// Phase 2: globally sort the pooled samples and pick `p − 1` pivots at
 /// evenly-spaced ranks.
-fn phase2_select_pivots<S>(
+fn phase2_select_pivots<S, I>(
     text: &[S],
-    mut samples: Vec<u64>,
+    mut samples: Vec<I>,
     p: usize,
     max_ctx: usize,
     dispatch: LcpDispatch,
-) -> Vec<u64>
+) -> Vec<I>
 where
     S: Ord + Copy + Sync + 'static,
+    I: Index,
 {
     if p <= 1 || samples.is_empty() {
         return Vec::new();
     }
     let n_samples = samples.len();
-    let mut sa_w = vec![0u64; n_samples];
-    let mut lcp = vec![0u64; n_samples];
-    let mut lcp_w = vec![0u64; n_samples];
+    let mut sa_w = vec![I::zero(); n_samples];
+    let mut lcp = vec![I::zero(); n_samples];
+    let mut lcp_w = vec![I::zero(); n_samples];
     sample_sort::merge_sort(
         text,
         &mut samples,
@@ -395,18 +427,20 @@ where
 /// boundaries is internally sorted. Both properties hold under
 /// arbitrary thread interleaving.
 #[allow(clippy::too_many_arguments)]
-fn phase3_distribute<S>(
+fn phase3_distribute<S, I>(
     text: &[S],
-    subarray_buckets: &mut [ExtMemBucket<SaLcp>],
-    pivots: &[u64],
+    subarray_buckets: &mut [ExtMemBucket<SaLcp<I>>],
+    pivots: &[I],
     p: usize,
     opts: &ExtMemOpts,
     dispatch: LcpDispatch,
-) -> io::Result<Vec<ExtMemBucket<SaLcp>>>
+) -> io::Result<Vec<ExtMemBucket<SaLcp<I>>>>
 where
     S: Ord + Copy + Sync + 'static,
+    I: Index,
+    SaLcp<I>: crate::ext_bucket::BucketRecord,
 {
-    let partition_buckets: Vec<Mutex<ExtMemBucket<SaLcp>>> = (0..p)
+    let partition_buckets: Vec<Mutex<ExtMemBucket<SaLcp<I>>>> = (0..p)
         .map(|j| Mutex::new(ExtMemBucket::new(&opts.work_dir, format!("part{j}"))))
         .collect();
 
@@ -442,8 +476,8 @@ where
                 if lo >= hi {
                     continue;
                 }
-                let mut sub: Vec<SaLcp> = records[lo..hi].to_vec();
-                sub[0].lcp = 0;
+                let mut sub: Vec<SaLcp<I>> = records[lo..hi].to_vec();
+                sub[0].lcp = I::zero();
                 let mut bucket = partition_buckets[j].lock().unwrap();
                 bucket.add_slice(&sub)?;
                 bucket.mark_boundary();
@@ -462,21 +496,22 @@ where
 /// Upper-bound binary search: returns the first index `i` such that the
 /// suffix at `records[i].pos` is **strictly greater than** the suffix at
 /// `pivot`.
-fn upper_bound_by_pivot<S>(
-    records: &[SaLcp],
-    pivot: u64,
+fn upper_bound_by_pivot<S, I>(
+    records: &[SaLcp<I>],
+    pivot: I,
     text: &[S],
     max_ctx: usize,
     dispatch: LcpDispatch,
 ) -> usize
 where
     S: Ord + Copy + 'static,
+    I: Index,
 {
     let mut lo = 0;
     let mut hi = records.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        match dispatch.suffix_cmp(text, records[mid].pos as usize, pivot as usize, max_ctx) {
+        match dispatch.suffix_cmp(text, records[mid].pos.to_usize(), pivot.to_usize(), max_ctx) {
             Ordering::Greater => hi = mid,
             Ordering::Equal | Ordering::Less => lo = mid + 1,
         }
@@ -500,15 +535,17 @@ where
 /// subarrays the per-partition size is `≈ n / p`, so this stays
 /// proportional to `n / 4 = 0.25 n` even at the peak — well below the
 /// in-memory path's `~4 n` working set.
-fn phase4_merge_and_emit<S, F>(
+fn phase4_merge_and_emit<S, I, F>(
     text: &[S],
-    partition_buckets: &mut [ExtMemBucket<SaLcp>],
+    partition_buckets: &mut [ExtMemBucket<SaLcp<I>>],
     max_ctx: usize,
     emit: &mut F,
     dispatch: LcpDispatch,
 ) -> io::Result<()>
 where
     S: Ord + Copy + Sync + 'static,
+    I: Index,
+    SaLcp<I>: crate::ext_bucket::BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
 {
     let n_partitions = partition_buckets.len();
@@ -525,15 +562,15 @@ where
         // Parallel-merge each non-empty bucket in this chunk. `par_iter_mut`
         // preserves index order in the collected `Vec`, so the subsequent
         // sequential emit yields positions in lex order.
-        let merged: Vec<Vec<u64>> = chunk
+        let merged: Vec<Vec<I>> = chunk
             .par_iter_mut()
-            .map(|bucket| -> io::Result<Vec<u64>> {
+            .map(|bucket| -> io::Result<Vec<I>> {
                 if bucket.total_records() == 0 {
                     return Ok(Vec::new());
                 }
                 let records = bucket.load_all()?;
                 let boundaries: Vec<usize> = bucket.boundaries().to_vec();
-                let workspace = CascadeWorkspace::new();
+                let workspace = CascadeWorkspace::<I>::new();
                 // `cascade_merge` consumes the workspace and returns
                 // the result side directly — the other three buffers
                 // drop along with `workspace` here, without an
@@ -544,7 +581,8 @@ where
 
         for positions in merged {
             for pos in positions {
-                emit(pos)?;
+                // Widen back to the public `u64` emit contract.
+                emit(pos.to_usize() as u64)?;
             }
         }
 
@@ -560,14 +598,14 @@ where
 /// flipping a `src_is_a` flag after each level. Avoids the
 /// per-level allocations that the previous immutable-`Vec` cascade
 /// performed for every pair of sub-subarrays.
-struct CascadeWorkspace {
-    a_sa: Vec<u64>,
-    a_lcp: Vec<u64>,
-    b_sa: Vec<u64>,
-    b_lcp: Vec<u64>,
+struct CascadeWorkspace<I> {
+    a_sa: Vec<I>,
+    a_lcp: Vec<I>,
+    b_sa: Vec<I>,
+    b_lcp: Vec<I>,
 }
 
-impl CascadeWorkspace {
+impl<I: Index> CascadeWorkspace<I> {
     fn new() -> Self {
         Self {
             a_sa: Vec::new(),
@@ -581,10 +619,10 @@ impl CascadeWorkspace {
     /// the cascade's actual run lengths are don't-care.
     fn ensure_capacity(&mut self, n: usize) {
         if self.a_sa.len() < n {
-            self.a_sa.resize(n, 0);
-            self.a_lcp.resize(n, 0);
-            self.b_sa.resize(n, 0);
-            self.b_lcp.resize(n, 0);
+            self.a_sa.resize(n, I::zero());
+            self.a_lcp.resize(n, I::zero());
+            self.b_sa.resize(n, I::zero());
+            self.b_lcp.resize(n, I::zero());
         }
     }
 
@@ -599,11 +637,11 @@ impl CascadeWorkspace {
     fn cascade_merge<S>(
         mut self,
         text: &[S],
-        records: &[SaLcp],
+        records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
-    ) -> Vec<u64>
+    ) -> Vec<I>
     where
         S: Ord + Copy + 'static,
     {
