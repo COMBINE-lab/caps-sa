@@ -201,12 +201,37 @@ impl<'a> PositionSource<'a> {
     }
 }
 
+/// Target subarray size used by [`effective_subproblem_count`] when
+/// auto-picking `p`. Smaller means more (smaller) subarrays — lower
+/// per-task phase-1 scratch, at the cost of more phase-3 distribute
+/// work (which scales as `O(p² · log(n/p))`, sequentially) and a
+/// higher temp-file count.
+const PHASE1_TARGET_CHUNK: usize = 65_536;
+/// Hard cap on the number of subarrays. With phase 3 currently
+/// sequential, scaling `p` past a couple of thousand causes the
+/// `O(p²)` distribute pass to swamp the rest of the algorithm at
+/// human-genome scale (measured: `p = 8192` doubled the wall time
+/// relative to `p = 128` on GRCh38 at 32 threads, even though it cut
+/// peak RSS to ~6 GB). 2048 keeps phase 3 sub-second on a 3 GB input
+/// while pushing per-task scratch low enough for `T × n/p` workspace
+/// to fit comfortably alongside the loaded text.
+const PHASE1_MAX_PARTITIONS: usize = 2048;
+
 fn effective_subproblem_count(n: usize, requested: usize) -> usize {
     if n == 0 {
         return 0;
     }
     let raw = if requested == 0 {
-        rayon::current_num_threads().saturating_mul(4)
+        let nthreads = rayon::current_num_threads().max(1);
+        let p_from_size = n.div_ceil(PHASE1_TARGET_CHUNK);
+        // At least one chunk per thread (otherwise we leave cores idle),
+        // at most `PHASE1_MAX_PARTITIONS` (so phase 3's sequential
+        // `O(p²)` sweep and the temp-file count stay manageable). For
+        // small inputs `p_from_size` is well below the cap, so the
+        // formula degrades gracefully to roughly "one chunk per thread";
+        // for human-scale inputs the cap binds and per-task scratch
+        // stays in the tens-of-MB range.
+        p_from_size.clamp(nthreads, PHASE1_MAX_PARTITIONS)
     } else {
         requested
     };
@@ -215,6 +240,13 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
 
 /// Phase 1: sort each subarray in parallel, sample from it, and spill
 /// `(position, lcp)` records to its own [`ExtMemBucket`].
+///
+/// One rayon task per subarray; rayon's work-stealing scheduler keeps
+/// all worker threads busy and lets `merge_sort`'s inner
+/// [`rayon::join`] recursion steal idle slots. With the auto-picked
+/// `p` (target chunk ~ 64 K records), per-task scratch is ~18 MiB on
+/// human-scale inputs, so the `num_threads × per_task_scratch` peak
+/// stays bounded even though we don't reuse buffers across iterations.
 fn phase1_sort_sample_spill<S>(
     text: &[S],
     source: &PositionSource<'_>,
