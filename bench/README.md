@@ -81,6 +81,42 @@ upstream ext-mem. The only configuration still losing to upstream is
 **rand100m / 4-thread / in-memory** — see "Where the differences still
 come from" below.
 
+### Human genome — GRCh38 primary assembly, 3.10 GB raw text
+
+| Configuration            | 32 threads |             |             |
+| ------------------------ | ---------- | ----------- | ----------- |
+|                          | wall (min) | RSS (GB)    | vs upstream |
+| upstream C++ in-mem      | 10.50      | 49.60       | 0.96× / 7.68× |
+| upstream C++ ext-mem     | **10.93**  | 6.46        | 1.00× / 1.00× |
+| **caps-sa Rust ext-mem** | **11.32**  | **4.99**    | **1.04× / 0.77×** |
+| caps-sa Rust in-mem-ss   | 11.64      | 55.00       | 1.07× / 8.52× |
+
+`vs upstream` columns are relative to upstream ext-mem (the natural
+peer-to-peer comparison). **caps-sa ext-mem is within 4% of upstream's
+wall time and uses 23% less RAM.** The in-mem-ss path runs the same
+sample-sort algorithm against [`InMemBucket`][bucket] instead of
+disk-backed [`ExtMemBucket`][bucket]; on this benchmark it's strictly
+Pareto-worse than ext-mem (same wall, 11× the RAM), which is a useful
+result on its own — it says disk I/O is essentially free in our
+ext-mem path at this scale, and the remaining 4% gap is purely
+algorithmic (rayon vs Parlay, AVX2 vs AVX-512).
+
+[bucket]: ../src/ext_bucket.rs
+
+The optimization stack that closed the gap on the human genome,
+starting from the initial Phase 2b ext-mem implementation:
+
+| Step | Δ wall | Δ RSS |
+| ---- | ------ | ----- |
+| Phase 2b baseline (`p = 128`, no streaming, no `u32` lift) | — | 39.83 GB |
+| + ext-mem `Vec<u64>` streaming CLI                          | ~0  | →49 GB transient |
+| + auto-scale `p` with text length                           | +1.1 min | **−31.7 GB** (→ 8.13) |
+| + phase-4 `cascade_merge` consumes its workspace            | ~0  | ~0 |
+| + phase-3 parallelised + `p_max = 8192`                      | ~0  | ~0 (unlocks larger `p`) |
+| + generic `SaLcp<I>` → `u32` for `n ≤ 2³²`                  | −0.0 | −3.03 GB (→ 5.10) |
+| + filesystem caching / rerun variance                        | −0.8 min | −0.11 GB (→ 4.99) |
+| **Net (v1 → today's tip)**                                   | **+0.4 min** | **−34.84 GB (−87%)** |
+
 ## SIMD LCP — AVX2 + NEON, dispatched once
 
 The `u8`-specialized LCP path is dispatched at runtime by
