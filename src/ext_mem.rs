@@ -38,7 +38,7 @@ use rayon::prelude::*;
 
 use crate::Index;
 use crate::ext_bucket::{BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp};
-use crate::lcp::LcpDispatch;
+use crate::lcp::{LcpDispatch, Symbol};
 use crate::sample_sort;
 
 /// Emit a phase-timing line to stderr if `CAPS_SA_PROFILE` is set in
@@ -112,7 +112,7 @@ impl ExtMemOpts {
 /// smaller when one runs off the end" tie-break.
 pub fn build_ext_mem<S, F>(text: &[S], opts: &ExtMemOpts, emit: F) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
     // Dispatch on text size: when every suffix position fits in `u32`
@@ -144,7 +144,7 @@ pub fn build_ext_mem_for_positions<S, F>(
     emit: F,
 ) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
     // We hold a reference to `positions` for the duration of the build;
@@ -164,7 +164,7 @@ fn build_ext_mem_inner<S, I, F>(
     mut emit: F,
 ) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
     SaLcp<I>: BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
@@ -263,7 +263,7 @@ fn build_in_memory_ss_inner<S, I, F>(
     mut emit: F,
 ) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
     SaLcp<I>: BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
@@ -307,7 +307,7 @@ where
 /// in the ext-mem path.
 pub fn build_in_memory_sample_sort<S, F>(text: &[S], opts: &ExtMemOpts, emit: F) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
     if text.len() <= u32::MAX as usize + 1 {
@@ -336,7 +336,7 @@ pub fn build_in_memory_sample_sort_for_positions<S, F>(
     emit: F,
 ) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
     if text.len() <= u32::MAX as usize + 1 {
@@ -460,7 +460,7 @@ fn phase1_sort_sample_spill<S, I, B, MkB>(
     mk_bucket: MkB,
 ) -> io::Result<(Vec<B>, Vec<I>)>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
@@ -565,7 +565,7 @@ fn phase2_select_pivots<S, I>(
     dispatch: LcpDispatch,
 ) -> Vec<I>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
 {
     if p <= 1 || samples.is_empty() {
@@ -616,7 +616,7 @@ fn phase3_distribute<S, I, B, MkB>(
     mk_bucket: MkB,
 ) -> io::Result<Vec<B>>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
@@ -685,7 +685,7 @@ fn upper_bound_by_pivot<S, I>(
     dispatch: LcpDispatch,
 ) -> usize
 where
-    S: Ord + Copy + 'static,
+    S: Symbol,
     I: Index,
 {
     let mut lo = 0;
@@ -724,7 +724,7 @@ fn phase4_merge_and_emit<S, I, B, F>(
     dispatch: LcpDispatch,
 ) -> io::Result<()>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
@@ -873,7 +873,7 @@ impl<I: Index> CascadeWorkspace<I> {
         dispatch: LcpDispatch,
     ) -> Vec<I>
     where
-        S: Ord + Copy + 'static,
+        S: Symbol,
     {
         let n = records.len();
         if n == 0 {
@@ -923,7 +923,7 @@ impl<I: Index> CascadeWorkspace<I> {
         dispatch: LcpDispatch,
     ) -> Vec<usize>
     where
-        S: Ord + Copy + 'static,
+        S: Symbol,
     {
         // Destructure self so the borrow checker can see the two sides as
         // disjoint locals — we borrow one immutably and the other mutably.

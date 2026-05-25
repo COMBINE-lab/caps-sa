@@ -7,32 +7,95 @@
 //! holds a function pointer chosen by [`is_x86_feature_detected!`] /
 //! [`is_aarch64_feature_detected!`] at construction time, so the hot path
 //! is a single indirect call through a register — no per-call atomic
-//! loads, no per-call feature-detection branches, no per-call `TypeId`
-//! checks once monomorphization has resolved `S`.
+//! loads, no per-call feature-detection branches.
 //!
 //! The free-standing [`lcp`] / [`suffix_cmp`] / [`lcp_u8`] helpers remain
 //! for one-off callers (and for the tests in this file). They construct a
 //! [`LcpDispatch`] on every call and are correspondingly slower; algorithm
 //! kernels should prefer the methods on [`LcpDispatch`].
+//!
+//! ## Symbol types
+//!
+//! The whole crate is generic over any [`Symbol`] type. `Symbol` is an
+//! `unsafe` marker for types whose in-memory bytes encode equality
+//! (`a == b` iff their byte representations are equal) — i.e. no padding,
+//! no invalid bit patterns. Blanket impls are provided for every stdlib
+//! integer type and for fixed-size arrays of `Symbol`s, so `u8`, `u16`,
+//! `u32`, `u64`, `[u8; 3]` (24-bit), … all work out of the box. The LCP
+//! function casts `&[S]` to a byte view, runs a single byte-level SIMD
+//! compare (AVX-512BW hybrid → AVX2 → NEON → scalar), then divides the
+//! byte-LCP by `size_of::<S>()` to get the symbol-LCP. Endianness is
+//! irrelevant because the byte-compare resolves equality only; symbol
+//! ordering is recovered by the caller's `text[lcp].cmp(&text[lcp + 1])`
+//! using `S`'s native `Ord`.
 
-use std::any::TypeId;
 use std::cmp::Ordering;
 
-/// A function-pointer dispatch for byte-text LCP. The architecture-specific
-/// pointer is selected once at construction by feature detection; later
-/// calls reduce to a register-resident indirect call.
+/// A symbol type for suffix-array construction. All stdlib unsigned
+/// and signed integer types satisfy this, as does `[T; N]` for any
+/// `T: Symbol` (arrays have no padding and inherit `Ord`
+/// lexicographically from `T`). To use a custom type as a symbol,
+/// implement this trait yourself; if the type contains padding, mark
+/// it `#[repr(C, packed)]` first.
 ///
-/// `LcpDispatch` is `Copy`, `Send`, and `Sync` (a function pointer is all
-/// three), so it threads freely through `rayon` boundaries.
+/// The trait bundles every other bound the algorithm needs from a
+/// symbol type ([`Ord`] + [`Copy`] + [`Send`] + [`Sync`] + `'static`),
+/// so the public API surface only ever needs `S: Symbol`.
+///
+/// # Safety
+///
+/// Implementations must guarantee that bit-equality of the in-memory
+/// representation implies value-equality — i.e. **no padding bytes**,
+/// **no invalid bit patterns** that two distinct values could share.
+/// The byte-view SIMD LCP path in [`LcpDispatch::lcp`] casts `&[S]`
+/// to a `&[u8]` view and compares bytes; if two distinct `S` values
+/// could have identical bytes, or one `S` value could have two
+/// different byte representations (e.g. via uninitialised padding),
+/// the LCP function would return wrong answers and corrupt the
+/// resulting suffix array.
+pub unsafe trait Symbol: Ord + Copy + Send + Sync + 'static {}
+
+macro_rules! impl_symbol_for_primitives {
+    ($($t:ty),* $(,)?) => {
+        $(
+            // SAFETY: stdlib primitive integers have no padding and every
+            // bit pattern is a valid value, so byte-equality is exactly
+            // value-equality.
+            unsafe impl Symbol for $t {}
+        )*
+    };
+}
+impl_symbol_for_primitives!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize,
+);
+
+// SAFETY: arrays of `Symbol`s have no padding (Rust arrays are tightly
+// packed) and inherit equality element-wise, so byte-equality of the
+// whole array is exactly value-equality. This covers patterns like
+// `[u8; 3]` for 24-bit alphabets and `[u32; 2]` for 64-bit-on-32-bit.
+unsafe impl<T: Symbol, const N: usize> Symbol for [T; N] {}
+
+/// A function-pointer dispatch for byte-level LCP. The architecture-
+/// specific pointer is selected once at construction by feature
+/// detection; later calls reduce to a register-resident indirect call.
+///
+/// `LcpDispatch` is `Copy`, `Send`, and `Sync` (a function pointer is
+/// all three), so it threads freely through `rayon` boundaries.
+///
+/// The same byte-level function backs every symbol width: the
+/// [`Self::lcp`] method casts `&[S]` to a byte view, calls the function
+/// with byte-scale offsets, and divides the result by `size_of::<S>()`
+/// to recover the symbol-level LCP.
 #[derive(Copy, Clone)]
 pub struct LcpDispatch {
-    lcp_u8_fn: LcpU8Fn,
+    lcp_bytes_fn: LcpBytesFn,
 }
 
-/// Internal function-pointer type for the `u8`-specialized LCP path.
-/// `unsafe fn` because the AVX2 / NEON variants are `#[target_feature]`
-/// gated; the dispatch's owner has already verified CPU support.
-type LcpU8Fn = unsafe fn(&[u8], usize, usize, usize) -> usize;
+/// Internal function-pointer type for the byte-level LCP path.
+/// `unsafe fn` because the AVX2 / AVX-512 / NEON variants are
+/// `#[target_feature]` gated; the dispatch's owner has already
+/// verified CPU support.
+type LcpBytesFn = unsafe fn(&[u8], usize, usize, usize) -> usize;
 
 impl LcpDispatch {
     /// Detect the best LCP implementation for this CPU. Cheap (a couple
@@ -40,7 +103,7 @@ impl LcpDispatch {
     /// feature-detection cache, so call it **once** per top-level build.
     pub fn detect() -> Self {
         Self {
-            lcp_u8_fn: pick_lcp_u8_impl(),
+            lcp_bytes_fn: pick_lcp_bytes_impl(),
         }
     }
 
@@ -48,31 +111,43 @@ impl LcpDispatch {
     /// want a deterministic baseline.
     pub fn scalar() -> Self {
         Self {
-            lcp_u8_fn: lcp_u8_scalar,
+            lcp_bytes_fn: lcp_bytes_scalar,
         }
     }
 
-    /// Longest common prefix of `text[p..]` and `text[q..]`, bounded by
-    /// `max_ctx`. Dispatches to the captured byte-text fast path when
-    /// `S` is `u8`; falls back to portable scalar for any other symbol
-    /// type.
+    /// Longest common prefix of `text[p..]` and `text[q..]` in symbols,
+    /// bounded by `max_ctx`. For any `S: Symbol` of non-zero size, this
+    /// dispatches to the byte-level SIMD path with byte-scaled offsets
+    /// and returns `byte_lcp / size_of::<S>()`.
     #[inline]
-    pub fn lcp<S>(&self, text: &[S], p: usize, q: usize, max_ctx: usize) -> usize
-    where
-        S: Eq + 'static,
-    {
-        if TypeId::of::<S>() == TypeId::of::<u8>() {
-            // SAFETY: the `TypeId` check guarantees `S == u8`, so `&[S]`
-            // and `&[u8]` are the same type at runtime. We reinterpret
-            // the slice header without changing its length/alignment.
-            // After monomorphization on a concrete `S` and with LTO this
-            // whole branch folds to either the byte path or the scalar
-            // path with no runtime test.
-            let text_u8: &[u8] =
-                unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-            return unsafe { (self.lcp_u8_fn)(text_u8, p, q, max_ctx) };
+    pub fn lcp<S: Symbol>(&self, text: &[S], p: usize, q: usize, max_ctx: usize) -> usize {
+        let k = std::mem::size_of::<S>();
+        if k == 0 {
+            // ZSTs: `Symbol` permits ZSTs (e.g. a unit `struct Foo;`),
+            // but the byte-view dispatch can't divide by zero. Such a
+            // text has zero bytes regardless of length, so every suffix
+            // is identical and the LCP is just the length-bounded `lim`.
+            let lim_p = text.len().saturating_sub(p).min(max_ctx);
+            let lim_q = text.len().saturating_sub(q).min(max_ctx);
+            return lim_p.min(lim_q);
         }
-        lcp_scalar(text, p, q, max_ctx)
+        // SAFETY: `Symbol`'s `unsafe` contract is exactly "bit-equality
+        // is value-equality" — `&[S]` has the same byte representation
+        // as a `&[u8]` view over the same bytes, with no padding to
+        // worry about. `size_of_val(text)` gives the slice's exact
+        // byte length, which Rust's slice invariant already guarantees
+        // fits in `isize`.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, size_of_val(text)) };
+        let byte_lcp = unsafe {
+            (self.lcp_bytes_fn)(
+                bytes,
+                p.saturating_mul(k),
+                q.saturating_mul(k),
+                max_ctx.saturating_mul(k),
+            )
+        };
+        byte_lcp / k
     }
 
     /// Total order on two suffixes of `text`. Uses [`Self::lcp`] for the
@@ -80,10 +155,13 @@ impl LcpDispatch {
     /// both suffixes are exhausted within `max_ctx` — orders by remaining
     /// length (shorter is smaller, the convention SAIS and CaPS-SA use).
     #[inline]
-    pub fn suffix_cmp<S>(&self, text: &[S], p: usize, q: usize, max_ctx: usize) -> Ordering
-    where
-        S: Ord + 'static,
-    {
+    pub fn suffix_cmp<S: Symbol>(
+        &self,
+        text: &[S],
+        p: usize,
+        q: usize,
+        max_ctx: usize,
+    ) -> Ordering {
         let n = text.len();
         let lim_p = n - p;
         let lim_q = n - q;
@@ -101,33 +179,30 @@ impl LcpDispatch {
 /// for tests / introspection, slower than reusing one [`LcpDispatch`]
 /// across an algorithm's inner loop.
 #[inline]
-pub fn lcp<S>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usize
-where
-    S: Eq + 'static,
-{
+pub fn lcp<S: Symbol>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usize {
     LcpDispatch::detect().lcp(text, p, q, max_ctx)
 }
 
 /// One-off suffix comparison; see [`lcp`] for the cost note.
 #[inline]
-pub fn suffix_cmp<S>(text: &[S], p: usize, q: usize, max_ctx: usize) -> Ordering
-where
-    S: Ord + 'static,
-{
+pub fn suffix_cmp<S: Symbol>(text: &[S], p: usize, q: usize, max_ctx: usize) -> Ordering {
     LcpDispatch::detect().suffix_cmp(text, p, q, max_ctx)
 }
 
-/// One-off `u8`-typed LCP that auto-selects AVX2 / NEON / scalar. Skips
-/// the generic `TypeId` branch; otherwise equivalent in cost to
-/// [`lcp`] for byte texts.
+/// One-off `u8`-typed LCP that auto-selects AVX-512 / AVX2 / NEON /
+/// scalar. Convenience entry point for byte texts; equivalent in cost
+/// to `LcpDispatch::detect().lcp::<u8>(...)` but skips the generic
+/// indirection.
 #[inline]
 pub fn lcp_u8(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
-    let f = pick_lcp_u8_impl();
+    let f = pick_lcp_bytes_impl();
     unsafe { f(text, p, q, max_ctx) }
 }
 
-/// Generic scalar LCP. Public so callers that already know their symbol
-/// type isn't `u8` can skip both dispatch and `TypeId` check.
+/// Generic scalar LCP. Public so callers that already know they can
+/// skip the SIMD dispatch (e.g. non-`Symbol` symbol types like
+/// arbitrary `Eq` newtypes) can call this directly. Still
+/// symbol-granularity; just doesn't go through the byte view.
 #[inline]
 pub fn lcp_scalar<S: Eq>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usize {
     let n = text.len();
@@ -144,8 +219,8 @@ pub fn lcp_scalar<S: Eq>(text: &[S], p: usize, q: usize, max_ctx: usize) -> usiz
     i
 }
 
-/// Inspect this CPU's features and return the best [`LcpU8Fn`].
-fn pick_lcp_u8_impl() -> LcpU8Fn {
+/// Inspect this CPU's features and return the best [`LcpBytesFn`].
+fn pick_lcp_bytes_impl() -> LcpBytesFn {
     #[cfg(target_arch = "x86_64")]
     {
         // AVX-512BW gives us a 64-byte byte-compare returning a 64-bit
@@ -153,24 +228,25 @@ fn pick_lcp_u8_impl() -> LcpU8Fn {
         // Both `f` (foundation) and `bw` (byte/word ops, for the
         // `_mm512_cmpeq_epi8_mask` we use) are required.
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
-            return lcp_u8_avx512;
+            return lcp_bytes_avx512;
         }
         if std::is_x86_feature_detected!("avx2") {
-            return lcp_u8_avx2;
+            return lcp_bytes_avx2;
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
-            return lcp_u8_neon;
+            return lcp_bytes_neon;
         }
     }
-    lcp_u8_scalar
+    lcp_bytes_scalar
 }
 
-/// `unsafe fn`-typed scalar — wrapper around [`lcp_scalar`] so all three
-/// dispatch targets share the [`LcpU8Fn`] signature.
-unsafe fn lcp_u8_scalar(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+/// `unsafe fn`-typed scalar — wrapper around [`lcp_scalar`] for the
+/// `u8` instantiation so all dispatch targets share the [`LcpBytesFn`]
+/// signature.
+unsafe fn lcp_bytes_scalar(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
     lcp_scalar(text, p, q, max_ctx)
 }
 
@@ -180,16 +256,16 @@ unsafe fn lcp_u8_scalar(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usiz
 /// gives the first differing byte.
 ///
 /// The function leads with a single 32-byte AVX2 step. This keeps the
-/// short-LCP regime (random DNA, where every call typically resolves in
-/// the first ≤16 bytes) at AVX2's per-call cost — a 64-byte load + ZMM
-/// register usage on a call that exits inside the first 32 bytes is
-/// wasted work. Once we've established the LCP exceeds 32 bytes we
+/// short-LCP regime (random DNA, where every call typically resolves
+/// in the first ≤16 bytes) at AVX2's per-call cost — a 64-byte load +
+/// ZMM register usage on a call that exits inside the first 32 bytes
+/// is wasted work. Once we've established the LCP exceeds 32 bytes we
 /// switch to the 64-byte stride for the rest of the comparison, which
-/// is the regime the upstream genome bench (and `lcp_u8_avx512`'s
+/// is the regime the upstream genome bench (and this function's
 /// reason for existing) actually hits.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn lcp_u8_avx512(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+unsafe fn lcp_bytes_avx512(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
     use std::arch::x86_64::{
         __m256i, __m512i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
         _mm512_cmpeq_epi8_mask, _mm512_loadu_si512,
@@ -261,7 +337,7 @@ unsafe fn lcp_u8_avx512(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usiz
 /// via `_mm256_movemask_epi8` + `trailing_zeros`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn lcp_u8_avx2(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+unsafe fn lcp_bytes_avx2(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
     let n = text.len();
     let lim_p = n.saturating_sub(p).min(max_ctx);
@@ -296,7 +372,7 @@ unsafe fn lcp_u8_avx2(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize 
 /// `trailing_zeros / 4` gives the byte index.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn lcp_u8_neon(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
+unsafe fn lcp_bytes_neon(text: &[u8], p: usize, q: usize, max_ctx: usize) -> usize {
     use std::arch::aarch64::{
         vceqq_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16,
     };
@@ -426,6 +502,115 @@ mod tests {
             text[diff_at] = b'G';
             let got = detected.lcp(&text, 0, 256, usize::MAX);
             assert_eq!(got, diff_at, "diff_at={diff_at}");
+        }
+    }
+
+    /// SIMD-vs-scalar agreement for `u16` text. The byte-view dispatch
+    /// must return symbol-LCPs that match the scalar walk over `&[u16]`.
+    /// Covers the case where the first differing byte lands inside a
+    /// symbol whose previous bytes were equal (e.g. low byte of u16
+    /// equal, high byte differs).
+    #[test]
+    fn simd_matches_scalar_on_u16() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1357);
+
+        // Place a difference at every interesting byte boundary within
+        // and across symbols; the symbol-LCP should equal byte_diff/2.
+        let mut text = vec![0u16; 256];
+        for byte_diff_at in [0usize, 1, 2, 3, 31, 32, 33, 63, 64, 65, 127, 128, 200] {
+            text.iter_mut().for_each(|x| *x = 0xAAAA);
+            // Flip one bit inside `text[byte_diff_at / 2]`, in either
+            // the low or high byte depending on parity.
+            let sym = byte_diff_at / 2;
+            let mask = if byte_diff_at % 2 == 0 {
+                0x00FF
+            } else {
+                0xFF00
+            };
+            text[sym] ^= mask & 0xAAAA; // toggle the bit pattern
+            let got = lcp(&text, 0, 128, usize::MAX);
+            // The first differing symbol is `byte_diff_at / 2`.
+            assert_eq!(
+                got, sym,
+                "byte_diff_at={byte_diff_at}, expected symbol {sym}"
+            );
+        }
+
+        // Random u16 texts: dispatched path must equal scalar.
+        for &n in &[1usize, 16, 17, 100, 500] {
+            let text: Vec<u16> = (0..n).map(|_| rng.random_range(0..16u16)).collect();
+            for _ in 0..20 {
+                let p = rng.random_range(0..n);
+                let q = rng.random_range(0..n);
+                let want = lcp_scalar(&text, p, q, usize::MAX);
+                let got = lcp(&text, p, q, usize::MAX);
+                assert_eq!(got, want, "u16 p={p} q={q} n={n}");
+            }
+        }
+    }
+
+    /// Same agreement check at `u32` granularity (4-byte symbols).
+    #[test]
+    fn simd_matches_scalar_on_u32() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x2468);
+
+        for &n in &[1usize, 8, 9, 100, 500] {
+            let text: Vec<u32> = (0..n).map(|_| rng.random_range(0..32u32)).collect();
+            for _ in 0..20 {
+                let p = rng.random_range(0..n);
+                let q = rng.random_range(0..n);
+                let want = lcp_scalar(&text, p, q, usize::MAX);
+                let got = lcp(&text, p, q, usize::MAX);
+                assert_eq!(got, want, "u32 p={p} q={q} n={n}");
+            }
+        }
+    }
+
+    /// 24-bit alphabet via `[u8; 3]`: every symbol-LCP must equal the
+    /// scalar walk's. Exercises a symbol width that doesn't divide any
+    /// SIMD chunk evenly.
+    #[test]
+    fn simd_matches_scalar_on_u8_3() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xACAC);
+
+        for &n in &[1usize, 8, 22, 100, 333] {
+            let text: Vec<[u8; 3]> = (0..n)
+                .map(|_| {
+                    [
+                        rng.random_range(0..4u8),
+                        rng.random_range(0..4u8),
+                        rng.random_range(0..4u8),
+                    ]
+                })
+                .collect();
+            for _ in 0..20 {
+                let p = rng.random_range(0..n);
+                let q = rng.random_range(0..n);
+                let want = lcp_scalar(&text, p, q, usize::MAX);
+                let got = lcp(&text, p, q, usize::MAX);
+                assert_eq!(got, want, "[u8;3] p={p} q={q} n={n}");
+            }
+        }
+    }
+
+    /// `u64` agreement — 8-byte symbols.
+    #[test]
+    fn simd_matches_scalar_on_u64() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFEED);
+
+        for &n in &[1usize, 4, 5, 50, 250] {
+            let text: Vec<u64> = (0..n).map(|_| rng.random_range(0..64u64)).collect();
+            for _ in 0..20 {
+                let p = rng.random_range(0..n);
+                let q = rng.random_range(0..n);
+                let want = lcp_scalar(&text, p, q, usize::MAX);
+                let got = lcp(&text, p, q, usize::MAX);
+                assert_eq!(got, want, "u64 p={p} q={q} n={n}");
+            }
         }
     }
 }

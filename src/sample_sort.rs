@@ -31,7 +31,7 @@
 //!   symbol scan and compare.
 
 use crate::Index;
-use crate::lcp::LcpDispatch;
+use crate::lcp::{LcpDispatch, Symbol};
 use rayon::join;
 
 /// Tunable options for SA construction.
@@ -64,7 +64,7 @@ impl Default for Opts {
 /// smaller than all of `S`.
 pub fn build_in_memory<S, I>(text: &[S]) -> Vec<I>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
 {
     build_in_memory_with_opts(text, &Opts::default())
@@ -73,7 +73,7 @@ where
 /// Variant of [`build_in_memory`] that accepts tuning options.
 pub fn build_in_memory_with_opts<S, I>(text: &[S], opts: &Opts) -> Vec<I>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
 {
     let n = text.len();
@@ -97,7 +97,7 @@ where
 /// constructs `positions` with only the indices they want.
 pub fn build_in_memory_for_positions<S, I>(text: &[S], positions: Vec<I>) -> Vec<I>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
 {
     build_in_memory_for_positions_with_opts(text, positions, &Opts::default())
@@ -110,7 +110,7 @@ pub fn build_in_memory_for_positions_with_opts<S, I>(
     opts: &Opts,
 ) -> Vec<I>
 where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
 {
     let n = positions.len();
@@ -163,7 +163,7 @@ pub(crate) fn merge_sort<S, I>(
     max_ctx: usize,
     dispatch: LcpDispatch,
 ) where
-    S: Ord + Copy + Sync + 'static,
+    S: Symbol,
     I: Index,
 {
     let n = sa.len();
@@ -219,7 +219,7 @@ pub(crate) fn merge<S, I>(
     max_ctx: usize,
     dispatch: LcpDispatch,
 ) where
-    S: Ord + Copy + 'static,
+    S: Symbol,
     I: Index,
 {
     let len_x = x.len();

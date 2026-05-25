@@ -135,7 +135,78 @@ Phase 2b ext-mem implementation:
 | + AVX-512 hybrid LCP (Opt 5)                                 | **−0.85 min** (→ 10.47) | ~0 (→ 5.03) |
 | + Pooled bucket files (Opt 6)                                | +0.3 min (→ 10.78, noise) | **−0.31 GB** (→ 4.72) |
 | + Phase 4 chunk-size = 4·num_threads (Opt 7)                  | **−0.64 min** (→ 10.14) | ~0 (→ 4.98) |
+| + `Symbol` trait + byte-view SIMD (Opt 8)                     | ~0 (genome stays u8) | ~0 |
 | **Net (v1 → today's tip)**                                   | **−0.77 min** | **−34.85 GB (−88%)** |
+
+### `Symbol` trait — SIMD LCP for arbitrary alphabets (Opt 8)
+
+The LCP fast path was originally u8-only (TypeId-gated dispatch in
+`LcpDispatch::lcp<S: Eq + 'static>`). Any other symbol type — `u16`
+for >125-chromosome genome indexes, `u32` for large-alphabet integer
+texts, `[u8; 3]` for 24-bit-packed data — fell through to the scalar
+`lcp_scalar`. That left a clean architectural ceiling of one
+microsecond per call regardless of how long the LCP ran, which is
+~20× the SIMD path on a long-LCP regime.
+
+The fix collapses every symbol width onto a single byte-level SIMD
+function. Reasoning: an LCP only needs *equality* on the shared
+prefix, not ordering — and **byte-equality of two `[S]` slices is
+exactly value-equality** for any `S` with no padding and no invalid
+bit patterns. So `LcpDispatch::lcp<S: Symbol>` becomes:
+
+```rust
+let k = std::mem::size_of::<S>();
+let bytes = unsafe {
+    std::slice::from_raw_parts(text.as_ptr() as *const u8, size_of_val(text))
+};
+let byte_lcp = unsafe {
+    (self.lcp_bytes_fn)(bytes, p * k, q * k, max_ctx.saturating_mul(k))
+};
+byte_lcp / k
+```
+
+`Symbol` is the new public marker trait — `unsafe trait Symbol: Ord +
+Copy + Send + Sync + 'static` — with blanket impls for every stdlib
+integer (`u8` through `u128`, `i8` through `i128`, `usize`, `isize`)
+and for `[T; N]` of any `T: Symbol`. Users get the SIMD path for free
+on any of those; custom types opt in via `unsafe impl Symbol for
+MyNewtype {}` once they've verified the no-padding / byte-faithful-
+equality invariant.
+
+The byte-view trick has a nice subtlety: the SIMD compare's "first
+differing byte" might land *inside* a partially-equal symbol (e.g.
+on `u16`, low byte equal, high byte differs). `byte_lcp / k` rounds
+down to the symbol containing that byte, which is the correct
+symbol-LCP — every preceding symbol had every byte equal, this
+symbol differs at byte offset `byte_lcp mod k`. **Endianness doesn't
+matter** because the SIMD compare resolves equality only; the order
+of two differing symbols is recovered by `S::cmp` after the LCP via
+`text[lcp].cmp(&text[lcp + 1])`.
+
+#### Empirical impact (AMD EPYC 9575F, 1 M symbols, long-LCP regime)
+
+```
+                 scalar baseline    Symbol-trait SIMD    speedup
+u8 (1 B/sym)       198.8 ms             4.4 ms          45.0×
+u16 (2 B/sym)      198.8 ms             7.0 ms          28.3×
+[u8; 3] (3 B/sym)  233.9 ms            10.2 ms          22.9×
+u32 (4 B/sym)      198.8 ms            13.7 ms          14.5×
+u64 (8 B/sym)      198.8 ms            28.6 ms           7.0×
+```
+
+The SIMD-vs-scalar ratio scales as ~`64 / size_of::<S>()` (minus per-
+call constant overhead that bites harder on the wider symbols). The
+u8 ratio is the AVX-512 stride (64 bytes); every other ratio comes
+"for free" because the same instruction does the work.
+
+The crate's marquee genome bench stays on `u8` (single-byte alphabet
+for ACGT + N + spacer + sentinels), so this opt doesn't move the
+GRCh38 wall — it's an enabling change for downstream consumers. The
+practical use case in rustar-aligner: highly-fragmented assemblies
+that need more than 125 spacer-sentinel values, which the previous
+plan deferred to a "Phase 3 `u16` fallback" — that path is now a
+one-line type swap (`Vec<u8>` → `Vec<u16>`) on the rustar-aligner
+side with no caps-sa work.
 
 ### Phase 4 chunk-size — unblock rayon work-stealing (Opt 7)
 

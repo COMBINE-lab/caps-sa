@@ -3,23 +3,24 @@
 A pure-Rust implementation of **CaPS-SA** (Khan et al., WABI 2023), a
 cache-friendly, parallel, sample-sort-based suffix array constructor.
 
-The crate is generic over the symbol type (`u8`, `u16`, …; any `Ord +
-Copy`) and the index type (`u32`, `u64`, `usize`), produces a standard
-lexicographic suffix array, and scales to human-genome inputs (≈ 6 ×
-10⁹ symbols) on commodity hardware via an external-memory sample-sort
-path that streams the SA out as positions are emitted.
+The crate is generic over the symbol type (`u8`, `u16`, `u32`, `u64`,
+`[u8; N]`, … — anything implementing the [`Symbol`] trait) and the
+index type (`u32`, `u64`, `usize`), produces a standard lexicographic
+suffix array, and scales to human-genome inputs (≈ 6 × 10⁹ symbols) on
+commodity hardware via an external-memory sample-sort path that
+streams the SA out as positions are emitted.
 
 ## Status
 
 Both the in-memory and external-memory paths are implemented, tested,
-and benchmarked. 35 unit tests pass and the SA output is differentially
+and benchmarked. 43 unit tests pass and the SA output is differentially
 verified against a brute-force reference on small and random inputs.
 
 On the human genome (GRCh38, 32 threads on AMD EPYC 9575F), caps-sa is
-**4% faster than upstream CaPS-SA's ext-mem path** and uses **22% less
-RAM**, while matching upstream's in-mem wall time at 1/10 of the RAM.
-See [`bench/README.md`](bench/README.md) for the full methodology and
-the optimisation ladder that got us there.
+**7% faster than upstream CaPS-SA's ext-mem path** and uses **23% less
+RAM**, while beating upstream's in-mem wall time by 3% at 1/10 of the
+RAM. See [`bench/README.md`](bench/README.md) for the full methodology
+and the optimisation ladder that got us there.
 
 The crate ships four entry points sharing one LCP-enhanced merge
 kernel:
@@ -34,7 +35,14 @@ kernel:
 All four paths share the same SIMD LCP fast path (AVX-512BW hybrid →
 AVX2 → NEON → scalar), selected once per build entry via
 `LcpDispatch::detect()` and threaded into the inner loop as a function
-pointer — no per-call feature-detect overhead.
+pointer — no per-call feature-detect overhead. The same byte-level
+SIMD function backs **every symbol width** via a byte-view dispatch in
+`LcpDispatch::lcp<S: Symbol>`: a single AVX-512 byte-compare followed
+by `byte_lcp / size_of::<S>()` recovers the symbol-LCP for `u16`,
+`u32`, `[u8; 3]`, `u64`, and any other `Symbol`. Measured on a Zen 5
+host this lifts the LCP function from ~200 ms scalar to 4–29 ms SIMD
+across widths (7× on `u64` to 45× on `u8` for a 1 M-symbol long-LCP
+microbench).
 
 ## Example
 
