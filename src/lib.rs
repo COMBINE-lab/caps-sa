@@ -23,8 +23,9 @@ mod limits;
 mod sample_sort;
 
 pub use ext_mem::{
-    ExtMemOpts, build_ext_mem, build_ext_mem_for_positions, build_ext_mem_for_positions_with,
-    build_ext_mem_with, build_in_memory_sample_sort, build_in_memory_sample_sort_for_positions,
+    ExtMemOpts, build_ext_mem, build_ext_mem_for_filter, build_ext_mem_for_filter_with,
+    build_ext_mem_for_positions, build_ext_mem_for_positions_with, build_ext_mem_with,
+    build_in_memory_sample_sort, build_in_memory_sample_sort_for_positions,
     build_in_memory_sample_sort_for_positions_with, build_in_memory_sample_sort_with,
 };
 pub use lcp::{LcpDispatch, Symbol, lcp, lcp_scalar, lcp_u8, suffix_cmp};

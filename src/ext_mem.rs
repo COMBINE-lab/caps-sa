@@ -213,6 +213,76 @@ where
     }
 }
 
+/// Like [`build_ext_mem_for_positions`] but takes a **predicate** over
+/// text positions instead of a pre-materialised `Vec<u64>` of kept
+/// positions.
+///
+/// caps-sa walks the predicate **once** to build a bitmap of kept
+/// positions + a tiny per-block popcount prefix-sum (together ~`n / 8`
+/// bytes — ~770 MB on the human genome, vs the ~50 GB the equivalent
+/// `Vec<u64>` would take). Phase 1's per-subarray fill is then driven
+/// by popcount-walking the bitmap; the predicate is **never invoked
+/// again** after the initial build. See [`FilteredSource`] for the
+/// memory accounting and the inner loop.
+///
+/// Use this entry when the caller already has the text in RAM and
+/// the kept positions are described by a cheap per-position
+/// predicate (e.g. STAR's `text[p] < 4` for ACGT-only suffix
+/// sampling). It is **the right entry for genome-scale inputs** —
+/// the `Vec<u64>` path can dominate peak RSS otherwise.
+///
+/// `keep` is invoked from rayon worker threads in parallel during
+/// the bitmap build; it must be `Send + Sync` (typically a plain
+/// closure capturing only `&[u8]` references is fine).
+pub fn build_ext_mem_for_filter<S, F, Pred>(
+    text: &[S],
+    keep: Pred,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Symbol,
+    F: FnMut(u64) -> io::Result<()>,
+    Pred: Fn(u64) -> bool + Send + Sync,
+{
+    build_ext_mem_for_filter_with(text, keep, &PlainText::new(text.len()), opts, emit)
+}
+
+/// Variant of [`build_ext_mem_for_filter`] that accepts a
+/// [`LimitProvider`]. See [`build_ext_mem_with`] for the semantics.
+pub fn build_ext_mem_for_filter_with<S, L, F, Pred>(
+    text: &[S],
+    keep: Pred,
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> io::Result<()>,
+    Pred: Fn(u64) -> bool + Send + Sync,
+{
+    let filtered = FilteredSource::new(text.len(), keep);
+    if text.len() <= u32::MAX as usize + 1 {
+        build_ext_mem_inner::<S, u32, L, F>(
+            text,
+            PositionSource::Filtered(filtered),
+            lp,
+            opts,
+            emit,
+        )
+    } else {
+        build_ext_mem_inner::<S, u64, L, F>(
+            text,
+            PositionSource::Filtered(filtered),
+            lp,
+            opts,
+            emit,
+        )
+    }
+}
+
 fn build_ext_mem_inner<S, I, L, F>(
     text: &[S],
     source: PositionSource<'_>,
@@ -270,6 +340,15 @@ where
         "phase1 (sort+sample+spill) {:.3}s",
         t.elapsed().as_secs_f64()
     ));
+
+    // Drop the position source as soon as phase 1 returns — phases
+    // 2/3/4 don't touch it. For `PositionSource::Subset` this frees
+    // the caller's `Vec<u64>` (e.g. ~47 GB on a human-scale
+    // _for_positions build); for `PositionSource::Filtered` it
+    // frees the bitmap + cumsum (~770 MB); for `Identity` it's a
+    // no-op. The text and the spilled `subarray_buckets` are all
+    // phase 2+ needs.
+    drop(source);
 
     let t = Instant::now();
     let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
@@ -348,6 +427,9 @@ where
 
     let (mut subarray_buckets, samples) =
         phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, dispatch, factory)?;
+    // Same rationale as in `build_ext_mem_inner` — drop the source
+    // as soon as phase 1's `fill_chunk` calls have stopped.
+    drop(source);
     let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
     let mut partition_buckets = phase3_distribute::<S, I, L, _, _>(
         text,
@@ -470,12 +552,217 @@ where
     }
 }
 
-/// Source of the positions to sort. The all-suffixes case
-/// ([`PositionSource::Identity`]) avoids materialising a `Vec<u64>` of
-/// length `n`, which on the human genome would itself be ~25 GB.
+/// Source of the positions to sort.
+///
+/// - [`PositionSource::Identity`] is the all-suffixes case `0..n`;
+///   avoids materialising a `Vec<u64>` of length `n`, which on the
+///   human genome would itself be ~50 GB.
+/// - [`PositionSource::Subset`] holds a caller-supplied `&[u64]` of
+///   the positions to sort, in any order. Random-access by index.
+/// - [`PositionSource::Filtered`] is the streaming-predicate variant:
+///   the caller hands in a `Fn(u64) -> bool` over text positions and
+///   caps-sa walks the filter forward through the text on demand. A
+///   tiny prefix-sum (`text.len() / BLOCK_SIZE × 8` B ≈ 760 KB on
+///   the human genome at the 64 KB block size) lets `fill_chunk`
+///   locate the i-th kept position in `O(log n_blocks + BLOCK_SIZE +
+///   chunk_size)`. **No kept-positions list is materialised** — the
+///   memory saving over `Subset` is `≈ 8 × n_kept` bytes, dominant
+///   on genome-scale inputs.
 enum PositionSource<'a> {
     Identity(usize),
     Subset(&'a [u64]),
+    Filtered(FilteredSource),
+}
+
+/// Block size in **u64 words** for [`FilteredSource`]'s popcount
+/// prefix-sum. With 1024 words per block (64 K text bits) the
+/// prefix-sum stores one `u64` per block — ~760 KB for the human
+/// genome — and each `fill_chunk` walks at most one block (≈ 8 KB)
+/// in cache before emitting the first kept position.
+const FILTERED_WORDS_PER_BLOCK: usize = 1024;
+
+/// Streaming position source backed by a **bitmap** of kept positions
+/// + a per-block popcount prefix-sum. No `Vec<u64>` of kept positions
+/// is ever materialised.
+///
+/// Memory: `(n + 7) / 8` bytes for the bitmap (~770 MB on the human
+/// genome at `n ≈ 6.2 B`) + `8 × n_blocks` for the prefix sum
+/// (~760 KB). The 47 GB `Vec<u64>` the [`Subset`][PositionSource::Subset]
+/// variant requires goes away entirely.
+///
+/// Lookup path inside [`fill_chunk`]:
+/// 1. `partition_point` the prefix-sum to find the block containing
+///    the `start`-th kept position (`O(log n_blocks)` ≈ 17 ops).
+/// 2. Walk that block's bitmap words `popcount`-by-`popcount` until
+///    we've skipped the right number of set bits to reach `start`.
+/// 3. Walk forward through bitmap words using `trailing_zeros`-style
+///    iteration, emitting each set bit's position to `dst`. Inner
+///    loop is `O(chunk_size / 64)` u64 ops — no per-text-position
+///    closure calls, branch-light, cache-resident.
+///
+/// A truly `O(1)` select-1 structure (darray / Elias-Fano) on top
+/// of the bitmap would shrink step (1)+(2) further; with
+/// `chunk_size` ≈ 750 K and only `p` ≈ 8192 fill_chunk calls per
+/// build, the `O(log n_blocks)` + at-most-one-block-walk cost is
+/// already a rounding error. See `bench/README.md` for the
+/// follow-up note if that ever changes.
+struct FilteredSource {
+    text_len: usize,
+    total_kept: usize,
+    /// Bitmap: `(bitmap[w] >> b) & 1 == 1` iff position `64 * w + b`
+    /// is kept. Length = `text_len.div_ceil(64)`.
+    bitmap: Vec<u64>,
+    /// `cumsum[i] = sum of set bits in
+    /// `bitmap[0 .. i * FILTERED_WORDS_PER_BLOCK]`. Length =
+    /// `n_blocks + 1`; the last entry equals `total_kept`.
+    cumsum: Vec<u64>,
+}
+
+impl FilteredSource {
+    /// Build a [`FilteredSource`] by walking the predicate once over
+    /// `0..text_len` to fill the bitmap, then accumulating per-block
+    /// popcounts.
+    ///
+    /// The predicate is invoked exactly `text_len` times here; once
+    /// the bitmap is built, `fill_chunk` never calls it again. This
+    /// trades one full predicate pass for zero per-position calls
+    /// during all subsequent random-access `fill_chunk`s — a clear
+    /// win when (as in caps-sa's phase 1) every position is read at
+    /// least once.
+    fn new<Pred>(text_len: usize, keep: Pred) -> Self
+    where
+        Pred: Fn(u64) -> bool + Send + Sync,
+    {
+        let n_words = text_len.div_ceil(64);
+        // Parallel per-word bitmap build. Each word reads 64 text
+        // positions (clamped at `text_len`), packs them into a u64.
+        let bitmap: Vec<u64> = (0..n_words)
+            .into_par_iter()
+            .map(|w| {
+                let mut word: u64 = 0;
+                let base = (w as u64) * 64;
+                let limit = ((w + 1) * 64).min(text_len) - w * 64;
+                for b in 0..limit {
+                    if keep(base + b as u64) {
+                        word |= 1u64 << b;
+                    }
+                }
+                word
+            })
+            .collect();
+
+        // Per-block popcount cumsum. Each block covers
+        // `FILTERED_WORDS_PER_BLOCK` words = `FILTERED_BITS_PER_BLOCK`
+        // text positions.
+        let n_blocks = n_words.div_ceil(FILTERED_WORDS_PER_BLOCK);
+        let per_block: Vec<u64> = (0..n_blocks)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * FILTERED_WORDS_PER_BLOCK;
+                let end = ((i + 1) * FILTERED_WORDS_PER_BLOCK).min(n_words);
+                let mut c: u64 = 0;
+                for &word in &bitmap[start..end] {
+                    c += word.count_ones() as u64;
+                }
+                c
+            })
+            .collect();
+        let mut cumsum = Vec::with_capacity(n_blocks + 1);
+        let mut s: u64 = 0;
+        cumsum.push(0);
+        for &k in &per_block {
+            s += k;
+            cumsum.push(s);
+        }
+        let total_kept = s as usize;
+        Self {
+            text_len,
+            total_kept,
+            bitmap,
+            cumsum,
+        }
+    }
+
+    /// Number of kept positions.
+    #[inline]
+    fn len(&self) -> usize {
+        self.total_kept
+    }
+
+    /// Fill `dst` with the next `dst.len()` kept positions starting
+    /// from the `start`-th (0-based) kept position. See type-level
+    /// doc for the algorithm; this is the hot path during phase 1
+    /// fill_chunk.
+    fn fill_chunk<I: Index>(&self, start: usize, dst: &mut [I]) {
+        debug_assert!(start + dst.len() <= self.total_kept);
+        if dst.is_empty() {
+            return;
+        }
+
+        // (1) Locate the block containing the `start`-th set bit.
+        // `partition_point(|c| c <= start)` gives the first cumsum
+        // entry strictly greater than `start`; previous index is the
+        // containing block.
+        let pp = self.cumsum.partition_point(|&c| c <= start as u64);
+        debug_assert!(pp > 0);
+        let block_idx = pp - 1;
+        let mut word_idx = block_idx * FILTERED_WORDS_PER_BLOCK;
+        let mut skip = start as u64 - self.cumsum[block_idx];
+
+        // (2) Skip the first `skip` set bits — possibly spanning
+        // several bitmap words. Whole words with `popcount ≤ skip`
+        // are consumed wholesale; the final partial word has its
+        // lowest `skip` set bits cleared so the emit loop sees only
+        // un-skipped 1s.
+        //
+        // Note: a naive `while skip >= 64 { … }` is wrong because a
+        // word's popcount can be far less than 64; we must subtract
+        // the actual popcount each iteration, not 64. This matters
+        // any time the bitmap is sparser than ~50%.
+        let n_words = self.bitmap.len();
+        let mut word: u64 = if word_idx < n_words { self.bitmap[word_idx] } else { 0 };
+        while skip > 0 {
+            let pc = word.count_ones() as u64;
+            if skip < pc {
+                // Consume `skip` lowest set bits inside the current
+                // word; emit loop continues from the remaining ones.
+                for _ in 0..skip {
+                    word &= word - 1;
+                }
+                break;
+            }
+            // Skip ≥ pc: consume the whole word and advance.
+            skip -= pc;
+            word_idx += 1;
+            word = if word_idx < n_words { self.bitmap[word_idx] } else { 0 };
+        }
+
+        // (3) Walk `word`+subsequent words, emitting one position per
+        // set bit. Uses `trailing_zeros` to jump straight to the next
+        // 1 inside a word, then clears it via `word &= word - 1`.
+        let mut written = 0usize;
+        let need = dst.len();
+        loop {
+            while word != 0 && written < need {
+                let bit = word.trailing_zeros() as u64;
+                let pos = (word_idx as u64) * 64 + bit;
+                debug_assert!((pos as usize) < self.text_len);
+                dst[written] = I::from_usize(pos as usize);
+                written += 1;
+                word &= word - 1;
+            }
+            if written == need {
+                break;
+            }
+            word_idx += 1;
+            debug_assert!(
+                word_idx < n_words,
+                "FilteredSource::fill_chunk: walked past bitmap end \
+                 ({written}/{need} emitted, word_idx={word_idx}, n_words={n_words})"
+            );
+            word = self.bitmap[word_idx];
+        }
+    }
 }
 
 impl<'a> PositionSource<'a> {
@@ -483,6 +770,7 @@ impl<'a> PositionSource<'a> {
         match self {
             Self::Identity(n) => *n,
             Self::Subset(p) => p.len(),
+            Self::Filtered(f) => f.len(),
         }
     }
 
@@ -491,7 +779,8 @@ impl<'a> PositionSource<'a> {
     /// positions into `I` via [`Index::from_usize`]. For
     /// [`PositionSource::Identity`] this generates the contiguous
     /// integer range on the fly; for [`PositionSource::Subset`] it
-    /// reads from the caller's slice.
+    /// reads from the caller's slice; for [`PositionSource::Filtered`]
+    /// it walks the predicate forward from the right text block.
     fn fill_chunk<I: Index>(&self, start: usize, dst: &mut [I]) {
         match self {
             Self::Identity(_) => {
@@ -505,6 +794,7 @@ impl<'a> PositionSource<'a> {
                     *slot = I::from_usize(v as usize);
                 }
             }
+            Self::Filtered(f) => f.fill_chunk(start, dst),
         }
     }
 }
@@ -1309,6 +1599,86 @@ mod tests {
                 assert_eq!(got, want64, "in-mem ss mismatch n={n} p={p}");
             }
         }
+    }
+
+    /// Helper that drives [`build_ext_mem_for_filter`] and collects the
+    /// emitted positions.
+    fn ext_mem_for_filter<Pred>(text: &[u8], keep: Pred, p: usize) -> Vec<u64>
+    where
+        Pred: Fn(u64) -> bool + Send + Sync,
+    {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: p,
+            work_dir: dir.path().to_path_buf(),
+            ..ExtMemOpts::default()
+        };
+        let mut out: Vec<u64> = Vec::new();
+        build_ext_mem_for_filter(text, keep, &opts, |pos| {
+            out.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn ext_mem_for_filter_matches_for_positions_on_full_set() {
+        // Filter that accepts every position → must equal the
+        // identity-positions ext-mem build.
+        let text = b"mississippi";
+        let want = ext_mem_sa(text, 3);
+        let got = ext_mem_for_filter(text, |_p| true, 3);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ext_mem_for_filter_matches_for_positions_on_dna_subset() {
+        // STAR-style "keep ACGT (`< 4`), drop N (`4`)/spacer (`5`)"
+        // filter. The filter API must produce exactly the same SA as
+        // pre-materialising the kept positions and going through the
+        // _for_positions path.
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCA75_5A);
+        for &n in &[50usize, 500, 2000] {
+            for &p in &[1usize, 3, 8] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..6u8)).collect();
+                let positions: Vec<u64> = (0..n as u64).filter(|&i| text[i as usize] < 4).collect();
+                let want = ext_mem_for_positions(&text, positions, p);
+                let got = ext_mem_for_filter(&text, |i| text[i as usize] < 4, p);
+                assert_eq!(got, want, "filter vs positions mismatch n={n} p={p}");
+            }
+        }
+    }
+
+    #[test]
+    fn ext_mem_for_filter_handles_block_aligned_boundaries() {
+        // Exercise the bitmap word/block boundaries by using a text
+        // longer than one popcount block (1024 × 64 bits = 64 K
+        // positions) — but stay under that to keep the test fast.
+        // 200 K positions touches the cumsum's second block too.
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xB10C_C0DE);
+        let n = 200_000usize;
+        let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..6u8)).collect();
+        let positions: Vec<u64> = (0..n as u64).filter(|&i| text[i as usize] < 4).collect();
+        let want = ext_mem_for_positions(&text, positions, 8);
+        let got = ext_mem_for_filter(&text, |i| text[i as usize] < 4, 8);
+        assert_eq!(got, want, "filter API mismatch across block boundaries");
+    }
+
+    #[test]
+    fn ext_mem_for_filter_sparse_predicate() {
+        // ~5% acceptance — exercises long runs of zero-bits in the
+        // bitmap (skip-loop across whole words).
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5_AA_55);
+        let n = 50_000usize;
+        let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..20u8)).collect();
+        let positions: Vec<u64> = (0..n as u64).filter(|&i| text[i as usize] < 1).collect();
+        let want = ext_mem_for_positions(&text, positions, 4);
+        let got = ext_mem_for_filter(&text, |i| text[i as usize] < 1, 4);
+        assert_eq!(got, want, "filter API mismatch on sparse predicate");
     }
 
     #[test]
