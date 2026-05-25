@@ -1,6 +1,6 @@
 [package]
 name = "caps-sa"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 # 1.89 stabilises the AVX-512 intrinsics (`_mm512_loadu_si512`,
 # `_mm512_cmpeq_epi8_mask`) used in `src/lcp.rs::lcp_u8_avx512`. The
