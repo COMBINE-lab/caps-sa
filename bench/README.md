@@ -136,7 +136,65 @@ Phase 2b ext-mem implementation:
 | + Pooled bucket files (Opt 6)                                | +0.3 min (→ 10.78, noise) | **−0.31 GB** (→ 4.72) |
 | + Phase 4 chunk-size = 4·num_threads (Opt 7)                  | **−0.64 min** (→ 10.14) | ~0 (→ 4.98) |
 | + `Symbol` trait + byte-view SIMD (Opt 8)                     | ~0 (genome stays u8) | ~0 |
+| + `LimitProvider` + `SegmentedText` (Opt 9)                   | ~0 (PlainText path) | ~0 |
 | **Net (v1 → today's tip)**                                   | **−0.77 min** | **−34.85 GB (−88%)** |
+
+### `LimitProvider` + `SegmentedText` — multi-segment SAs (Opt 9)
+
+Multi-string SAs (and the SJ-indexed genome case in particular —
+where every splice junction wants its own sentinel to avoid
+cross-junction LCP collisions) can push the alphabet size into the
+tens of thousands. Going to `u16`/`u24`/`u32` text just to encode
+those sentinels multiplies the genome's resident memory by 2-4×.
+
+Approach 3 from the WIDE_ALPHABETS analysis in `rustar-aligner`'s
+`sa_build.rs`: keep the text at `u8` (just real bases) and encode
+the segment-boundary structure in a parallel data structure that the
+LCP function consults. This ships that infrastructure on the
+caps-sa side.
+
+The shape:
+
+- A new `LimitProvider` trait with one method `fn lim_at(&self,
+  p: usize) -> usize` — the logical length of the suffix at `p`.
+  Plumbed through every site in `merge` / `cascade_merge` /
+  `suffix_cmp` that previously computed `n - p` inline.
+- `PlainText { n: usize }` is the default impl. Its `lim_at` is
+  `#[inline(always)]`-marked and folds at monomorphization time to
+  the same `n - p` expression. The merge becomes a generic
+  `merge<S, I, L: LimitProvider>` and, on the `PlainText`
+  instantiation, generates **bit-identical assembly to the
+  non-segmented path** — confirmed by re-benching the marquee
+  GRCh38 / 32 t (`hum200m` / `rand100m` / yeast) wall-times after
+  the refactor, all within run-to-run variance.
+- `SegmentedText { ends: Vec<u64> }` is the segmented impl. Stores
+  cumulative end positions of each segment, `lim_at(p)` is a
+  `partition_point` binary search. Two ergonomic constructors:
+  `from_lengths(text_len, &[len_0, len_1, …])` and
+  `from_ends(text_len, sorted_ends)`. For a 50 K-junction SA on a
+  6 GB text the storage cost is **400 KB** total — vs the 750 MB
+  a packed bitmap would need, or the 6 extra GB a `u16` text
+  would need.
+
+Public API surface: every existing entry (`build_ext_mem`,
+`build_in_memory`, the `_for_positions` siblings, and the in-mem-ss
+ones) gets a `_with` sibling that takes `lp: &L`. The existing
+entries are zero-cost wrappers that pass `&PlainText::new(text.len())`.
+`LcpDispatch::suffix_cmp_with` is the analogous one-off helper.
+
+Per-LCP-call cost in the `SegmentedText` case: O(log n_segments)
+binary search per call. For 50 K segments that's ~16 comparisons,
+amortisable to once per merge output by caching `lim_p` / `lim_q`
+in the merge state when the pointers don't move (not done in this
+patch — easy follow-up if the cost actually shows up in a profile).
+
+The marquee genome bench is unaffected (the rustar-aligner path
+hasn't migrated to `SegmentedText` yet); this lands the
+infrastructure so the migration is a self-contained follow-up.
+Differential tests against a brute-force segmented oracle cover
+random small inputs (`segmented_random_validity`), specific
+multi-string fixtures, and subset-positions variants.
+
 
 ### `Symbol` trait — SIMD LCP for arbitrary alphabets (Opt 8)
 

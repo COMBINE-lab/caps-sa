@@ -32,6 +32,7 @@
 
 use crate::Index;
 use crate::lcp::{LcpDispatch, Symbol};
+use crate::limits::{LimitProvider, PlainText};
 use rayon::join;
 
 /// Tunable options for SA construction.
@@ -76,9 +77,22 @@ where
     S: Symbol,
     I: Index,
 {
+    build_in_memory_with(text, &PlainText::new(text.len()), opts)
+}
+
+/// Variant of [`build_in_memory`] that accepts a [`LimitProvider`].
+/// With [`PlainText`] this is identical to [`build_in_memory`]; with
+/// [`SegmentedText`][crate::limits::SegmentedText] the LCP scans stop
+/// at segment boundaries.
+pub fn build_in_memory_with<S, I, L>(text: &[S], lp: &L, opts: &Opts) -> Vec<I>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
     let n = text.len();
     let positions: Vec<I> = (0..n).map(I::from_usize).collect();
-    build_in_memory_for_positions_with_opts(text, positions, opts)
+    build_in_memory_for_positions_with(text, positions, lp, opts)
 }
 
 /// Sort the caller-supplied `positions` by the lexicographic order of
@@ -113,6 +127,24 @@ where
     S: Symbol,
     I: Index,
 {
+    build_in_memory_for_positions_with(text, positions, &PlainText::new(text.len()), opts)
+}
+
+/// Variant of [`build_in_memory_for_positions`] that accepts both a
+/// [`LimitProvider`] (for segmented LCP truncation) and tuning options.
+/// With [`PlainText`] this is identical to
+/// [`build_in_memory_for_positions_with_opts`].
+pub fn build_in_memory_for_positions_with<S, I, L>(
+    text: &[S],
+    positions: Vec<I>,
+    lp: &L,
+    opts: &Opts,
+) -> Vec<I>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
     let n = positions.len();
     if n == 0 {
         return Vec::new();
@@ -130,6 +162,7 @@ where
 
     merge_sort(
         text,
+        lp,
         &mut sa,
         &mut sa_w,
         &mut lcp_arr,
@@ -153,9 +186,10 @@ where
 ///
 /// Visible to the rest of the crate so the external-memory path can sort
 /// individual subarrays of positions using the same kernel.
-#[allow(clippy::too_many_arguments)] // 4 buffers + text + ctx + dispatch
-pub(crate) fn merge_sort<S, I>(
+#[allow(clippy::too_many_arguments)] // 4 buffers + text + lp + ctx + dispatch
+pub(crate) fn merge_sort<S, I, L>(
     text: &[S],
+    lp: &L,
     sa: &mut [I],
     sa_w: &mut [I],
     lcp_arr: &mut [I],
@@ -165,6 +199,7 @@ pub(crate) fn merge_sort<S, I>(
 ) where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
 {
     let n = sa.len();
     debug_assert_eq!(sa_w.len(), n);
@@ -185,15 +220,15 @@ pub(crate) fn merge_sort<S, I>(
     let (lcp_w_l, lcp_w_r) = lcp_w.split_at_mut(mid);
 
     join(
-        || merge_sort(text, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx, dispatch),
-        || merge_sort(text, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx, dispatch),
+        || merge_sort(text, lp, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx, dispatch),
+        || merge_sort(text, lp, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx, dispatch),
     );
 
     // Merge the two sorted halves (still living in `sa`) into the workspace,
     // then copy the workspace back into the destination so the caller's
     // postcondition holds on `sa` / `lcp_arr`.
     merge(
-        text, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx, dispatch,
+        text, lp, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx, dispatch,
     );
     sa.copy_from_slice(sa_w);
     lcp_arr.copy_from_slice(lcp_w);
@@ -207,9 +242,10 @@ pub(crate) fn merge_sort<S, I>(
 ///
 /// Visible to the rest of the crate so the external-memory path can cascade
 /// 2-way merges across each partition's sub-subarrays during Phase 4.
-#[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + ctx + dispatch
-pub(crate) fn merge<S, I>(
+#[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + lp + ctx + dispatch
+pub(crate) fn merge<S, I, L>(
     text: &[S],
+    lp: &L,
     x: &[I],
     y: &[I],
     lcp_x: &[I],
@@ -221,6 +257,7 @@ pub(crate) fn merge<S, I>(
 ) where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
 {
     let len_x = x.len();
     let len_y = y.len();
@@ -254,7 +291,6 @@ pub(crate) fn merge<S, I>(
     let mut i_b: usize = 0;
     let mut m: usize = 0;
     let mut k: usize = 0;
-    let n_text = text.len();
 
     while i_a < len_a && i_b < len_b {
         let l_a = lcp_a[i_a].to_usize();
@@ -268,17 +304,28 @@ pub(crate) fn merge<S, I>(
             // Tied — extend by an actual symbol scan from offset m.
             let p_a = arr_a[i_a].to_usize();
             let p_b = arr_b[i_b].to_usize();
-            let lim_a = n_text - p_a;
-            let lim_b = n_text - p_b;
-            let remaining_ctx = max_ctx.saturating_sub(m);
+            // `lim_a` / `lim_b` are the per-suffix logical lengths from
+            // the `LimitProvider`. With `PlainText` these fold to
+            // `n_text - p` (the same expression the pre-LimitProvider
+            // code computed inline); with `SegmentedText` they cap at
+            // the next segment boundary so the LCP scan stops there.
+            let lim_a = lp.lim_at(p_a);
+            let lim_b = lp.lim_at(p_b);
+            // Pass an already-segmentation-aware cap to the SIMD LCP so
+            // it doesn't have to scan past the boundary. For PlainText
+            // this is equivalent to the LCP function's own `n - p`
+            // intersection — no extra work.
+            let cap = lim_a.min(lim_b).min(max_ctx);
+            let remaining_ctx = cap.saturating_sub(m);
             let ext = dispatch.lcp(text, p_a + m, p_b + m, remaining_ctx);
             let total = m + ext;
             let a_smaller = if total < lim_a && total < lim_b {
                 text[p_a + total] < text[p_b + total]
             } else {
-                // One or both suffixes ran off the end (or hit `max_ctx`).
-                // Shorter remaining suffix is smaller — matches the implicit
-                // end-sentinel convention.
+                // One or both suffixes ran off the end of their segment
+                // (or hit `max_ctx`). Shorter remaining suffix is
+                // smaller — matches the implicit end-sentinel
+                // convention.
                 lim_a < lim_b
             };
             (a_smaller, m, total)
@@ -449,5 +496,106 @@ mod tests {
             let want = brute_force_sa(&text);
             assert_eq!(got, want);
         }
+    }
+
+    // ---- segmented SA tests ----
+
+    use crate::limits::SegmentedText;
+
+    /// Compare two suffixes under the segmented comparator (LCP
+    /// truncated at the boundary, "shorter-is-smaller" tie-break).
+    fn segmented_cmp(text: &[u8], lp: &SegmentedText, a: usize, b: usize) -> std::cmp::Ordering {
+        use crate::limits::LimitProvider;
+        let lim_a = lp.lim_at(a);
+        let lim_b = lp.lim_at(b);
+        let lim = lim_a.min(lim_b);
+        for i in 0..lim {
+            if text[a + i] != text[b + i] {
+                return text[a + i].cmp(&text[b + i]);
+            }
+        }
+        lim_a.cmp(&lim_b)
+    }
+
+    /// Assert that `sa` is a valid segmented SA over `text` partitioned
+    /// by `lengths`:
+    ///
+    /// 1. it's a permutation of the positions in `positions`, and
+    /// 2. every adjacent pair is in non-decreasing comparator order.
+    ///
+    /// Comparator-equivalent suffixes can appear in any relative order —
+    /// caps-sa's merge isn't a stable sort, so we don't pin a canonical
+    /// permutation.
+    fn assert_segmented_sa_valid(text: &[u8], lengths: &[usize], positions: &[u32], sa: &[u32]) {
+        let lp = SegmentedText::from_lengths(text.len(), lengths);
+        let mut expected = positions.to_vec();
+        expected.sort();
+        let mut got_sorted = sa.to_vec();
+        got_sorted.sort();
+        assert_eq!(got_sorted, expected, "sa is not a permutation of positions");
+        for w in sa.windows(2) {
+            let a = w[0] as usize;
+            let b = w[1] as usize;
+            let ord = segmented_cmp(text, &lp, a, b);
+            assert_ne!(
+                ord,
+                std::cmp::Ordering::Greater,
+                "out of order: pos {a} > pos {b} under segmented comparator",
+            );
+        }
+    }
+
+    #[test]
+    fn segmented_in_memory_matches_brute_force_small() {
+        // 4 segments: "hello" | "world" | "banana" | "mississippi"
+        let text: Vec<u8> = b"helloworldbananamississippi".to_vec();
+        let lengths = &[5usize, 5, 6, 11];
+        let lp = SegmentedText::from_lengths(text.len(), lengths);
+        let sa: Vec<u32> = build_in_memory_with(&text, &lp, &Opts::default());
+        let all_positions: Vec<u32> = (0..text.len() as u32).collect();
+        assert_segmented_sa_valid(&text, lengths, &all_positions, &sa);
+    }
+
+    #[test]
+    fn segmented_single_segment_equals_unsegmented() {
+        // A single segment covering the whole text is the same as the
+        // non-segmented SA — confirms the LimitProvider path doesn't
+        // perturb the standard order when there's nothing to truncate.
+        let text = b"mississippi";
+        let lp = SegmentedText::from_lengths(text.len(), &[text.len()]);
+        let got_segmented: Vec<u32> = build_in_memory_with(text, &lp, &Opts::default());
+        let got_plain: Vec<u32> = build_in_memory(text);
+        assert_eq!(got_segmented, got_plain);
+    }
+
+    #[test]
+    fn segmented_random_validity() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5E6);
+        for _ in 0..20 {
+            let n_segments = rng.random_range(1..10usize);
+            let lengths: Vec<usize> = (0..n_segments)
+                .map(|_| rng.random_range(5..50usize))
+                .collect();
+            let n: usize = lengths.iter().sum();
+            // Small alphabet so the LCP-truncation case actually fires.
+            let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
+            let lp = SegmentedText::from_lengths(n, &lengths);
+            let sa: Vec<u32> = build_in_memory_with(&text, &lp, &Opts::default());
+            let all_positions: Vec<u32> = (0..n as u32).collect();
+            assert_segmented_sa_valid(&text, &lengths, &all_positions, &sa);
+        }
+    }
+
+    #[test]
+    fn segmented_for_positions_subset_validity() {
+        // Filter to even positions only, sort with segmentation.
+        let text: Vec<u8> = b"helloworldbananamississippi".to_vec();
+        let lengths = &[5usize, 5, 6, 11];
+        let positions: Vec<u32> = (0..text.len() as u32).step_by(2).collect();
+        let lp = SegmentedText::from_lengths(text.len(), lengths);
+        let sa =
+            build_in_memory_for_positions_with(&text, positions.clone(), &lp, &Opts::default());
+        assert_segmented_sa_valid(&text, lengths, &positions, &sa);
     }
 }

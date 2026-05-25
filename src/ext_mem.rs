@@ -39,6 +39,7 @@ use rayon::prelude::*;
 use crate::Index;
 use crate::ext_bucket::{BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp};
 use crate::lcp::{LcpDispatch, Symbol};
+use crate::limits::{LimitProvider, PlainText};
 use crate::sample_sort;
 
 /// Emit a phase-timing line to stderr if `CAPS_SA_PROFILE` is set in
@@ -115,14 +116,40 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
+    build_ext_mem_with(text, &PlainText::new(text.len()), opts, emit)
+}
+
+/// Variant of [`build_ext_mem`] that accepts a [`LimitProvider`]. With
+/// [`PlainText`] this matches [`build_ext_mem`] exactly (and
+/// monomorphizes to identical assembly); with
+/// [`SegmentedText`][crate::limits::SegmentedText] the LCP scans stop
+/// at segment boundaries.
+pub fn build_ext_mem_with<S, L, F>(text: &[S], lp: &L, opts: &ExtMemOpts, emit: F) -> io::Result<()>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> io::Result<()>,
+{
     // Dispatch on text size: when every suffix position fits in `u32`
     // (n ≤ 2^32), use the narrow record type to halve all the SaLcp
     // bytes — bucket disk I/O, phase-1 records, and the per-partition
     // load in phase 4.
     if text.len() <= u32::MAX as usize + 1 {
-        build_ext_mem_inner::<S, u32, F>(text, PositionSource::Identity(text.len()), opts, emit)
+        build_ext_mem_inner::<S, u32, L, F>(
+            text,
+            PositionSource::Identity(text.len()),
+            lp,
+            opts,
+            emit,
+        )
     } else {
-        build_ext_mem_inner::<S, u64, F>(text, PositionSource::Identity(text.len()), opts, emit)
+        build_ext_mem_inner::<S, u64, L, F>(
+            text,
+            PositionSource::Identity(text.len()),
+            lp,
+            opts,
+            emit,
+        )
     }
 }
 
@@ -147,25 +174,56 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
+    build_ext_mem_for_positions_with(text, positions, &PlainText::new(text.len()), opts, emit)
+}
+
+/// Variant of [`build_ext_mem_for_positions`] that accepts a
+/// [`LimitProvider`]. See [`build_ext_mem_with`] for the semantics.
+pub fn build_ext_mem_for_positions_with<S, L, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> io::Result<()>,
+{
     // We hold a reference to `positions` for the duration of the build;
     // `phase1_sort_sample_spill` copies each chunk out. The Vec is
     // dropped once phase 1 returns.
     if text.len() <= u32::MAX as usize + 1 {
-        build_ext_mem_inner::<S, u32, F>(text, PositionSource::Subset(&positions), opts, emit)
+        build_ext_mem_inner::<S, u32, L, F>(
+            text,
+            PositionSource::Subset(&positions),
+            lp,
+            opts,
+            emit,
+        )
     } else {
-        build_ext_mem_inner::<S, u64, F>(text, PositionSource::Subset(&positions), opts, emit)
+        build_ext_mem_inner::<S, u64, L, F>(
+            text,
+            PositionSource::Subset(&positions),
+            lp,
+            opts,
+            emit,
+        )
     }
 }
 
-fn build_ext_mem_inner<S, I, F>(
+fn build_ext_mem_inner<S, I, L, F>(
     text: &[S],
     source: PositionSource<'_>,
+    lp: &L,
     opts: &ExtMemOpts,
     mut emit: F,
 ) -> io::Result<()>
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
     SaLcp<I>: BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
 {
@@ -199,23 +257,31 @@ where
     let part_factory = |j: usize| phase3_pool.new_bucket::<SaLcp<I>>(j);
 
     let t = Instant::now();
-    let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill::<S, I, _, _>(text, &source, p, opts, dispatch, sub_factory)?;
+    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, L, _, _>(
+        text,
+        lp,
+        &source,
+        p,
+        opts,
+        dispatch,
+        sub_factory,
+    )?;
     profile_log(&format!(
         "phase1 (sort+sample+spill) {:.3}s",
         t.elapsed().as_secs_f64()
     ));
 
     let t = Instant::now();
-    let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
+    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
     profile_log(&format!(
         "phase2 (select pivots)      {:.3}s",
         t.elapsed().as_secs_f64()
     ));
 
     let t = Instant::now();
-    let mut partition_buckets = phase3_distribute::<S, I, _, _>(
+    let mut partition_buckets = phase3_distribute::<S, I, L, _, _>(
         text,
+        lp,
         &mut subarray_buckets,
         &pivots,
         p,
@@ -231,8 +297,9 @@ where
     drop(subarray_buckets);
 
     let t = Instant::now();
-    let result = phase4_merge_and_emit::<S, I, _, F>(
+    let result = phase4_merge_and_emit::<S, I, L, _, F>(
         text,
+        lp,
         &mut partition_buckets,
         opts.max_context,
         &mut emit,
@@ -256,15 +323,17 @@ where
 /// them), so ~25 GB on the human genome with `I = u32`. In exchange,
 /// the disk-spill / distribute-write / partition-load round-trip is
 /// gone — useful on machines with enough RAM to hold the working set.
-fn build_in_memory_ss_inner<S, I, F>(
+fn build_in_memory_ss_inner<S, I, L, F>(
     text: &[S],
     source: PositionSource<'_>,
+    lp: &L,
     opts: &ExtMemOpts,
     mut emit: F,
 ) -> io::Result<()>
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
     SaLcp<I>: BucketRecord,
     F: FnMut(u64) -> io::Result<()>,
 {
@@ -278,10 +347,11 @@ where
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
 
     let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill::<S, I, _, _>(text, &source, p, opts, dispatch, factory)?;
-    let pivots = phase2_select_pivots::<S, I>(text, samples, p, opts.max_context, dispatch);
-    let mut partition_buckets = phase3_distribute::<S, I, _, _>(
+        phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, dispatch, factory)?;
+    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
+    let mut partition_buckets = phase3_distribute::<S, I, L, _, _>(
         text,
+        lp,
         &mut subarray_buckets,
         &pivots,
         p,
@@ -290,8 +360,9 @@ where
         factory,
     )?;
     drop(subarray_buckets);
-    phase4_merge_and_emit::<S, I, _, F>(
+    phase4_merge_and_emit::<S, I, L, _, F>(
         text,
+        lp,
         &mut partition_buckets,
         opts.max_context,
         &mut emit,
@@ -310,17 +381,35 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
+    build_in_memory_sample_sort_with(text, &PlainText::new(text.len()), opts, emit)
+}
+
+/// Variant of [`build_in_memory_sample_sort`] that accepts a
+/// [`LimitProvider`].
+pub fn build_in_memory_sample_sort_with<S, L, F>(
+    text: &[S],
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> io::Result<()>,
+{
     if text.len() <= u32::MAX as usize + 1 {
-        build_in_memory_ss_inner::<S, u32, F>(
+        build_in_memory_ss_inner::<S, u32, L, F>(
             text,
             PositionSource::Identity(text.len()),
+            lp,
             opts,
             emit,
         )
     } else {
-        build_in_memory_ss_inner::<S, u64, F>(
+        build_in_memory_ss_inner::<S, u64, L, F>(
             text,
             PositionSource::Identity(text.len()),
+            lp,
             opts,
             emit,
         )
@@ -339,10 +428,45 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
+    build_in_memory_sample_sort_for_positions_with(
+        text,
+        positions,
+        &PlainText::new(text.len()),
+        opts,
+        emit,
+    )
+}
+
+/// Variant of [`build_in_memory_sample_sort_for_positions`] that
+/// accepts a [`LimitProvider`].
+pub fn build_in_memory_sample_sort_for_positions_with<S, L, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> io::Result<()>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> io::Result<()>,
+{
     if text.len() <= u32::MAX as usize + 1 {
-        build_in_memory_ss_inner::<S, u32, F>(text, PositionSource::Subset(&positions), opts, emit)
+        build_in_memory_ss_inner::<S, u32, L, F>(
+            text,
+            PositionSource::Subset(&positions),
+            lp,
+            opts,
+            emit,
+        )
     } else {
-        build_in_memory_ss_inner::<S, u64, F>(text, PositionSource::Subset(&positions), opts, emit)
+        build_in_memory_ss_inner::<S, u64, L, F>(
+            text,
+            PositionSource::Subset(&positions),
+            lp,
+            opts,
+            emit,
+        )
     }
 }
 
@@ -451,8 +575,9 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
 /// human-scale inputs, so the `num_threads × per_task_scratch` peak
 /// stays bounded even though we don't reuse buffers across iterations.
 #[allow(clippy::too_many_arguments)]
-fn phase1_sort_sample_spill<S, I, B, MkB>(
+fn phase1_sort_sample_spill<S, I, L, B, MkB>(
     text: &[S],
+    lp: &L,
     source: &PositionSource<'_>,
     p: usize,
     opts: &ExtMemOpts,
@@ -462,6 +587,7 @@ fn phase1_sort_sample_spill<S, I, B, MkB>(
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
     MkB: Fn(usize) -> B + Send + Sync,
@@ -490,6 +616,7 @@ where
             let mut lcp_w = vec![I::zero(); len];
             sample_sort::merge_sort(
                 text,
+                lp,
                 &mut sa,
                 &mut sa_w,
                 &mut lcp_arr,
@@ -557,8 +684,9 @@ fn evenly_spaced<T: Copy>(xs: &[T], count: usize) -> Vec<T> {
 
 /// Phase 2: globally sort the pooled samples and pick `p − 1` pivots at
 /// evenly-spaced ranks.
-fn phase2_select_pivots<S, I>(
+fn phase2_select_pivots<S, I, L>(
     text: &[S],
+    lp: &L,
     mut samples: Vec<I>,
     p: usize,
     max_ctx: usize,
@@ -567,6 +695,7 @@ fn phase2_select_pivots<S, I>(
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
 {
     if p <= 1 || samples.is_empty() {
         return Vec::new();
@@ -577,6 +706,7 @@ where
     let mut lcp_w = vec![I::zero(); n_samples];
     sample_sort::merge_sort(
         text,
+        lp,
         &mut samples,
         &mut sa_w,
         &mut lcp,
@@ -606,8 +736,9 @@ where
 /// boundaries is internally sorted. Both properties hold under
 /// arbitrary thread interleaving.
 #[allow(clippy::too_many_arguments)]
-fn phase3_distribute<S, I, B, MkB>(
+fn phase3_distribute<S, I, L, B, MkB>(
     text: &[S],
+    lp: &L,
     subarray_buckets: &mut [B],
     pivots: &[I],
     p: usize,
@@ -618,6 +749,7 @@ fn phase3_distribute<S, I, B, MkB>(
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
     MkB: Fn(usize) -> B + Send + Sync,
@@ -642,6 +774,7 @@ where
                     &records,
                     pivot,
                     text,
+                    lp,
                     opts.max_context,
                     dispatch,
                 ));
@@ -677,22 +810,30 @@ where
 /// Upper-bound binary search: returns the first index `i` such that the
 /// suffix at `records[i].pos` is **strictly greater than** the suffix at
 /// `pivot`.
-fn upper_bound_by_pivot<S, I>(
+fn upper_bound_by_pivot<S, I, L>(
     records: &[SaLcp<I>],
     pivot: I,
     text: &[S],
+    lp: &L,
     max_ctx: usize,
     dispatch: LcpDispatch,
 ) -> usize
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
 {
     let mut lo = 0;
     let mut hi = records.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        match dispatch.suffix_cmp(text, records[mid].pos.to_usize(), pivot.to_usize(), max_ctx) {
+        match dispatch.suffix_cmp_with(
+            text,
+            lp,
+            records[mid].pos.to_usize(),
+            pivot.to_usize(),
+            max_ctx,
+        ) {
             Ordering::Greater => hi = mid,
             Ordering::Equal | Ordering::Less => lo = mid + 1,
         }
@@ -716,8 +857,9 @@ where
 /// subarrays the per-partition size is `≈ n / p`, so this stays
 /// proportional to `n / 4 = 0.25 n` even at the peak — well below the
 /// in-memory path's `~4 n` working set.
-fn phase4_merge_and_emit<S, I, B, F>(
+fn phase4_merge_and_emit<S, I, L, B, F>(
     text: &[S],
+    lp: &L,
     partition_buckets: &mut [B],
     max_ctx: usize,
     emit: &mut F,
@@ -726,6 +868,7 @@ fn phase4_merge_and_emit<S, I, B, F>(
 where
     S: Symbol,
     I: Index,
+    L: LimitProvider,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
     F: FnMut(u64) -> io::Result<()>,
@@ -789,7 +932,7 @@ where
                 // drop along with `workspace` here, without an
                 // intermediate `to_vec()` copy.
                 let result =
-                    workspace.cascade_merge(text, &records, &boundaries, max_ctx, dispatch);
+                    workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch);
                 if profile {
                     merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
                 }
@@ -864,9 +1007,10 @@ impl<I: Index> CascadeWorkspace<I> {
     /// the caller skip the per-partition `to_vec()` round-trip that
     /// would otherwise sit briefly alongside all four workspace buffers
     /// at peak.
-    fn cascade_merge<S>(
+    fn cascade_merge<S, L>(
         mut self,
         text: &[S],
+        lp: &L,
         records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
@@ -874,6 +1018,7 @@ impl<I: Index> CascadeWorkspace<I> {
     ) -> Vec<I>
     where
         S: Symbol,
+        L: LimitProvider,
     {
         let n = records.len();
         if n == 0 {
@@ -897,7 +1042,7 @@ impl<I: Index> CascadeWorkspace<I> {
 
         let mut src_is_a = true;
         while run_lens.len() > 1 {
-            run_lens = self.merge_one_level(src_is_a, &run_lens, text, max_ctx, dispatch);
+            run_lens = self.merge_one_level(src_is_a, &run_lens, text, lp, max_ctx, dispatch);
             src_is_a = !src_is_a;
         }
 
@@ -914,16 +1059,18 @@ impl<I: Index> CascadeWorkspace<I> {
     /// `src_is_a`-selected buffer side into the other. Returns the new
     /// run-length list (each entry is the sum of the two it replaced, or
     /// the carry-over for an odd tail).
-    fn merge_one_level<S>(
+    fn merge_one_level<S, L>(
         &mut self,
         src_is_a: bool,
         run_lens: &[usize],
         text: &[S],
+        lp: &L,
         max_ctx: usize,
         dispatch: LcpDispatch,
     ) -> Vec<usize>
     where
         S: Symbol,
+        L: LimitProvider,
     {
         // Destructure self so the borrow checker can see the two sides as
         // disjoint locals — we borrow one immutably and the other mutably.
@@ -962,6 +1109,7 @@ impl<I: Index> CascadeWorkspace<I> {
                 let dst_end = dst_off + l1 + l2;
                 sample_sort::merge(
                     text,
+                    lp,
                     &src_sa[src_off..x_end],
                     &src_sa[x_end..xy_end],
                     &src_lcp[src_off..x_end],

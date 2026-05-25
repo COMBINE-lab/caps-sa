@@ -31,6 +31,8 @@
 
 use std::cmp::Ordering;
 
+use crate::limits::{LimitProvider, PlainText};
+
 /// A symbol type for suffix-array construction. All stdlib unsigned
 /// and signed integer types satisfy this, as does `[T; N]` for any
 /// `T: Symbol` (arrays have no padding and inherit `Ord`
@@ -154,6 +156,9 @@ impl LcpDispatch {
     /// shared prefix, then resolves the first differing symbol or — if
     /// both suffixes are exhausted within `max_ctx` — orders by remaining
     /// length (shorter is smaller, the convention SAIS and CaPS-SA use).
+    ///
+    /// Zero-cost wrapper around [`Self::suffix_cmp_with`] for the
+    /// non-segmented case.
     #[inline]
     pub fn suffix_cmp<S: Symbol>(
         &self,
@@ -162,11 +167,26 @@ impl LcpDispatch {
         q: usize,
         max_ctx: usize,
     ) -> Ordering {
-        let n = text.len();
-        let lim_p = n - p;
-        let lim_q = n - q;
+        self.suffix_cmp_with(text, &PlainText::new(text.len()), p, q, max_ctx)
+    }
+
+    /// Like [`Self::suffix_cmp`] but takes a [`LimitProvider`] so the
+    /// suffix lengths used for the LCP-cap and the "shorter-is-smaller"
+    /// tie-break come from a segmented view of the text. With
+    /// [`PlainText`] this matches [`Self::suffix_cmp`] exactly.
+    #[inline]
+    pub fn suffix_cmp_with<S: Symbol, L: LimitProvider>(
+        &self,
+        text: &[S],
+        lp: &L,
+        p: usize,
+        q: usize,
+        max_ctx: usize,
+    ) -> Ordering {
+        let lim_p = lp.lim_at(p);
+        let lim_q = lp.lim_at(q);
         let lim = lim_p.min(lim_q).min(max_ctx);
-        let common = self.lcp(text, p, q, max_ctx);
+        let common = self.lcp(text, p, q, lim);
         if common < lim {
             text[p + common].cmp(&text[q + common])
         } else {
