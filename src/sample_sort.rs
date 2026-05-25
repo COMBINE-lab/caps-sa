@@ -322,11 +322,14 @@ pub(crate) fn merge<S, I, L>(
             let a_smaller = if total < lim_a && total < lim_b {
                 text[p_a + total] < text[p_b + total]
             } else {
-                // One or both suffixes ran off the end of their segment
-                // (or hit `max_ctx`). Shorter remaining suffix is
-                // smaller — matches the implicit end-sentinel
-                // convention.
-                lim_a < lim_b
+                // One or both suffixes ran off the end of their
+                // segment (or hit `max_ctx`). Defer to the
+                // [`LimitProvider`]'s boundary-ordering convention —
+                // for [`PlainText`] / standard `SegmentedText` this
+                // is `lim_a.cmp(&lim_b)` (shorter-is-smaller, the
+                // generalised-SA convention); custom impls can flip
+                // it (e.g. STAR's `spacer-as-largest`).
+                lp.boundary_order(p_a, lim_a, p_b, lim_b).is_lt()
             };
             (a_smaller, m, total)
         };
@@ -597,5 +600,111 @@ mod tests {
         let sa =
             build_in_memory_for_positions_with(&text, positions.clone(), &lp, &Opts::default());
         assert_segmented_sa_valid(&text, lengths, &positions, &sa);
+    }
+
+    // ---- STAR-convention boundary_order tests ----
+
+    /// A `LimitProvider` wrapping [`SegmentedText`] with STAR's
+    /// `spacer-as-largest` boundary semantics: the suffix that hits
+    /// its limit first is *larger*, equivalently the longer-`lim`
+    /// suffix is smaller, with an ascending-position tie-break when
+    /// `lim_a == lim_b`. Used by rustar-aligner's `sa_build` to keep
+    /// byte-for-byte STAR compatibility on the segmented arm.
+    struct StarConvention {
+        inner: SegmentedText,
+    }
+
+    impl crate::limits::LimitProvider for StarConvention {
+        fn lim_at(&self, p: usize) -> usize {
+            self.inner.lim_at(p)
+        }
+        fn boundary_order(
+            &self,
+            p_a: usize,
+            lim_a: usize,
+            p_b: usize,
+            lim_b: usize,
+        ) -> std::cmp::Ordering {
+            lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))
+        }
+    }
+
+    /// Brute-force SA under STAR's convention (longer-lim is smaller,
+    /// position tie-break). Used as the oracle for the differential
+    /// test. With a position tie-break the SA is uniquely determined,
+    /// so this can be compared with `assert_eq!`.
+    fn star_brute_force_sa(text: &[u8], lengths: &[usize]) -> Vec<u32> {
+        use crate::limits::LimitProvider;
+        let lp = SegmentedText::from_lengths(text.len(), lengths);
+        let mut sa: Vec<u32> = (0..text.len() as u32).collect();
+        sa.sort_by(|&a, &b| {
+            let pa = a as usize;
+            let pb = b as usize;
+            let lim_a = lp.lim_at(pa);
+            let lim_b = lp.lim_at(pb);
+            let lim = lim_a.min(lim_b);
+            for i in 0..lim {
+                if text[pa + i] != text[pb + i] {
+                    return text[pa + i].cmp(&text[pb + i]);
+                }
+            }
+            // STAR convention: longer-lim is smaller, then position.
+            lim_b.cmp(&lim_a).then(pa.cmp(&pb))
+        });
+        sa
+    }
+
+    #[test]
+    fn star_convention_matches_brute_force_small() {
+        // 4 segments: "hello" | "world" | "banana" | "mississippi"
+        let text: Vec<u8> = b"helloworldbananamississippi".to_vec();
+        let lengths = &[5usize, 5, 6, 11];
+        let lp = StarConvention {
+            inner: SegmentedText::from_lengths(text.len(), lengths),
+        };
+        let got: Vec<u32> = build_in_memory_with(&text, &lp, &Opts::default());
+        let want = star_brute_force_sa(&text, lengths);
+        assert_eq!(got, want, "STAR-convention SA mismatch");
+    }
+
+    /// Exercises the STAR-specific within-segment longer-is-smaller
+    /// case: in "AAAA" with one segment, STAR orders the longest
+    /// suffix first (`AAAA < AAA < AA < A`) — opposite of the
+    /// standard SA's `A < AA < AAA < AAAA`.
+    #[test]
+    fn star_convention_within_segment_longer_first() {
+        let text = b"AAAA";
+        let lp = StarConvention {
+            inner: SegmentedText::from_lengths(text.len(), &[text.len()]),
+        };
+        let got: Vec<u32> = build_in_memory_with(text, &lp, &Opts::default());
+        // Position 0 = "AAAA" (lim 4), 1 = "AAA" (lim 3), 2 = "AA"
+        // (lim 2), 3 = "A" (lim 1). Longer-lim is smaller, so 0 < 1
+        // < 2 < 3.
+        assert_eq!(got, vec![0u32, 1, 2, 3]);
+    }
+
+    #[test]
+    fn star_convention_random_matches_brute_force() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCAFE);
+        for _ in 0..20 {
+            let n_segments = rng.random_range(1..10usize);
+            let lengths: Vec<usize> = (0..n_segments)
+                .map(|_| rng.random_range(5..50usize))
+                .collect();
+            let n: usize = lengths.iter().sum();
+            // Small alphabet so the boundary-tie-break case fires.
+            let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
+            let lp = StarConvention {
+                inner: SegmentedText::from_lengths(n, &lengths),
+            };
+            let got: Vec<u32> = build_in_memory_with(&text, &lp, &Opts::default());
+            let want = star_brute_force_sa(&text, &lengths);
+            assert_eq!(
+                got, want,
+                "STAR-convention SA mismatch (lengths={lengths:?}, text={text:?})",
+            );
+        }
     }
 }

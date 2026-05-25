@@ -171,9 +171,15 @@ impl LcpDispatch {
     }
 
     /// Like [`Self::suffix_cmp`] but takes a [`LimitProvider`] so the
-    /// suffix lengths used for the LCP-cap and the "shorter-is-smaller"
-    /// tie-break come from a segmented view of the text. With
-    /// [`PlainText`] this matches [`Self::suffix_cmp`] exactly.
+    /// suffix lengths used for the LCP-cap and the boundary-tie-break
+    /// come from a segmented view of the text. With [`PlainText`]
+    /// this matches [`Self::suffix_cmp`] exactly.
+    ///
+    /// The boundary tie-break (when both suffixes hit their limit
+    /// before any byte differs) is delegated to
+    /// [`LimitProvider::boundary_order`]; the default
+    /// "shorter-is-smaller" gives the generalised-SA convention,
+    /// custom impls can flip it (e.g. STAR's spacer-as-largest).
     #[inline]
     pub fn suffix_cmp_with<S: Symbol, L: LimitProvider>(
         &self,
@@ -190,7 +196,7 @@ impl LcpDispatch {
         if common < lim {
             text[p + common].cmp(&text[q + common])
         } else {
-            lim_p.cmp(&lim_q)
+            lp.boundary_order(p, lim_p, q, lim_q)
         }
     }
 }

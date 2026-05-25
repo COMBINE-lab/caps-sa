@@ -37,6 +37,42 @@ pub trait LimitProvider: Sync {
     /// next segment boundary or end-of-text. Must be at most
     /// `text.len() - p`.
     fn lim_at(&self, p: usize) -> usize;
+
+    /// Order to resolve when one or both suffixes hit their boundary
+    /// before any byte of their shared prefix differs. The default
+    /// is `lim_a.cmp(&lim_b)` — "shorter-suffix-is-smaller", the
+    /// standard generalised-SA / multi-string-SA convention, what a
+    /// `Vec<&str>` sort with `&str` ordering produces.
+    ///
+    /// Custom impls can override for different boundary conventions.
+    /// The motivating example is STAR's `spacer-as-largest` ordering:
+    /// the suffix that hits a spacer first is *larger*, equivalently
+    /// the longer-`lim` one is smaller, with an ascending-position
+    /// tie-break when both `lim`s coincide:
+    ///
+    /// ```ignore
+    /// fn boundary_order(&self, p_a: usize, lim_a: usize,
+    ///                   p_b: usize, lim_b: usize) -> Ordering {
+    ///     lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))
+    /// }
+    /// ```
+    ///
+    /// `p_a` / `p_b` are the suffix start positions in the same
+    /// coordinate space the merge sees (the spacer-free text's
+    /// coordinates when invoked through `*_with` entries on a
+    /// rustar-aligner-style spacer-free text). The default impl
+    /// ignores them; impls that want a position tie-break use them.
+    #[inline]
+    fn boundary_order(
+        &self,
+        p_a: usize,
+        lim_a: usize,
+        p_b: usize,
+        lim_b: usize,
+    ) -> std::cmp::Ordering {
+        let _ = (p_a, p_b);
+        lim_a.cmp(&lim_b)
+    }
 }
 
 /// Default provider for non-segmented texts: `lim_at(p) = n - p`.

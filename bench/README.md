@@ -188,6 +188,18 @@ amortisable to once per merge output by caching `lim_p` / `lim_q`
 in the merge state when the pointers don't move (not done in this
 patch — easy follow-up if the cost actually shows up in a profile).
 
+`LimitProvider` also exposes a `boundary_order` method (default
+`lim_a.cmp(&lim_b)`, "shorter-is-smaller") that callers can
+override to flip the tie-break convention. Motivating use: STAR's
+`spacer-as-largest` ordering — a `LimitProvider` impl returning
+`lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))` makes the merge byte-for-
+byte STAR-compatible at cross-segment ties, which is what
+`rustar-aligner`'s `StarSegmentedText` wrapper does to preserve
+the existing oracle-equality tests. Default impl is
+`#[inline]`-marked and folds to the same `lim_a.cmp(&lim_b)` the
+current code computes when called from `PlainText` /
+`SegmentedText`, so the override is fully opt-in.
+
 The marquee genome bench is unaffected (the rustar-aligner path
 hasn't migrated to `SegmentedText` yet); this lands the
 infrastructure so the migration is a self-contained follow-up.
