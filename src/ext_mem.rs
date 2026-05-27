@@ -37,7 +37,9 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::Index;
-use crate::ext_bucket::{BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp};
+use crate::ext_bucket::{
+    BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp, SaLcpBucketStore,
+};
 use crate::lcp::{LcpDispatch, Symbol};
 use crate::limits::{LimitProvider, PlainText};
 use crate::sample_sort;
@@ -77,6 +79,12 @@ pub struct ExtMemOpts {
     /// filesystems with high metadata cost. The `CAPS_SA_N_PHYS` env
     /// var overrides this for one-off benches.
     pub physical_file_count: usize,
+    /// Use the bounded ordered phase-4 emitter instead of the default
+    /// chunk collect-then-emit path. This can reduce transient merged
+    /// partition residency on skewed workloads, but is slower on the
+    /// GRCh38 32-thread benchmark because of channel coordination and
+    /// backpressure, so it is opt-in.
+    pub ordered_phase4_emit: bool,
 }
 
 impl Default for ExtMemOpts {
@@ -86,6 +94,7 @@ impl Default for ExtMemOpts {
             subproblem_count: 0,
             work_dir: std::env::temp_dir(),
             physical_file_count: 0,
+            ordered_phase4_emit: false,
         }
     }
 }
@@ -98,6 +107,103 @@ impl ExtMemOpts {
             work_dir: work_dir.as_ref().to_path_buf(),
             ..Self::default()
         }
+    }
+
+    /// Defaults plus caps-sa environment overrides.
+    ///
+    /// Recognised variables:
+    /// - `CAPS_SA_WORK_DIR` / `CAPS_SA_TMPDIR`: temp-file directory
+    /// - `CAPS_SA_SUBPROBLEMS`: subarray count (`p`)
+    /// - `CAPS_SA_N_PHYS`: physical backing-file count
+    /// - `CAPS_SA_MAX_CONTEXT`: LCP comparison cap
+    /// - `CAPS_SA_ORDERED_PHASE4=1|true|yes|on`: bounded ordered phase-4 emit
+    ///
+    /// Invalid numeric values are ignored, matching the existing
+    /// benchmark-only `CAPS_SA_N_PHYS` behaviour.
+    pub fn from_env() -> Self {
+        let mut opts = Self::default();
+        if let Some(dir) =
+            std::env::var_os("CAPS_SA_WORK_DIR").or_else(|| std::env::var_os("CAPS_SA_TMPDIR"))
+        {
+            opts.work_dir = PathBuf::from(dir);
+        }
+        if let Some(v) = read_env_usize("CAPS_SA_SUBPROBLEMS") {
+            opts.subproblem_count = v;
+        }
+        if let Some(v) = read_env_usize("CAPS_SA_N_PHYS") {
+            opts.physical_file_count = v;
+        }
+        if let Some(v) = read_env_usize("CAPS_SA_MAX_CONTEXT") {
+            opts.max_context = v;
+        }
+        if read_env_bool("CAPS_SA_ORDERED_PHASE4") {
+            opts.ordered_phase4_emit = true;
+        }
+        opts
+    }
+
+    /// Builder-style setter for [`Self::max_context`].
+    pub fn max_context(mut self, max_context: usize) -> Self {
+        self.max_context = max_context;
+        self
+    }
+
+    /// Builder-style setter for [`Self::subproblem_count`].
+    pub fn subproblem_count(mut self, subproblem_count: usize) -> Self {
+        self.subproblem_count = subproblem_count;
+        self
+    }
+
+    /// Builder-style setter for [`Self::work_dir`].
+    pub fn work_dir(mut self, work_dir: impl AsRef<Path>) -> Self {
+        self.work_dir = work_dir.as_ref().to_path_buf();
+        self
+    }
+
+    /// Builder-style setter for [`Self::physical_file_count`].
+    pub fn physical_file_count(mut self, physical_file_count: usize) -> Self {
+        self.physical_file_count = physical_file_count;
+        self
+    }
+
+    /// Builder-style setter for [`Self::ordered_phase4_emit`].
+    pub fn ordered_phase4_emit(mut self, ordered_phase4_emit: bool) -> Self {
+        self.ordered_phase4_emit = ordered_phase4_emit;
+        self
+    }
+}
+
+fn read_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+fn read_env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// Error type for `try_*` builders whose output callback can return
+/// an application-specific error.
+#[derive(Debug)]
+pub enum BuildError<E> {
+    /// Temporary-file or bucket I/O failed inside caps-sa.
+    Io(io::Error),
+    /// The caller's output callback rejected an emitted suffix-array
+    /// position.
+    Emit(E),
+}
+
+impl<E> From<io::Error> for BuildError<E> {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+fn into_io_result(result: Result<(), BuildError<io::Error>>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(BuildError::Io(err) | BuildError::Emit(err)) => Err(err),
     }
 }
 
@@ -116,7 +222,20 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
-    build_ext_mem_with(text, &PlainText::new(text.len()), opts, emit)
+    into_io_result(try_build_ext_mem(text, opts, emit))
+}
+
+/// Generic-error variant of [`build_ext_mem`].
+pub fn try_build_ext_mem<S, E, F>(
+    text: &[S],
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    F: FnMut(u64) -> Result<(), E>,
+{
+    try_build_ext_mem_with(text, &PlainText::new(text.len()), opts, emit)
 }
 
 /// Variant of [`build_ext_mem`] that accepts a [`LimitProvider`]. With
@@ -130,12 +249,27 @@ where
     L: LimitProvider,
     F: FnMut(u64) -> io::Result<()>,
 {
+    into_io_result(try_build_ext_mem_with(text, lp, opts, emit))
+}
+
+/// Generic-error variant of [`build_ext_mem_with`].
+pub fn try_build_ext_mem_with<S, L, E, F>(
+    text: &[S],
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> Result<(), E>,
+{
     // Dispatch on text size: when every suffix position fits in `u32`
     // (n ≤ 2^32), use the narrow record type to halve all the SaLcp
     // bytes — bucket disk I/O, phase-1 records, and the per-partition
     // load in phase 4.
     if text.len() <= u32::MAX as usize + 1 {
-        build_ext_mem_inner::<S, u32, L, F>(
+        build_ext_mem_inner::<S, u32, L, E, F>(
             text,
             PositionSource::Identity(text.len()),
             lp,
@@ -143,7 +277,7 @@ where
             emit,
         )
     } else {
-        build_ext_mem_inner::<S, u64, L, F>(
+        build_ext_mem_inner::<S, u64, L, E, F>(
             text,
             PositionSource::Identity(text.len()),
             lp,
@@ -174,7 +308,21 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
-    build_ext_mem_for_positions_with(text, positions, &PlainText::new(text.len()), opts, emit)
+    into_io_result(try_build_ext_mem_for_positions(text, positions, opts, emit))
+}
+
+/// Generic-error variant of [`build_ext_mem_for_positions`].
+pub fn try_build_ext_mem_for_positions<S, E, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    F: FnMut(u64) -> Result<(), E>,
+{
+    try_build_ext_mem_for_positions_with(text, positions, &PlainText::new(text.len()), opts, emit)
 }
 
 /// Variant of [`build_ext_mem_for_positions`] that accepts a
@@ -191,11 +339,29 @@ where
     L: LimitProvider,
     F: FnMut(u64) -> io::Result<()>,
 {
+    into_io_result(try_build_ext_mem_for_positions_with(
+        text, positions, lp, opts, emit,
+    ))
+}
+
+/// Generic-error variant of [`build_ext_mem_for_positions_with`].
+pub fn try_build_ext_mem_for_positions_with<S, L, E, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> Result<(), E>,
+{
     // We hold a reference to `positions` for the duration of the build;
     // `phase1_sort_sample_spill` copies each chunk out. The Vec is
     // dropped once phase 1 returns.
     if text.len() <= u32::MAX as usize + 1 {
-        build_ext_mem_inner::<S, u32, L, F>(
+        build_ext_mem_inner::<S, u32, L, E, F>(
             text,
             PositionSource::Subset(&positions),
             lp,
@@ -203,7 +369,7 @@ where
             emit,
         )
     } else {
-        build_ext_mem_inner::<S, u64, L, F>(
+        build_ext_mem_inner::<S, u64, L, E, F>(
             text,
             PositionSource::Subset(&positions),
             lp,
@@ -245,7 +411,22 @@ where
     F: FnMut(u64) -> io::Result<()>,
     Pred: Fn(u64) -> bool + Send + Sync,
 {
-    build_ext_mem_for_filter_with(text, keep, &PlainText::new(text.len()), opts, emit)
+    into_io_result(try_build_ext_mem_for_filter(text, keep, opts, emit))
+}
+
+/// Generic-error variant of [`build_ext_mem_for_filter`].
+pub fn try_build_ext_mem_for_filter<S, E, F, Pred>(
+    text: &[S],
+    keep: Pred,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    F: FnMut(u64) -> Result<(), E>,
+    Pred: Fn(u64) -> bool + Send + Sync,
+{
+    try_build_ext_mem_for_filter_with(text, keep, &PlainText::new(text.len()), opts, emit)
 }
 
 /// Variant of [`build_ext_mem_for_filter`] that accepts a
@@ -263,9 +444,28 @@ where
     F: FnMut(u64) -> io::Result<()>,
     Pred: Fn(u64) -> bool + Send + Sync,
 {
+    into_io_result(try_build_ext_mem_for_filter_with(
+        text, keep, lp, opts, emit,
+    ))
+}
+
+/// Generic-error variant of [`build_ext_mem_for_filter_with`].
+pub fn try_build_ext_mem_for_filter_with<S, L, E, F, Pred>(
+    text: &[S],
+    keep: Pred,
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> Result<(), E>,
+    Pred: Fn(u64) -> bool + Send + Sync,
+{
     let filtered = FilteredSource::new(text.len(), keep);
     if text.len() <= u32::MAX as usize + 1 {
-        build_ext_mem_inner::<S, u32, L, F>(
+        build_ext_mem_inner::<S, u32, L, E, F>(
             text,
             PositionSource::Filtered(filtered),
             lp,
@@ -273,7 +473,7 @@ where
             emit,
         )
     } else {
-        build_ext_mem_inner::<S, u64, L, F>(
+        build_ext_mem_inner::<S, u64, L, E, F>(
             text,
             PositionSource::Filtered(filtered),
             lp,
@@ -283,19 +483,19 @@ where
     }
 }
 
-fn build_ext_mem_inner<S, I, L, F>(
+fn build_ext_mem_inner<S, I, L, E, F>(
     text: &[S],
     source: PositionSource<'_>,
     lp: &L,
     opts: &ExtMemOpts,
     mut emit: F,
-) -> io::Result<()>
+) -> Result<(), BuildError<E>>
 where
     S: Symbol,
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    F: FnMut(u64) -> io::Result<()>,
+    F: FnMut(u64) -> Result<(), E>,
 {
     let n = source.len();
     if n == 0 {
@@ -376,11 +576,12 @@ where
     drop(subarray_buckets);
 
     let t = Instant::now();
-    let result = phase4_merge_and_emit::<S, I, L, _, F>(
+    let result = phase4_merge_and_emit::<S, I, L, _, E, F>(
         text,
         lp,
         &mut partition_buckets,
         opts.max_context,
+        opts.ordered_phase4_emit,
         &mut emit,
         dispatch,
     );
@@ -402,19 +603,19 @@ where
 /// them), so ~25 GB on the human genome with `I = u32`. In exchange,
 /// the disk-spill / distribute-write / partition-load round-trip is
 /// gone — useful on machines with enough RAM to hold the working set.
-fn build_in_memory_ss_inner<S, I, L, F>(
+fn build_in_memory_ss_inner<S, I, L, E, F>(
     text: &[S],
     source: PositionSource<'_>,
     lp: &L,
     opts: &ExtMemOpts,
     mut emit: F,
-) -> io::Result<()>
+) -> Result<(), BuildError<E>>
 where
     S: Symbol,
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    F: FnMut(u64) -> io::Result<()>,
+    F: FnMut(u64) -> Result<(), E>,
 {
     let n = source.len();
     if n == 0 {
@@ -442,11 +643,12 @@ where
         factory,
     )?;
     drop(subarray_buckets);
-    phase4_merge_and_emit::<S, I, L, _, F>(
+    phase4_merge_and_emit::<S, I, L, _, E, F>(
         text,
         lp,
         &mut partition_buckets,
         opts.max_context,
+        opts.ordered_phase4_emit,
         &mut emit,
         dispatch,
     )
@@ -463,7 +665,20 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
-    build_in_memory_sample_sort_with(text, &PlainText::new(text.len()), opts, emit)
+    into_io_result(try_build_in_memory_sample_sort(text, opts, emit))
+}
+
+/// Generic-error variant of [`build_in_memory_sample_sort`].
+pub fn try_build_in_memory_sample_sort<S, E, F>(
+    text: &[S],
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    F: FnMut(u64) -> Result<(), E>,
+{
+    try_build_in_memory_sample_sort_with(text, &PlainText::new(text.len()), opts, emit)
 }
 
 /// Variant of [`build_in_memory_sample_sort`] that accepts a
@@ -479,8 +694,23 @@ where
     L: LimitProvider,
     F: FnMut(u64) -> io::Result<()>,
 {
+    into_io_result(try_build_in_memory_sample_sort_with(text, lp, opts, emit))
+}
+
+/// Generic-error variant of [`build_in_memory_sample_sort_with`].
+pub fn try_build_in_memory_sample_sort_with<S, L, E, F>(
+    text: &[S],
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> Result<(), E>,
+{
     if text.len() <= u32::MAX as usize + 1 {
-        build_in_memory_ss_inner::<S, u32, L, F>(
+        build_in_memory_ss_inner::<S, u32, L, E, F>(
             text,
             PositionSource::Identity(text.len()),
             lp,
@@ -488,7 +718,7 @@ where
             emit,
         )
     } else {
-        build_in_memory_ss_inner::<S, u64, L, F>(
+        build_in_memory_ss_inner::<S, u64, L, E, F>(
             text,
             PositionSource::Identity(text.len()),
             lp,
@@ -510,7 +740,23 @@ where
     S: Symbol,
     F: FnMut(u64) -> io::Result<()>,
 {
-    build_in_memory_sample_sort_for_positions_with(
+    into_io_result(try_build_in_memory_sample_sort_for_positions(
+        text, positions, opts, emit,
+    ))
+}
+
+/// Generic-error variant of [`build_in_memory_sample_sort_for_positions`].
+pub fn try_build_in_memory_sample_sort_for_positions<S, E, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    F: FnMut(u64) -> Result<(), E>,
+{
+    try_build_in_memory_sample_sort_for_positions_with(
         text,
         positions,
         &PlainText::new(text.len()),
@@ -533,8 +779,26 @@ where
     L: LimitProvider,
     F: FnMut(u64) -> io::Result<()>,
 {
+    into_io_result(try_build_in_memory_sample_sort_for_positions_with(
+        text, positions, lp, opts, emit,
+    ))
+}
+
+/// Generic-error variant of [`build_in_memory_sample_sort_for_positions_with`].
+pub fn try_build_in_memory_sample_sort_for_positions_with<S, L, E, F>(
+    text: &[S],
+    positions: Vec<u64>,
+    lp: &L,
+    opts: &ExtMemOpts,
+    emit: F,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    L: LimitProvider,
+    F: FnMut(u64) -> Result<(), E>,
+{
     if text.len() <= u32::MAX as usize + 1 {
-        build_in_memory_ss_inner::<S, u32, L, F>(
+        build_in_memory_ss_inner::<S, u32, L, E, F>(
             text,
             PositionSource::Subset(&positions),
             lp,
@@ -542,7 +806,7 @@ where
             emit,
         )
     } else {
-        build_in_memory_ss_inner::<S, u64, L, F>(
+        build_in_memory_ss_inner::<S, u64, L, E, F>(
             text,
             PositionSource::Subset(&positions),
             lp,
@@ -720,7 +984,11 @@ impl FilteredSource {
         // the actual popcount each iteration, not 64. This matters
         // any time the bitmap is sparser than ~50%.
         let n_words = self.bitmap.len();
-        let mut word: u64 = if word_idx < n_words { self.bitmap[word_idx] } else { 0 };
+        let mut word: u64 = if word_idx < n_words {
+            self.bitmap[word_idx]
+        } else {
+            0
+        };
         while skip > 0 {
             let pc = word.count_ones() as u64;
             if skip < pc {
@@ -734,7 +1002,11 @@ impl FilteredSource {
             // Skip ≥ pc: consume the whole word and advance.
             skip -= pc;
             word_idx += 1;
-            word = if word_idx < n_words { self.bitmap[word_idx] } else { 0 };
+            word = if word_idx < n_words {
+                self.bitmap[word_idx]
+            } else {
+                0
+            };
         }
 
         // (3) Walk `word`+subsequent words, emitting one position per
@@ -879,7 +1151,7 @@ where
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>> + Send,
+    B: SaLcpBucketStore<I> + Send,
     MkB: Fn(usize) -> B + Send + Sync,
 {
     let n = source.len();
@@ -924,12 +1196,7 @@ where
             // Spill (position, lcp) records to the bucket. `lcp[0]`
             // remains 0 (set by the merge-sort base case), making each
             // subarray its own well-formed LCP-annotated sorted run.
-            let records: Vec<SaLcp<I>> = sa
-                .iter()
-                .zip(lcp_arr.iter())
-                .map(|(&pos, &lcp)| SaLcp { pos, lcp })
-                .collect();
-            bucket.add_slice(&records)?;
+            bucket.add_soa(&sa, &lcp_arr)?;
 
             Ok((bucket, samples))
         })
@@ -1041,7 +1308,7 @@ where
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>> + Send,
+    B: SaLcpBucketStore<I> + Send,
     MkB: Fn(usize) -> B + Send + Sync,
 {
     let _ = opts; // work_dir is used only by the ext-mem factory closure now
@@ -1080,10 +1347,8 @@ where
                 if lo >= hi {
                     continue;
                 }
-                let mut sub: Vec<SaLcp<I>> = records[lo..hi].to_vec();
-                sub[0].lcp = I::zero();
                 let mut bucket = partition_buckets[j].lock().unwrap();
-                bucket.add_slice(&sub)?;
+                bucket.add_slice_reset_first_lcp(&records[lo..hi])?;
                 bucket.mark_boundary();
             }
             Ok(())
@@ -1147,21 +1412,22 @@ where
 /// subarrays the per-partition size is `≈ n / p`, so this stays
 /// proportional to `n / 4 = 0.25 n` even at the peak — well below the
 /// in-memory path's `~4 n` working set.
-fn phase4_merge_and_emit<S, I, L, B, F>(
+fn phase4_merge_and_emit<S, I, L, B, E, F>(
     text: &[S],
     lp: &L,
     partition_buckets: &mut [B],
     max_ctx: usize,
+    ordered_emit: bool,
     emit: &mut F,
     dispatch: LcpDispatch,
-) -> io::Result<()>
+) -> Result<(), BuildError<E>>
 where
     S: Symbol,
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
     B: BucketStore<SaLcp<I>> + Send,
-    F: FnMut(u64) -> io::Result<()>,
+    F: FnMut(u64) -> Result<(), E>,
 {
     let n_partitions = partition_buckets.len();
     if n_partitions == 0 {
@@ -1198,49 +1464,33 @@ where
     while start < n_partitions {
         let end = (start + chunk_size).min(n_partitions);
         let chunk = &mut partition_buckets[start..end];
-
-        // Parallel-merge each non-empty bucket in this chunk. `par_iter_mut`
-        // preserves index order in the collected `Vec`, so the subsequent
-        // sequential emit yields positions in lex order.
-        let merged: Vec<Vec<I>> = chunk
-            .par_iter_mut()
-            .map(|bucket| -> io::Result<Vec<I>> {
-                if bucket.total_records() == 0 {
-                    return Ok(Vec::new());
-                }
-                let t = Instant::now();
-                let records = bucket.load_all()?;
-                let boundaries: Vec<usize> = bucket.boundaries().to_vec();
-                if profile {
-                    load_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
-                }
-
-                let t = Instant::now();
-                let workspace = CascadeWorkspace::<I>::new();
-                // `cascade_merge` consumes the workspace and returns
-                // the result side directly — the other three buffers
-                // drop along with `workspace` here, without an
-                // intermediate `to_vec()` copy.
-                let result =
-                    workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch);
-                if profile {
-                    merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
-                }
-                Ok(result)
-            })
-            .collect::<Result<Vec<_>, io::Error>>()?;
-
-        let t = Instant::now();
-        for positions in merged {
-            for pos in positions {
-                // Widen back to the public `u64` emit contract.
-                emit(pos.to_usize() as u64)?;
-            }
+        if ordered_emit {
+            phase4_merge_chunk_ordered_emit(
+                text,
+                lp,
+                chunk,
+                max_ctx,
+                emit,
+                dispatch,
+                profile,
+                &load_us,
+                &merge_us,
+                &mut emit_secs,
+            )?;
+        } else {
+            phase4_merge_chunk_collect_emit(
+                text,
+                lp,
+                chunk,
+                max_ctx,
+                emit,
+                dispatch,
+                profile,
+                &load_us,
+                &merge_us,
+                &mut emit_secs,
+            )?;
         }
-        if profile {
-            emit_secs += t.elapsed().as_secs_f64();
-        }
-
         start = end;
     }
     if profile {
@@ -1252,6 +1502,177 @@ where
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase4_merge_chunk_collect_emit<S, I, L, B, E, F>(
+    text: &[S],
+    lp: &L,
+    chunk: &mut [B],
+    max_ctx: usize,
+    emit: &mut F,
+    dispatch: LcpDispatch,
+    profile: bool,
+    load_us: &std::sync::atomic::AtomicU64,
+    merge_us: &std::sync::atomic::AtomicU64,
+    emit_secs: &mut f64,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+    SaLcp<I>: BucketRecord,
+    B: BucketStore<SaLcp<I>> + Send,
+    F: FnMut(u64) -> Result<(), E>,
+{
+    // Default fast path: let rayon merge the whole chunk with minimal
+    // coordination, then emit the collected partition results in order.
+    let merged: Vec<Vec<I>> = chunk
+        .par_iter_mut()
+        .map(|bucket| -> io::Result<Vec<I>> {
+            merge_one_partition(
+                text, lp, bucket, max_ctx, dispatch, profile, load_us, merge_us,
+            )
+        })
+        .collect::<Result<Vec<_>, io::Error>>()?;
+
+    let t = Instant::now();
+    for positions in merged {
+        for pos in positions {
+            emit(pos.to_usize() as u64).map_err(BuildError::Emit)?;
+        }
+    }
+    if profile {
+        *emit_secs += t.elapsed().as_secs_f64();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase4_merge_chunk_ordered_emit<S, I, L, B, E, F>(
+    text: &[S],
+    lp: &L,
+    chunk: &mut [B],
+    max_ctx: usize,
+    emit: &mut F,
+    dispatch: LcpDispatch,
+    profile: bool,
+    load_us: &std::sync::atomic::AtomicU64,
+    merge_us: &std::sync::atomic::AtomicU64,
+    emit_secs: &mut f64,
+) -> Result<(), BuildError<E>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+    SaLcp<I>: BucketRecord,
+    B: BucketStore<SaLcp<I>> + Send,
+    F: FnMut(u64) -> Result<(), E>,
+{
+    let n_jobs = chunk.len();
+    let channel_bound = (rayon::current_num_threads().max(1) * 2).min(n_jobs).max(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, io::Result<Vec<I>>)>(channel_bound);
+    let mut pending = std::collections::BTreeMap::<usize, Vec<I>>::new();
+    let mut next_to_emit = 0usize;
+    let mut received = 0usize;
+    let mut io_err: Option<io::Error> = None;
+    let mut emit_err: Option<E> = None;
+
+    std::thread::scope(|thread_scope| {
+        let worker = thread_scope.spawn(|| {
+            chunk
+                .par_iter_mut()
+                .enumerate()
+                .for_each_with(tx, |tx, (local_idx, bucket)| {
+                    let result = merge_one_partition(
+                        text, lp, bucket, max_ctx, dispatch, profile, load_us, merge_us,
+                    );
+                    let _ = tx.send((local_idx, result));
+                });
+        });
+
+        while received < n_jobs {
+            let (local_idx, result) = rx
+                .recv()
+                .expect("phase4 worker channel closed before all partitions completed");
+            received += 1;
+            match result {
+                Ok(positions) => {
+                    pending.insert(local_idx, positions);
+                }
+                Err(err) => {
+                    if io_err.is_none() {
+                        io_err = Some(err);
+                    }
+                }
+            }
+
+            while let Some(positions) = pending.remove(&next_to_emit) {
+                if io_err.is_none() && emit_err.is_none() {
+                    let t = Instant::now();
+                    for pos in positions {
+                        // Widen back to the public `u64` emit contract.
+                        if let Err(err) = emit(pos.to_usize() as u64) {
+                            emit_err = Some(err);
+                            break;
+                        }
+                    }
+                    if profile {
+                        *emit_secs += t.elapsed().as_secs_f64();
+                    }
+                }
+                next_to_emit += 1;
+            }
+        }
+        worker.join().expect("phase4 merge worker panicked");
+    });
+
+    if let Some(err) = io_err {
+        return Err(BuildError::Io(err));
+    }
+    if let Some(err) = emit_err {
+        return Err(BuildError::Emit(err));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_one_partition<S, I, L, B>(
+    text: &[S],
+    lp: &L,
+    bucket: &mut B,
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    profile: bool,
+    load_us: &std::sync::atomic::AtomicU64,
+    merge_us: &std::sync::atomic::AtomicU64,
+) -> io::Result<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+    SaLcp<I>: BucketRecord,
+    B: BucketStore<SaLcp<I>>,
+{
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    if bucket.total_records() == 0 {
+        return Ok(Vec::new());
+    }
+    let t = Instant::now();
+    let records = bucket.load_all()?;
+    let boundaries: Vec<usize> = bucket.boundaries().to_vec();
+    if profile {
+        load_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+    }
+
+    let t = Instant::now();
+    let workspace = CascadeWorkspace::<I>::new();
+    let result = workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch);
+    if profile {
+        merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
+    }
+    Ok(result)
 }
 
 /// Reusable ping-pong scratch for the partition cascade merge.
@@ -1679,6 +2100,33 @@ mod tests {
         let want = ext_mem_for_positions(&text, positions, 4);
         let got = ext_mem_for_filter(&text, |i| text[i as usize] < 1, 4);
         assert_eq!(got, want, "filter API mismatch on sparse predicate");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum EmitTestError {
+        Stop,
+    }
+
+    #[test]
+    fn try_ext_mem_returns_typed_emit_error() {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: 2,
+            work_dir: dir.path().to_path_buf(),
+            ..ExtMemOpts::default()
+        };
+        let mut seen = 0usize;
+        let err = try_build_ext_mem(b"banana", &opts, |_pos| {
+            seen += 1;
+            if seen == 2 {
+                Err(EmitTestError::Stop)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, BuildError::Emit(EmitTestError::Stop)));
     }
 
     #[test]

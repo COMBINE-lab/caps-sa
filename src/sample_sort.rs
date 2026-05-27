@@ -291,6 +291,8 @@ pub(crate) fn merge<S, I, L>(
     let mut i_b: usize = 0;
     let mut m: usize = 0;
     let mut k: usize = 0;
+    let mut lim_a_cache: Option<(usize, usize)> = None;
+    let mut lim_b_cache: Option<(usize, usize)> = None;
 
     while i_a < len_a && i_b < len_b {
         let l_a = lcp_a[i_a].to_usize();
@@ -309,8 +311,22 @@ pub(crate) fn merge<S, I, L>(
             // `n_text - p` (the same expression the pre-LimitProvider
             // code computed inline); with `SegmentedText` they cap at
             // the next segment boundary so the LCP scan stops there.
-            let lim_a = lp.lim_at(p_a);
-            let lim_b = lp.lim_at(p_b);
+            let lim_a = match lim_a_cache {
+                Some((idx, lim)) if idx == i_a => lim,
+                _ => {
+                    let lim = lp.lim_at(p_a);
+                    lim_a_cache = Some((i_a, lim));
+                    lim
+                }
+            };
+            let lim_b = match lim_b_cache {
+                Some((idx, lim)) if idx == i_b => lim,
+                _ => {
+                    let lim = lp.lim_at(p_b);
+                    lim_b_cache = Some((i_b, lim));
+                    lim
+                }
+            };
             // Pass an already-segmentation-aware cap to the SIMD LCP so
             // it doesn't have to scan past the boundary. For PlainText
             // this is equivalent to the LCP function's own `n - p`
@@ -338,16 +354,19 @@ pub(crate) fn merge<S, I, L>(
             z[k] = arr_a[i_a];
             lcp_z[k] = I::from_usize(lcp_for_output);
             i_a += 1;
+            lim_a_cache = None;
         } else {
             z[k] = arr_b[i_b];
             lcp_z[k] = I::from_usize(lcp_for_output);
             i_b += 1;
+            lim_b_cache = None;
             // Outputting from B: swap labels so the next iteration's
             // "last-output stream" is what was B.
             std::mem::swap(&mut arr_a, &mut arr_b);
             std::mem::swap(&mut lcp_a, &mut lcp_b);
             std::mem::swap(&mut len_a, &mut len_b);
             std::mem::swap(&mut i_a, &mut i_b);
+            std::mem::swap(&mut lim_a_cache, &mut lim_b_cache);
         }
         m = new_m;
         k += 1;

@@ -2,6 +2,42 @@
 
 Release notes for the [`caps-sa`](https://crates.io/crates/caps-sa) crate.
 
+## [v0.6.0](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.6.0) — 2026-05-27
+
+### Added
+
+- Generic-error `try_*` external-memory and in-memory sample-sort
+  builders returning `BuildError<E>`, so callers can abort emit
+  callbacks with their own error type instead of forcing
+  `std::io::Error`.
+- `ExtMemOpts::from_env()` and builder setters for external-memory
+  tuning, including `CAPS_SA_WORK_DIR` / `CAPS_SA_TMPDIR`.
+- Opt-in bounded ordered phase-4 emission via
+  `ExtMemOpts::ordered_phase4_emit(true)` or
+  `CAPS_SA_ORDERED_PHASE4=1`. The default remains the faster
+  collect-then-emit phase-4 path.
+
+### Changed
+
+- Phase 1 writes `(position, lcp)` records directly from the existing
+  position and LCP arrays, avoiding a transient `Vec<SaLcp<_>>`.
+- Phase 3 appends partition sub-slices while resetting the first LCP
+  inside the bucket layer, avoiding one allocation/copy per non-empty
+  sub-subarray.
+- The merge loop caches current stream-head `LimitProvider::lim_at`
+  results, reducing repeated segment-boundary lookups for segmented
+  callers.
+- `Index::from_usize` docs now state the existing unchecked-cast
+  behavior explicitly.
+
+### Compatibility
+
+This release adds a public field to `ExtMemOpts`, which can break
+struct-literal construction without `..Default::default()`. Version
+bumps `0.5.0 → 0.6.0`.
+
+---
+
 ## [v0.5.0](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.5.0) — 2026-05-25
 
 ### Added
