@@ -846,7 +846,7 @@ enum PositionSource<'a> {
 const FILTERED_WORDS_PER_BLOCK: usize = 1024;
 
 /// Streaming position source backed by a **bitmap** of kept positions
-/// + a per-block popcount prefix-sum. No `Vec<u64>` of kept positions
+/// plus a per-block popcount prefix-sum. No `Vec<u64>` of kept positions
 /// is ever materialised.
 ///
 /// Memory: `(n + 7) / 8` bytes for the bitmap (~770 MB on the human
@@ -2060,7 +2060,7 @@ mod tests {
         // pre-materialising the kept positions and going through the
         // _for_positions path.
         use rand::{RngExt, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCA75_5A);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCA_755A);
         for &n in &[50usize, 500, 2000] {
             for &p in &[1usize, 3, 8] {
                 let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..6u8)).collect();

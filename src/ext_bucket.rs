@@ -15,8 +15,6 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -774,11 +772,46 @@ where
     }
 }
 
-/// `pwrite` until all of `buf` is written. Retries on `Interrupted`.
+// Positioned single-shot I/O primitives. Every call carries its offset
+// explicitly and never consults the file's implicit cursor, so concurrent
+// calls from multiple threads to disjoint offsets on one shared handle are
+// safe — which is exactly what the pooled bucket path relies on. Unix uses
+// `pread`/`pwrite` ([`FileExt::read_at`]/[`write_at`]); Windows uses the
+// equivalent overlapped `ReadFile`/`WriteFile`
+// ([`FileExt::seek_read`]/[`seek_write`]), each a single syscall taking the
+// offset from a per-call `OVERLAPPED`.
 #[cfg(unix)]
+#[inline]
+fn pwrite_one(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(windows)]
+#[inline]
+fn pwrite_one(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
+
+#[cfg(unix)]
+#[inline]
+fn pread_one(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+#[inline]
+fn pread_one(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+/// `pwrite` until all of `buf` is written. Retries on `Interrupted`.
 fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
-        match file.write_at(buf, offset) {
+        match pwrite_one(file, buf, offset) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -798,10 +831,9 @@ fn pwrite_all(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
 
 /// `pread` until all of `buf` is filled. Errors on EOF before the
 /// requested length.
-#[cfg(unix)]
 fn pread_all(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
-        match file.read_at(buf, offset) {
+        match pread_one(file, buf, offset) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -818,16 +850,6 @@ fn pread_all(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()>
     }
     Ok(())
 }
-
-// Non-Unix targets keep the per-bucket-file path; the pooled path is
-// gated on `cfg(unix)` and the workspace bench targets are Linux /
-// macOS. If Windows support is needed, swap pread/pwrite for
-// `seek_read`/`seek_write` from `std::os::windows::fs::FileExt`.
-#[cfg(not(unix))]
-compile_error!(
-    "PooledExtMemBucket currently requires Unix file extension API; \
-     add Windows support via seek_read/seek_write if needed."
-);
 
 fn write_records<T: BucketRecord, W: Write>(w: &mut W, rs: &[T]) -> io::Result<()> {
     // Buffer one chunk at a time to amortize allocation while keeping

@@ -2,6 +2,27 @@
 
 Release notes for the [`caps-sa`](https://crates.io/crates/caps-sa) crate.
 
+## [v0.6.1](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.6.1) — 2026-06-01
+
+### Added
+
+- Windows support for the pooled external-memory bucket path.
+  `PooledExtMemBucket` previously required the Unix `pread`/`pwrite`
+  file-extension API (`FileExt::read_at`/`write_at`) and emitted a
+  `compile_error!` on non-Unix targets. Positioned reads/writes are now
+  routed through `cfg`-gated `pread_one`/`pwrite_one` helpers that use
+  `FileExt::seek_read`/`seek_write` on Windows. Every call carries its
+  offset explicitly and never relies on the handle's implicit cursor,
+  so concurrent positioned I/O from multiple threads to disjoint
+  offsets stays correct on both platforms.
+
+### Fixed
+
+- Two clippy lints in `ext_mem.rs` (`unusual_byte_groupings` on a hex
+  seed literal, `doc_lazy_continuation` on a `+`-prefixed doc line).
+
+---
+
 ## [v0.6.0](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.6.0) — 2026-05-27
 
 ### Added
