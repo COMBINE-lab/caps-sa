@@ -1,0 +1,161 @@
+---
+title: caps-sa
+description: Cache-friendly, parallel, sample-sort-based suffix array construction in pure Rust.
+---
+
+import { Image } from 'astro:assets';
+import capssaIcon from '../../assets/capssa-icon.svg';
+
+export const installCode = `<span class="comment"># Library · add to your crate</span>
+<span class="prompt">$</span> cargo add caps-sa
+
+<span class="comment"># CLI · build the example binary</span>
+<span class="prompt">$</span> cargo build <span class="flag">--release</span> <span class="flag">--example</span> caps_sa
+
+<span class="comment"># construct a suffix array, streaming from disk</span>
+<span class="prompt">$</span> ./target/release/examples/caps_sa <span class="str">input.bin sa.bin</span> \\
+    <span class="flag">--ext-mem</span> <span class="flag">--threads</span> 16`;
+
+<div class="capssa-home">
+
+<section class="capssa-hero">
+  <div>
+    <h1>caps-sa</h1>
+    <p class="lead">A pure-Rust implementation of <em>CaPS-SA</em> — a cache-friendly, parallel, sample-sort-based <em>suffix array</em> constructor (Khan et al., WABI 2023).</p>
+    <p class="lead-2">Generic over the symbol type (<code>u8</code>, <code>u16</code>, … any <code>Symbol</code>) and index width. Scales to human-genome inputs (≈ 6 × 10⁹ symbols) on commodity hardware via an external-memory path that streams the SA out as positions are emitted.</p>
+    <div class="capssa-btns capssa-hero-btns">
+      <a href="/caps-sa/getting-started/introduction/" class="primary">Documentation</a>
+      <a href="https://github.com/COMBINE-lab/caps-sa">GitHub ↗</a>
+    </div>
+  </div>
+  <Image src={capssaIcon} alt="caps-sa logo: sorted suffix-array bars" class="capssa-mascot" loading="eager" />
+</section>
+
+<svg class="capssa-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="capssa-section">
+  <h2>Genome-scale, on commodity hardware.</h2>
+  <p class="lede">GRCh38 (3.1 GB, ≈ 6 × 10⁹ symbols), 32 threads on an AMD EPYC 9575F. Measured against the upstream C++ CaPS-SA reference.</p>
+  <div class="capssa-stats">
+    <div class="capssa-stat">
+      <div class="num">5.03 GB</div>
+      <div class="lbl">Peak RAM · whole human genome</div>
+      <div class="sub">Full GRCh38 suffix array in 10.47 min wall — 7% faster than upstream's external-memory path and 23% less RAM.</div>
+    </div>
+    <div class="capssa-stat">
+      <div class="num">45×</div>
+      <div class="lbl">LCP SIMD speedup</div>
+      <div class="sub">One AVX-512 byte-compare backs every symbol width, lifting the LCP kernel from ~200 ms scalar to 4–29 ms (7× on <code>u64</code>, 45× on <code>u8</code>).</div>
+    </div>
+  </div>
+</section>
+
+<svg class="capssa-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="capssa-section">
+  <h2>What it does.</h2>
+  <div class="capssa-feats">
+    <div class="capssa-feat">
+      <div class="n">01</div>
+      <div>
+        <h3>Generic over symbols</h3>
+        <p>Sort <code>u8</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>{'[u8; N]'}</code> — anything implementing <code>Symbol</code>. Index width is <code>u32</code>, <code>u64</code>, or <code>usize</code>.</p>
+      </div>
+    </div>
+    <div class="capssa-feat">
+      <div class="n">02</div>
+      <div>
+        <h3>In-memory & external-memory</h3>
+        <p>A parallel merge-sort and an in-memory sample-sort for RAM-rich hosts; a disk-spilling sample-sort when the SA can't fit. Same SA, same kernel.</p>
+      </div>
+    </div>
+    <div class="capssa-feat">
+      <div class="n">03</div>
+      <div>
+        <h3>LCP-enhanced merge</h3>
+        <p>Carried LCP arrays decide most merge comparisons in <code>O(1)</code>, with a SIMD LCP fast path (AVX-512BW → AVX2 → NEON → scalar) selected once per build.</p>
+      </div>
+    </div>
+    <div class="capssa-feat">
+      <div class="n">04</div>
+      <div>
+        <h3>Streaming output</h3>
+        <p>The external-memory path emits SA positions in lex order through a caller closure. Peak RAM stays bounded at <code>{'~O(text + n/p)'}</code> — the SA is never fully materialised.</p>
+      </div>
+    </div>
+    <div class="capssa-feat">
+      <div class="n">05</div>
+      <div>
+        <h3>Sort a subset</h3>
+        <p>The <code>*_for_positions</code> entry points sort only the positions you hand them. Filtered positions (N's, spacers) never enter the sort.</p>
+      </div>
+    </div>
+    <div class="capssa-feat">
+      <div class="n">06</div>
+      <div>
+        <h3>Generalized-SA ready</h3>
+        <p>A <code>SegmentedText</code> limit-provider stops LCP scans at segment boundaries — the hook STAR-style genome+junction indexes build on.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<svg class="capssa-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="capssa-section capssa-install-section">
+  <h2>Two faces, one kernel.</h2>
+  <div class="capssa-install">
+    <div>
+      <h3>Embed it, or run it</h3>
+      <p>caps-sa ships as a <strong>library</strong> for embedding in larger tools (it backs the genome indexer in <code>rustar-aligner</code>) and as a small <strong>CLI</strong> example for standalone suffix-array construction and benchmarking.</p>
+      <p>Add the crate from <a href="https://crates.io/crates/caps-sa">crates.io</a>, or build the CLI from source.</p>
+      <div class="capssa-btns">
+        <a href="/caps-sa/getting-started/installation/" class="primary">install</a>
+        <a href="/caps-sa/getting-started/quick-start/">quick start</a>
+        <a href="/caps-sa/concepts/algorithm/">the algorithm</a>
+      </div>
+    </div>
+    <pre class="capssa-code" set:html={installCode}></pre>
+  </div>
+</section>
+
+<svg class="capssa-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="capssa-section">
+  <h2>Side by side with upstream.</h2>
+  <p class="lede">Suffix-array build time (I/O excluded), caps-sa vs the upstream C++ CaPS-SA reference. See the <a href="/caps-sa/reference/performance/">performance page</a> for the full methodology.</p>
+  <table class="capssa-compare">
+    <thead>
+      <tr>
+        <th>Input</th>
+        <th style="text-align:right">Threads</th>
+        <th style="text-align:right">caps-sa</th>
+        <th style="text-align:right">upstream</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td class="metric">Yeast · 12 MB</td><td class="num">4</td><td class="num">0.99 s</td><td class="num">3.94 s</td></tr>
+      <tr><td class="metric">Random DNA · 100 MB</td><td class="num">4</td><td class="num">11.39 s</td><td class="num">12.17 s</td></tr>
+      <tr><td class="metric">Human GRCh38 · 3.1 GB</td><td class="num">32</td><td class="num">10.47 min</td><td class="num">10.93 min</td></tr>
+      <tr><td class="metric">GRCh38 peak RAM</td><td class="num">32</td><td class="num">5.03 GB</td><td class="num">6.46 GB</td></tr>
+    </tbody>
+  </table>
+</section>
+
+</div>

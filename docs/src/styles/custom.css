@@ -1,0 +1,658 @@
+/* ==========================================================================
+   caps-sa · design tokens — blueprint theme (teal accent)
+   Light: bone paper + prussian ink (cyanotype-inverted).
+   Dark:  deep navy paper + parchment ink (atlas dark).
+   Body has a graph-paper grid background. Display = Archivo Narrow,
+   body = Inter, mono = JetBrains Mono. The brand wordmark stays mono.
+   ========================================================================== */
+
+/* ---------- Tokens ---------- */
+
+:root {
+  /* Paper / surfaces */
+  --capssa-paper:       oklch(96% 0.012 80);
+  --capssa-paper-deep:  oklch(92% 0.02 230);
+  --capssa-paper-line:  oklch(82% 0.04 230);
+
+  /* Ink / text */
+  --capssa-ink:         oklch(28% 0.10 245);
+  --capssa-ink-soft:    oklch(40% 0.10 245);
+  --capssa-ink-mute:    oklch(58% 0.06 245);
+
+  /* Accents */
+  --capssa-accent:      oklch(54% 0.105 188);
+  --capssa-accent-soft: oklch(80% 0.085 188);
+  --capssa-warn:        oklch(56% 0.21 28);
+
+  /* Background grid */
+  --capssa-grid:        oklch(75% 0.04 230 / 0.16);
+  --capssa-contour:     oklch(68% 0.07 230);
+
+  /* Rule / border colour. In light mode this is full ink; in dark mode it
+     drops to the paper-line shade so borders read as quiet hairlines instead
+     of high-contrast cream-on-navy lines. */
+  --capssa-rule:        var(--capssa-ink);
+
+  /* Fonts */
+  --capssa-sans:        'Inter', system-ui, -apple-system, sans-serif;
+  --capssa-condensed:   'Archivo Narrow', sans-serif;
+  --capssa-mono:        'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Override Starlight tokens (light mode) */
+  --sl-font:            var(--capssa-sans);
+  --sl-font-mono:       var(--capssa-mono);
+  --sl-color-bg:                 var(--capssa-paper);
+  --sl-color-bg-nav:             var(--capssa-paper);
+  --sl-color-bg-sidebar:         var(--capssa-paper);
+  --sl-color-bg-inline-code:     var(--capssa-paper-deep);
+  --sl-color-text:               var(--capssa-ink);
+  --sl-color-text-accent:        var(--capssa-accent);
+  --sl-color-white:              var(--capssa-ink);
+  --sl-color-gray-1:             var(--capssa-ink);
+  --sl-color-gray-2:             var(--capssa-ink-soft);
+  --sl-color-gray-3:             var(--capssa-ink-mute);
+  --sl-color-gray-4:             var(--capssa-ink-mute);
+  --sl-color-gray-5:             var(--capssa-paper-line);
+  --sl-color-gray-6:             var(--capssa-paper-line);
+  --sl-color-hairline:           var(--capssa-paper-line);
+  --sl-color-hairline-light:     var(--capssa-paper-line);
+  --sl-color-hairline-shade:     var(--capssa-paper-line);
+}
+
+:root[data-theme='dark'] {
+  --capssa-paper:       oklch(17% 0.045 245);
+  --capssa-paper-deep:  oklch(21% 0.05 245);
+  --capssa-paper-line:  oklch(28% 0.05 245);
+
+  --capssa-ink:         oklch(94% 0.013 75);
+  --capssa-ink-soft:    oklch(80% 0.02 75);
+  --capssa-ink-mute:    oklch(62% 0.03 75);
+
+  --capssa-accent:      oklch(80% 0.12 190);
+  --capssa-accent-soft: oklch(62% 0.10 190);
+  --capssa-warn:        oklch(70% 0.20 28);
+
+  --capssa-grid:        oklch(28% 0.05 245 / 0.40);
+  --capssa-contour:     oklch(48% 0.07 235);
+  --capssa-rule:        oklch(48% 0.04 240);
+
+  --sl-color-bg:                 var(--capssa-paper);
+  --sl-color-bg-nav:             var(--capssa-paper);
+  --sl-color-bg-sidebar:         var(--capssa-paper);
+  --sl-color-bg-inline-code:     var(--capssa-paper-deep);
+  --sl-color-text:               var(--capssa-ink);
+  --sl-color-text-accent:        var(--capssa-accent);
+  --sl-color-white:              var(--capssa-ink);
+  --sl-color-gray-1:             var(--capssa-ink);
+  --sl-color-gray-2:             var(--capssa-ink-soft);
+  --sl-color-gray-3:             var(--capssa-ink-mute);
+  --sl-color-gray-4:             var(--capssa-ink-mute);
+  --sl-color-gray-5:             var(--capssa-paper-line);
+  --sl-color-gray-6:             var(--capssa-paper-line);
+  --sl-color-hairline:           var(--capssa-paper-line);
+  --sl-color-hairline-light:     var(--capssa-paper-line);
+  --sl-color-hairline-shade:     var(--capssa-paper-line);
+}
+
+/* ---------- Base body: graph-paper grid ---------- */
+
+body {
+  background-color: var(--capssa-paper);
+  background-image:
+    linear-gradient(to right, var(--capssa-grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--capssa-grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  font-feature-settings: "ss01", "cv11";
+  font-optical-sizing: auto;
+}
+
+::selection { background: var(--capssa-accent-soft); color: var(--capssa-ink); }
+
+/* ---------- Brand wordmark / nav ---------- */
+
+.site-title {
+  font-family: var(--capssa-mono);
+  font-weight: 700;
+  letter-spacing: 0.005em;
+}
+
+.capssa-header .top-nav a {
+  font-family: var(--capssa-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.18em;
+  font-weight: 500;
+  font-size: 0.92rem;
+}
+
+.capssa-header .version-pill {
+  font-family: var(--capssa-mono);
+}
+
+/* ---------- Headings: Archivo Narrow ---------- */
+/* Applied to every h1–h6 in main (page-h1, markdown headings, the capssa-home
+   custom hero/sections — everything except the .site-title brand wordmark
+   which keeps its mono override below). */
+
+main h1, main h2, main h3, main h4, main h5, main h6 {
+  font-family: var(--capssa-condensed);
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  color: var(--capssa-ink);
+}
+
+.sl-markdown-content h1 { font-size: clamp(2rem, 5vw, 3rem); line-height: 1.05; }
+.sl-markdown-content h2 { font-size: clamp(1.55rem, 3vw, 2rem); line-height: 1.1; margin-top: 2.25rem; }
+.sl-markdown-content h3 { font-size: 1.25rem; margin-top: 1.6rem; }
+.sl-markdown-content h4 { font-size: 1.05rem; }
+
+/* Auto page heading rendered by Starlight (the h1 shown above markdown
+   content on every doc page). Sized larger and condensed. */
+main > .content-panel:first-of-type > .sl-container > h1 {
+  font-family: var(--capssa-condensed);
+  font-weight: 700;
+  font-size: clamp(2.25rem, 5.5vw, 3.5rem);
+  line-height: 1.05;
+  letter-spacing: -0.005em;
+  color: var(--capssa-ink);
+}
+
+/* Inline code: keep on one line, quiet styling */
+:not(pre) > code {
+  white-space: nowrap;
+  font-family: var(--capssa-mono);
+  font-size: 0.9em;
+  background: var(--capssa-paper-deep);
+  border: 0.5px solid var(--capssa-paper-line);
+  padding: 1px 6px;
+  border-radius: 0;
+  color: var(--capssa-ink);
+}
+
+/* Hide the terminal-style title bar; restore a top border on framed code so
+   the box still reads as enclosed. */
+.expressive-code .frame.is-terminal .header { display: none; }
+.expressive-code .frame.has-title pre,
+.expressive-code .frame.is-terminal pre {
+  border-top: var(--ec-brdWd) solid var(--ec-brdCol);
+}
+
+/* Sidebar: cleaner, hairline rules */
+starlight-menu-button { color: var(--capssa-ink); }
+
+/* Section dividers in markdown — wiggle topo line */
+.sl-markdown-content hr {
+  border: none;
+  height: 50px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 50' preserveAspectRatio='none'><path d='M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28' fill='none' stroke='%23999' stroke-width='0.6'/><path d='M0,18 Q300,5 600,18 T1200,18' fill='none' stroke='%23999' stroke-width='0.6'/><path d='M0,38 Q400,24 800,38 T1200,38' fill='none' stroke='%23999' stroke-width='0.6'/></svg>");
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+  margin: 2.5rem 0;
+  opacity: 0.7;
+}
+
+/* ==========================================================================
+   Homepage (template: splash) — matches mockup 11
+   ========================================================================== */
+
+.capssa-home {
+  --capssa-content-pad: clamp(1rem, 4vw, 2.25rem);
+  margin: 0 auto;
+  max-width: 1240px;
+  padding: 0 var(--capssa-content-pad);
+  font-size: 16.5px;
+  line-height: 1.6;
+  color: var(--capssa-ink);
+}
+
+/* Hero */
+.capssa-hero {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 64px;
+  align-items: end;
+  padding: 64px 0 56px;
+}
+
+.capssa-hero h1 {
+  font-family: var(--capssa-condensed);
+  font-weight: 700;
+  font-size: clamp(56px, 9vw, 124px);
+  line-height: 0.95;
+  letter-spacing: -0.008em;
+  margin: 0 0 22px;
+  color: var(--capssa-ink);
+}
+
+.capssa-hero .lead {
+  font-size: 21px;
+  line-height: 1.5;
+  color: var(--capssa-ink-soft);
+  max-width: 50ch;
+  margin: 0 0 14px;
+}
+
+.capssa-hero .lead em { color: var(--capssa-ink); font-style: normal; font-weight: 600; }
+
+.capssa-hero .lead-2 {
+  font-size: 18px;
+  color: var(--capssa-ink-soft);
+  max-width: 52ch;
+  margin: 14px 0 0;
+}
+
+.capssa-hero .lead-2 code {
+  font-family: var(--capssa-mono);
+  font-size: 0.9em;
+  background: var(--capssa-paper-deep);
+  border: 0.5px solid var(--capssa-paper-line);
+  padding: 1px 6px;
+}
+
+.capssa-hero-btns { margin-top: 28px; }
+.capssa-btns.capssa-hero-btns a { text-transform: none; letter-spacing: 0.02em; }
+
+.capssa-mascot {
+  width: 100%;
+  max-width: 280px;
+  height: auto;
+  display: block;
+  margin: 0 0 0 auto;
+  filter: drop-shadow(0 2px 0 oklch(20% 0.05 245 / 0.08));
+}
+
+/* Wiggle topo divider — water-surface undulation via CSS path() morphing.
+   Each line's `d` attribute is overridden in CSS and animated between several
+   waveform variants. The control-point Y values drift independently per line,
+   with prime-ish durations and large negative delays so the three lines never
+   re-sync. Result: organic, water-like motion rather than rigid translation.
+
+   See: https://medium.com/@r_tripti/css-only-svg-wave-animation-291c1cadd15f
+   `d:` as a CSS property is supported in Chrome 108+, Safari 16.4+, Firefox 128+. */
+
+.capssa-topo {
+  display: block;
+  width: 100%;
+  height: 50px;
+  color: var(--capssa-contour);
+  margin: 0;
+  overflow: visible;
+}
+.capssa-topo path {
+  stroke-width: 0.9;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Static d (also the reduced-motion fallback). Each path is converted from
+   the original Q…T form to explicit Q…Q so we can morph each control point
+   independently. */
+.capssa-topo path:nth-of-type(1) {
+  d: path("M 0,28 Q 200,14 400,28 Q 600,42 800,28 Q 1000,16 1200,28");
+}
+.capssa-topo path:nth-of-type(2) {
+  d: path("M 0,18 Q 300,5 600,18 Q 900,31 1200,18");
+}
+.capssa-topo path:nth-of-type(3) {
+  d: path("M 0,38 Q 400,24 800,38 Q 1100,50 1200,38");
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .capssa-topo path:nth-of-type(1) {
+    animation: capssa-wave-a 8.6s ease-in-out infinite;
+  }
+  .capssa-topo path:nth-of-type(2) {
+    animation: capssa-wave-b 11.4s ease-in-out infinite -3.4s;
+  }
+  .capssa-topo path:nth-of-type(3) {
+    animation: capssa-wave-c 14s ease-in-out infinite -7.4s;
+  }
+}
+
+/* Belt-and-braces: explicit reduce block. The path stays at its static `d`
+   defined above (the 0%/100% keyframe value), no morphing applied. */
+@media (prefers-reduced-motion: reduce) {
+  .capssa-topo path { animation: none !important; }
+}
+
+/* Path 1 — three humps along centreline 28; each control-point Y breathes. */
+@keyframes capssa-wave-a {
+  0%, 100% { d: path("M 0,28 Q 200,14 400,28 Q 600,42 800,28 Q 1000,16 1200,28"); }
+  20%      { d: path("M 0,28 Q 200,8  400,28 Q 600,48 800,28 Q 1000,22 1200,28"); }
+  40%      { d: path("M 0,28 Q 200,20 400,28 Q 600,38 800,28 Q 1000,10 1200,28"); }
+  60%      { d: path("M 0,28 Q 200,12 400,28 Q 600,46 800,28 Q 1000,20 1200,28"); }
+  80%      { d: path("M 0,28 Q 200,18 400,28 Q 600,40 800,28 Q 1000,14 1200,28"); }
+}
+
+/* Path 2 — two humps at centreline 18, smaller amplitude. */
+@keyframes capssa-wave-b {
+  0%, 100% { d: path("M 0,18 Q 300,5  600,18 Q 900,31 1200,18"); }
+  25%      { d: path("M 0,18 Q 300,12 600,18 Q 900,24 1200,18"); }
+  50%      { d: path("M 0,18 Q 300,2  600,18 Q 900,34 1200,18"); }
+  75%      { d: path("M 0,18 Q 300,8  600,18 Q 900,28 1200,18"); }
+}
+
+/* Path 3 — single big hump at centreline 38. */
+@keyframes capssa-wave-c {
+  0%, 100% { d: path("M 0,38 Q 400,24 800,38 Q 1100,50 1200,38"); }
+  30%      { d: path("M 0,38 Q 400,30 800,38 Q 1100,44 1200,38"); }
+  55%      { d: path("M 0,38 Q 400,18 800,38 Q 1100,56 1200,38"); }
+  85%      { d: path("M 0,38 Q 400,32 800,38 Q 1100,42 1200,38"); }
+}
+
+/* Section base */
+.capssa-section { padding: 56px 0 16px; }
+
+.capssa-section .figmark {
+  font-family: var(--capssa-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.28em;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--capssa-accent);
+  margin-bottom: 14px;
+}
+
+.capssa-section h2 {
+  font-family: var(--capssa-condensed);
+  font-weight: 700;
+  font-size: clamp(32px, 4.5vw, 52px);
+  line-height: 1;
+  letter-spacing: -0.005em;
+  margin: 0 0 20px;
+  color: var(--capssa-ink);
+}
+
+.capssa-section .lede {
+  font-size: 18px;
+  color: var(--capssa-ink-soft);
+  max-width: 60ch;
+  margin: 0 0 32px;
+}
+
+/* Stats — 2 cells */
+.capssa-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 56px;
+  border-top: 0.5px solid var(--capssa-rule);
+  padding-top: 32px;
+}
+
+.capssa-stat .num {
+  font-family: var(--capssa-condensed);
+  font-weight: 700;
+  font-size: clamp(64px, 9vw, 128px);
+  line-height: 0.92;
+  color: var(--capssa-accent);
+  letter-spacing: -0.015em;
+  font-feature-settings: "tnum";
+}
+
+.capssa-stat .lbl {
+  font-family: var(--capssa-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.22em;
+  font-size: 12.5px;
+  color: var(--capssa-ink-soft);
+  margin-top: 18px;
+  font-weight: 600;
+}
+
+.capssa-stat .sub {
+  font-size: 15.5px;
+  color: var(--capssa-ink-mute);
+  line-height: 1.5;
+  max-width: 40ch;
+  margin-top: 8px;
+}
+
+/* Features grid */
+.capssa-feats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 56px;
+  border-top: 0.5px solid var(--capssa-rule);
+}
+
+.capssa-feat {
+  padding: 28px 0;
+  border-bottom: 0.5px solid var(--capssa-paper-line);
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 18px;
+  align-items: baseline;
+}
+
+.capssa-feat:nth-last-child(-n+2) { border-bottom: 0.5px solid var(--capssa-rule); }
+
+.capssa-feat .n {
+  font-family: var(--capssa-mono);
+  font-size: 13px;
+  color: var(--capssa-accent);
+  letter-spacing: 0.04em;
+  font-feature-settings: "tnum";
+  font-weight: 500;
+}
+
+.capssa-feat h3 {
+  font-family: var(--capssa-condensed);
+  font-weight: 600;
+  font-size: 21px;
+  margin: 0 0 6px;
+  letter-spacing: -0.005em;
+  color: var(--capssa-ink);
+}
+
+.capssa-feat p {
+  margin: 0;
+  font-size: 15.5px;
+  color: var(--capssa-ink-soft);
+  line-height: 1.55;
+  max-width: 60ch;
+}
+
+.capssa-feat code {
+  font-family: var(--capssa-mono);
+  font-size: 0.92em;
+  background: var(--capssa-paper-deep);
+  padding: 1px 6px;
+  border: 0.5px solid var(--capssa-paper-line);
+}
+
+/* Quick start */
+.capssa-install {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 56px;
+  border-top: 0.5px solid var(--capssa-rule);
+  padding-top: 36px;
+  align-items: start;
+}
+
+.capssa-install h3 {
+  font-family: var(--capssa-condensed);
+  font-weight: 600;
+  font-size: 26px;
+  margin: 0 0 12px;
+  color: var(--capssa-ink);
+}
+
+.capssa-install p {
+  margin: 0 0 14px;
+  font-size: 16.5px;
+  color: var(--capssa-ink-soft);
+  line-height: 1.6;
+  max-width: 44ch;
+}
+
+.capssa-install p code {
+  font-family: var(--capssa-mono);
+  font-size: 0.92em;
+  background: var(--capssa-paper-deep);
+  padding: 1px 6px;
+  border: 0.5px solid var(--capssa-paper-line);
+}
+
+/* Mono buttons */
+.capssa-btns {
+  display: flex;
+  gap: 0;
+  margin-top: 18px;
+  flex-wrap: wrap;
+  font-family: var(--capssa-mono);
+  font-size: 13px;
+}
+
+.capssa-btns a {
+  display: inline-block;
+  padding: 11px 16px;
+  border: 0.5px solid var(--capssa-ink);
+  color: var(--capssa-ink);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  border-right: none;
+  text-decoration: none;
+  font-weight: 500;
+  background: var(--capssa-paper);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.capssa-btns a:last-child { border-right: 0.5px solid var(--capssa-ink); }
+.capssa-btns a:hover { background: var(--capssa-accent); color: var(--capssa-paper); border-color: var(--capssa-accent); }
+.capssa-btns a.primary { background: var(--capssa-ink); color: var(--capssa-paper); border-color: var(--capssa-ink); }
+.capssa-btns a.primary:hover { background: var(--capssa-accent); color: var(--capssa-paper); border-color: var(--capssa-accent); }
+
+/* Code block on the homepage */
+.capssa-code {
+  background: var(--capssa-paper-deep);
+  border: 0.5px solid var(--capssa-rule);
+  padding: 22px 24px;
+  font-family: var(--capssa-mono);
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--capssa-ink);
+  overflow-x: auto;
+  position: relative;
+  font-variant-ligatures: none;
+  white-space: pre;
+}
+
+.capssa-code-label {
+  position: absolute;
+  top: -10px;
+  left: 14px;
+  background: var(--capssa-paper);
+  padding: 1px 10px;
+  font-family: var(--capssa-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.22em;
+  font-size: 10.5px;
+  color: var(--capssa-accent);
+  font-weight: 600;
+  border: 0.5px solid var(--capssa-rule);
+}
+
+.capssa-code .prompt { color: var(--capssa-accent); user-select: none; margin-right: 6px; }
+.capssa-code .flag { color: var(--capssa-accent); font-weight: 500; }
+.capssa-code .str { color: var(--capssa-ink-soft); }
+.capssa-code .comment { color: var(--capssa-ink-mute); font-style: italic; }
+
+/* Compatibility table */
+.capssa-compare {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 16px;
+  font-feature-settings: "lnum","tnum";
+  margin-top: 12px;
+}
+
+.capssa-compare th,
+.capssa-compare td {
+  padding: 12px 14px;
+  border-bottom: 0.5px solid var(--capssa-paper-line);
+  text-align: left;
+  vertical-align: baseline;
+}
+
+.capssa-compare thead th {
+  font-family: var(--capssa-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.18em;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--capssa-ink-soft);
+  border-bottom: 0.5px solid var(--capssa-rule);
+}
+
+.capssa-compare td.metric { color: var(--capssa-ink); }
+.capssa-compare td.num { text-align: right; font-family: var(--capssa-mono); font-size: 14.5px; color: var(--capssa-ink); }
+.capssa-compare td.match {
+  text-align: right;
+  color: var(--capssa-accent);
+  font-family: var(--capssa-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.18em;
+  font-size: 12px;
+  font-weight: 600;
+}
+.capssa-compare tbody tr:last-child td { border-bottom: 0.5px solid var(--capssa-rule); }
+
+/* ---------- Homepage layout: collapse desktop sidebar/TOC, keep mobile drawer ---------- */
+/* Detect homepage via the `.capssa-home` wrapper. Hide chrome that doesn't
+   make sense on a landing page (right TOC, pagination, last-modified, footer,
+   the auto page-h1) but never the mobile sidebar element — that's where the
+   menu toggle and drawer live, so mobile users still get full navigation. */
+
+:root:has(.capssa-home) main > .content-panel:first-of-type {
+  display: none;
+}
+:root:has(.capssa-home) .right-sidebar-container,
+:root:has(.capssa-home) .pagination-links,
+:root:has(.capssa-home) .meta,
+:root:has(.capssa-home) main > footer {
+  display: none !important;
+}
+:root:has(.capssa-home) {
+  --sl-mobile-toc-height: 0rem;
+}
+
+@media (min-width: 50rem) {
+  :root:has(.capssa-home) {
+    --sl-content-width: 72rem;
+    --sl-sidebar-width: 0rem;
+  }
+  :root:has(.capssa-home) .page > nav.sidebar { display: none !important; }
+  :root:has(.capssa-home) .main-frame { padding-inline-start: 0 !important; }
+  :root:has(.capssa-home) .main-pane {
+    width: 100% !important;
+    --sl-content-margin-inline: auto !important;
+  }
+  :root:has(.capssa-home) .content-panel > .sl-container {
+    margin-inline: auto !important;
+  }
+}
+
+/* Strip the default content-panel padding on the homepage so the capssa-home
+   container controls its own padding. */
+:root:has(.capssa-home) main > .content-panel {
+  padding-block: 0;
+}
+:root:has(.capssa-home) main > .content-panel > .sl-container {
+  max-width: none;
+  padding: 0;
+}
+
+/* ---------- Mobile ---------- */
+
+@media (max-width: 920px) {
+  .capssa-hero {
+    grid-template-columns: 1fr;
+    gap: 28px;
+    padding: 36px 0 28px;
+  }
+  .capssa-mascot { max-width: 200px; margin: 0; }
+  .capssa-stats { grid-template-columns: 1fr; gap: 36px; }
+  .capssa-feats { grid-template-columns: 1fr; }
+  .capssa-feat:nth-last-child(-n+2) { border-bottom: 0.5px solid var(--capssa-paper-line); }
+  .capssa-feat:last-child { border-bottom: 0.5px solid var(--capssa-rule); }
+  .capssa-install { grid-template-columns: 1fr; gap: 28px; }
+}

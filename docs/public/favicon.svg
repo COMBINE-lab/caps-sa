@@ -1,0 +1,27 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="caps-sa: sorted suffix array">
+  <title>caps-sa</title>
+  <!-- blueprint frame -->
+  <rect x="3.5" y="3.5" width="57" height="57" rx="9" fill="none" stroke="#3f7e9a" stroke-opacity="0.45" stroke-width="1.5"/>
+  <!-- baseline -->
+  <line x1="11" y1="50.5" x2="53" y2="50.5" stroke="#3f7e9a" stroke-opacity="0.5" stroke-width="1.2"/>
+  <!-- sorted ascending bars: a suffix array is a sorted set -->
+  <g fill="#2f9c92">
+    <rect x="12" y="38" width="4" height="12" rx="1.2"/>
+    <rect x="18" y="33" width="4" height="17" rx="1.2"/>
+    <rect x="24" y="28" width="4" height="22" rx="1.2"/>
+    <rect x="30" y="23" width="4" height="27" rx="1.2"/>
+    <rect x="36" y="18" width="4" height="32" rx="1.2"/>
+    <rect x="42" y="13" width="4" height="37" rx="1.2"/>
+    <rect x="48" y="9"  width="4" height="41" rx="1.2"/>
+  </g>
+  <!-- index ticks under the bars (the SA positions) -->
+  <g fill="#3f7e9a" fill-opacity="0.55">
+    <circle cx="14" cy="55" r="1"/>
+    <circle cx="20" cy="55" r="1"/>
+    <circle cx="26" cy="55" r="1"/>
+    <circle cx="32" cy="55" r="1"/>
+    <circle cx="38" cy="55" r="1"/>
+    <circle cx="44" cy="55" r="1"/>
+    <circle cx="50" cy="55" r="1"/>
+  </g>
+</svg>
