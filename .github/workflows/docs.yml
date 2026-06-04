@@ -27,6 +27,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          # Enable Pages (build type "workflow") via the API on first run,
+          # so a fresh repo doesn't need the Settings → Pages toggle flipped
+          # by hand. Requires the pages: write permission set below.
+          enablement: true
+
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
