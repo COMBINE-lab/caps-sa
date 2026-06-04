@@ -10,6 +10,8 @@ suffix array, and scales to human-genome inputs (≈ 6 × 10⁹ symbols) on
 commodity hardware via an external-memory sample-sort path that
 streams the SA out as positions are emitted.
 
+📖 **Documentation:** <https://combine-lab.github.io/caps-sa/>
+
 ## Status
 
 Both the in-memory and external-memory paths are implemented, tested,
