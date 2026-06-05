@@ -1,0 +1,4 @@
+author-lab: COMBINE-lab
+name: CaPS-SA
+description: A tool and library for fast, parallel, cache-friendly external-memory suffix array construction.
+webpage: https://combine-lab.github.io/caps-sa/
