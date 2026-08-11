@@ -55,7 +55,9 @@
 //! sentinel. So `A = 0` DNA encodings and STAR's `0..5` codes are both safe.
 
 use crate::Index;
+use crate::ext_mem::profile_log;
 use rayon::prelude::*;
+use std::time::Instant;
 
 /// Field width in bits and the number of symbols that fit in a `u64` key.
 ///
@@ -108,6 +110,7 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         return vec![I::zero()];
     }
 
+    let t0 = Instant::now();
     let max_sym = text.par_iter().copied().max().unwrap_or(0);
     let (bits, k) = pack_params(max_sym);
 
@@ -132,7 +135,17 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
             )
         })
         .collect();
+    profile_log(&format!(
+        "radix keys      {:.3}s",
+        t0.elapsed().as_secs_f64()
+    ));
+    let t1 = Instant::now();
     seeded.par_sort_unstable();
+    profile_log(&format!(
+        "radix seed sort {:.3}s",
+        t1.elapsed().as_secs_f64()
+    ));
+    let t2 = Instant::now();
 
     let mut sa: Vec<I> = Vec::with_capacity(n);
     sa.par_extend(seeded.par_iter().map(|&(_, _, p)| p));
@@ -142,25 +155,41 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     // and rank order is the current partial order.
     let mut rank: Vec<I> = vec![I::zero(); n];
     // Non-singleton `sa` ranges, the only ones any later round touches.
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    {
-        let mut i = 0;
-        while i < n {
-            let mut j = i + 1;
-            while j < n && (seeded[j].0, seeded[j].1) == (seeded[i].0, seeded[i].1) {
-                j += 1;
+    //
+    // Each index decides for itself whether it starts a group; the index that
+    // does then owns the whole group, walks it to find the end, and writes its
+    // members' ranks. Every group has exactly one owner and groups partition
+    // `0..n`, so the scattered writes never collide. `collect` on an indexed
+    // parallel iterator preserves order, so `groups` comes out sorted.
+    let ranks = Scatter::new(&mut rank);
+    let groups: Vec<(usize, usize)> = (0..n)
+        .into_par_iter()
+        .filter_map(|h| {
+            let key = (seeded[h].0, seeded[h].1);
+            if h > 0 && (seeded[h - 1].0, seeded[h - 1].1) == key {
+                return None;
             }
-            let g = I::from_usize(i);
-            for e in &sa[i..j] {
-                rank[e.to_usize()] = g;
+            let mut e = h + 1;
+            while e < n && (seeded[e].0, seeded[e].1) == key {
+                e += 1;
             }
-            if j - i > 1 {
-                groups.push((i, j));
+            let g = I::from_usize(h);
+            for entry in &sa[h..e] {
+                // SAFETY: `sa` is a permutation of `0..n`, and this thread
+                // owns the whole group `h..e`, so `entry` is a distinct index
+                // no other thread writes.
+                unsafe { ranks.set(entry.to_usize(), g) };
             }
-            i = j;
-        }
-    }
+            (e - h > 1).then_some((h, e))
+        })
+        .collect();
+    let mut groups = groups;
     drop(seeded);
+    profile_log(&format!(
+        "radix grouping  {:.3}s",
+        t2.elapsed().as_secs_f64()
+    ));
+    let t3 = Instant::now();
 
     // ---- Double: (rank_d(p), rank_d(p + d)) resolves to depth 2d. ----
     let mut depth = k;
@@ -183,14 +212,20 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
                         _ => 0,
                     }
                 };
-                sa_g.sort_unstable_by_key(|e| succ(e.to_usize()));
+                // Materialise the successor ranks once. `sort_unstable_by_key`
+                // re-evaluates its key function O(len log len) times, and each
+                // evaluation is a random probe into `rank`; paying for it once
+                // per element turns the sort's memory traffic sequential.
+                let mut keyed: Vec<(u64, I)> =
+                    sa_g.iter().map(|&e| (succ(e.to_usize()), e)).collect();
+                keyed.sort_unstable();
 
                 let mut fresh = Vec::new();
                 let mut i = 0;
-                while i < sa_g.len() {
-                    let key = succ(sa_g[i].to_usize());
+                while i < keyed.len() {
+                    let key = keyed[i].0;
                     let mut j = i + 1;
-                    while j < sa_g.len() && succ(sa_g[j].to_usize()) == key {
+                    while j < keyed.len() && keyed[j].0 == key {
                         j += 1;
                     }
                     let g = I::from_usize(start + i);
@@ -202,16 +237,24 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
                     }
                     i = j;
                 }
+                for (slot, &(_, e)) in sa_g.iter_mut().zip(keyed.iter()) {
+                    *slot = e;
+                }
                 fresh
             })
             .collect();
 
         // Phase B: publish the new ranks, now that every read is done.
-        for &(start, end) in &groups {
+        // Groups are disjoint and `sa` is a permutation, so each `rank` slot
+        // is written by exactly one group.
+        let ranks = Scatter::new(&mut rank);
+        groups.par_iter().for_each(|&(start, end)| {
             for i in start..end {
-                rank[sa[i].to_usize()] = next_rank[i];
+                // SAFETY: `sa[start..end]` are distinct positions owned solely
+                // by this group, and the groups partition their index range.
+                unsafe { ranks.set(sa[i].to_usize(), next_rank[i]) };
             }
-        }
+        });
 
         let before: usize = groups.iter().map(|&(s, e)| e - s).sum();
         groups = sub.into_iter().flatten().collect();
@@ -233,7 +276,50 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         }
     }
 
+    profile_log(&format!(
+        "radix doubling  {:.3}s",
+        t3.elapsed().as_secs_f64()
+    ));
     sa
+}
+
+/// Write access to disjoint slots of one slice from several rayon threads.
+///
+/// Both users here scatter through a permutation: the target index is
+/// `sa[i]`, not `i`, so the writes cannot be expressed as disjoint sub-slices
+/// and `split_at_mut` does not apply. What makes them safe is that `sa` is a
+/// permutation and the ranges being processed partition its index space, so
+/// every slot is written exactly once across all threads.
+struct Scatter<T> {
+    ptr: *mut T,
+    len: usize,
+}
+
+// SAFETY: `Scatter` hands out writes only through `set`, whose contract is
+// that no two calls target the same index. Under that contract there is no
+// aliasing between threads, so the pointer is safe to share.
+unsafe impl<T: Send> Send for Scatter<T> {}
+unsafe impl<T: Send> Sync for Scatter<T> {}
+
+impl<T> Scatter<T> {
+    fn new(slice: &mut [T]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    /// Write `value` at `index`.
+    ///
+    /// # Safety
+    ///
+    /// No two concurrent calls may pass the same `index`, and the borrow the
+    /// `Scatter` was built from must still be live.
+    #[inline]
+    unsafe fn set(&self, index: usize, value: T) {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.add(index).write(value) };
+    }
 }
 
 /// Borrow each `(start, end)` range of `sa` and `next_rank` mutably and
