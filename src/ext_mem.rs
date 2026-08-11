@@ -505,7 +505,8 @@ where
     let p = effective_subproblem_count(n, opts.subproblem_count);
     let runs = crate::runs::detect_for(text);
     let cmp = Cmp::new(LcpDispatch::detect(), &runs);
-    let seed_params = crate::radix::seed_params(text);
+    let seed_packer = crate::radix::seed_params(text);
+    let seed_params = seed_packer.as_ref();
     let work_dir = opts.work_dir.clone();
 
     // Pool the `2 × p` bucket files into one anonymous tempfile per
@@ -629,7 +630,8 @@ where
     let p = effective_subproblem_count(n, opts.subproblem_count);
     let runs = crate::runs::detect_for(text);
     let cmp = Cmp::new(LcpDispatch::detect(), &runs);
-    let seed_params = crate::radix::seed_params(text);
+    let seed_packer = crate::radix::seed_params(text);
+    let seed_params = seed_packer.as_ref();
 
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
 
@@ -1209,7 +1211,7 @@ fn phase1_sort_sample_spill<S, I, L, B, MkB>(
     p: usize,
     opts: &ExtMemOpts,
     cmp: Cmp<'_>,
-    seed_params: Option<(u32, usize)>,
+    seed_params: Option<&crate::radix::Packer>,
     mk_bucket: MkB,
 ) -> io::Result<(Vec<B>, Vec<I>)>
 where
@@ -1503,7 +1505,7 @@ fn phase4_merge_and_emit<S, I, L, B, E, F>(
     ordered_emit: bool,
     emit: &mut F,
     cmp: Cmp<'_>,
-    seed_params: Option<(u32, usize)>,
+    seed_params: Option<&crate::radix::Packer>,
 ) -> Result<(), BuildError<E>>
 where
     S: Symbol,
@@ -1644,7 +1646,7 @@ fn phase4_merge_chunk_ordered_emit<S, I, L, B, E, F>(
     max_ctx: usize,
     emit: &mut F,
     cmp: Cmp<'_>,
-    seed_params: Option<(u32, usize)>,
+    seed_params: Option<&crate::radix::Packer>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1740,7 +1742,7 @@ fn merge_one_partition<S, I, L, B>(
     bucket: &mut B,
     max_ctx: usize,
     cmp: Cmp<'_>,
-    seed_params: Option<(u32, usize)>,
+    seed_params: Option<&crate::radix::Packer>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,

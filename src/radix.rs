@@ -31,10 +31,13 @@
 //!
 //! ## The algorithm
 //!
-//! 1. **Pack.** Find the maximum symbol and choose the smallest field width
-//!    in `{1, 2, 4, 8}` bits that can hold it, so `k = 64 / bits` symbols fit
-//!    in one `u64` key. DNA over `{0,1,2,3}` gets 2-bit fields and therefore
-//!    resolves **32 symbols per key** rather than the 8 a raw byte key would.
+//! 1. **Pack.** Rank the bytes that actually occur onto a dense code range,
+//!    then choose the smallest field width in `{1, 2, 4, 8}` bits that holds
+//!    the alphabet, so `k = 64 / bits` symbols fit in one `u64` key. Ranking
+//!    matters: raw FASTA uses six symbols but its largest byte is `'T'` (84),
+//!    so packing raw bytes would force 8-bit fields and 8 symbols per key,
+//!    against 16 after ranking. DNA over `{0,1,2,3}` gets 2-bit fields and
+//!    **32 symbols per key**.
 //! 2. **Seed.** Sort `(key, position)`. This is a full sort of the suffixes
 //!    by their first `k` symbols, and it touches the text only in one
 //!    sequential pass.
@@ -63,47 +66,106 @@ use crate::sample_sort;
 use rayon::prelude::*;
 use std::time::Instant;
 
-/// Field width in bits and the number of symbols that fit in a `u64` key.
+/// An order-preserving remap of the bytes that actually occur in a text onto
+/// a dense code range, plus the resulting key geometry.
 ///
-/// Restricted to divisors of 64 so a key is an exact number of whole fields
-/// and no symbol ever straddles the key boundary.
-fn pack_params(max_sym: u8) -> (u32, usize) {
-    let bits: u32 = match max_sym {
-        0..=1 => 1,
-        2..=3 => 2,
-        4..=15 => 4,
-        _ => 8,
-    };
-    (bits, 64 / bits as usize)
+/// The field width is driven by how many *distinct* symbols a text uses, not
+/// by the largest byte value in it, and the difference is not academic. A raw
+/// FASTA uses six symbols, but the largest is `'T'` (84), so packing raw bytes
+/// forces 8-bit fields and fits only 8 symbols per key. Ranking those six
+/// bytes to `0..6` gives 4-bit fields and 16 symbols per key, which halves the
+/// number of doubling rounds needed downstream. The DNA-coded input is already
+/// dense, so it is unaffected.
+///
+/// The map is monotone by construction, since codes are assigned in ascending
+/// byte order. That is what keeps a packed key order-preserving: `key_a <
+/// key_b` still implies `suffix_a < suffix_b`, and the zero-padding argument
+/// carries over because code `0` remains the minimum.
+pub(crate) struct Packer {
+    /// Byte to dense code. Bytes absent from the text map to `0`; they never
+    /// appear in a key.
+    code: [u8; 256],
+    /// Bits per packed field.
+    bits: u32,
+    /// Symbols per `u64` key.
+    k: usize,
 }
 
-/// Pack the `k` symbols at `text[p..]` into one order-preserving `u64`,
-/// zero-padding past the end of the text.
-#[inline]
-fn key_at(text: &[u8], p: usize, bits: u32, k: usize) -> u64 {
-    if bits == 8 {
-        // Whole-byte fields: this is just a big-endian load, and the common
-        // case (p + 8 <= n) is a single unaligned u64 read plus a bswap.
-        let mut buf = [0u8; 8];
-        let end = (p + 8).min(text.len());
-        buf[..end - p].copy_from_slice(&text[p..end]);
-        return u64::from_be_bytes(buf);
+impl Packer {
+    /// Build the map for `text`.
+    fn new(text: &[u8]) -> Self {
+        // Which bytes occur? One parallel pass, folded into a 256-bit set.
+        let present = text
+            .par_chunks(1 << 16)
+            .map(|c| {
+                let mut seen = [false; 256];
+                for &b in c {
+                    seen[b as usize] = true;
+                }
+                seen
+            })
+            .reduce(
+                || [false; 256],
+                |mut a, b| {
+                    for i in 0..256 {
+                        a[i] |= b[i];
+                    }
+                    a
+                },
+            );
+
+        let mut code = [0u8; 256];
+        let mut next = 0u16;
+        for (b, &seen) in present.iter().enumerate() {
+            if seen {
+                code[b] = next as u8;
+                next += 1;
+            }
+        }
+        // `next` is the alphabet size; the largest code is `next - 1`.
+        let bits: u32 = match next.saturating_sub(1) {
+            0..=1 => 1,
+            2..=3 => 2,
+            4..=15 => 4,
+            _ => 8,
+        };
+        Self {
+            code,
+            bits,
+            k: 64 / bits as usize,
+        }
     }
-    let end = (p + k).min(text.len());
-    let mut key: u64 = 0;
-    for &s in &text[p..end] {
-        key = (key << bits) | s as u64;
+
+    #[inline]
+    pub(crate) fn bits(&self) -> u32 {
+        self.bits
     }
-    // Shift the packed prefix up so the missing trailing fields read as zero.
-    key << (bits as usize * (k - (end - p)))
+
+    #[inline]
+    pub(crate) fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Pack the `k` symbols at `text[p..]` into one order-preserving `u64`,
+    /// zero-padding past the end of the text.
+    #[inline]
+    pub(crate) fn key_at(&self, text: &[u8], p: usize) -> u64 {
+        let end = (p + self.k).min(text.len());
+        let mut key: u64 = 0;
+        for &s in &text[p..end] {
+            key = (key << self.bits) | self.code[s as usize] as u64;
+        }
+        // Shift the packed prefix up so the missing trailing fields read zero.
+        key << (self.bits as usize * (self.k - (end - p)))
+    }
 }
 
-/// Field width and symbols-per-key for `text`, or `None` when a packed key
-/// cannot represent this text's order.
+/// The alphabet map for `text`, or `None` when a packed key cannot represent
+/// this text's order.
 ///
 /// Computed once per build and handed to [`seed_subarray`], which would
 /// otherwise re-scan the whole text for every subarray.
-pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<(u32, usize)> {
+pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
     if size_of::<S>() != 1 {
         return None;
     }
@@ -111,7 +173,7 @@ pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<(u32, usize)> {
     // valid for reads of the same length.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-    Some(pack_params(bytes.par_iter().copied().max().unwrap_or(0)))
+    Some(Packer::new(bytes))
 }
 
 /// Sort `sa` into suffix order and fill `lcp`, using a packed fixed-depth key
@@ -138,7 +200,7 @@ pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<(u32, usize)> {
 pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
     text: &[S],
     lp: &L,
-    params: Option<(u32, usize)>,
+    packer: Option<&Packer>,
     sa: &mut [I],
     lcp: &mut [I],
     sa_w: &mut [I],
@@ -146,9 +208,10 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
     max_ctx: usize,
     cmp: Cmp<'_>,
 ) -> bool {
-    let Some((bits, k)) = params else {
+    let Some(packer) = packer else {
         return false;
     };
+    let (bits, k) = (packer.bits(), packer.k());
     if max_ctx != usize::MAX || lp.plain_lex_len() != Some(text.len()) {
         return false;
     }
@@ -172,7 +235,7 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
         .iter()
         .map(|&p| {
             let p = p.to_usize();
-            (key_at(bytes, p, bits, k), visible(p) as u32, p_as(p))
+            (packer.key_at(bytes, p), visible(p) as u32, p_as(p))
         })
         .collect();
     keyed.sort_unstable();
@@ -251,8 +314,7 @@ const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
 ///   serial, which is exactly where a `n log n` sort loses on many cores.
 fn seed_sort<I: Index>(
     text: &[u8],
-    bits: u32,
-    k: usize,
+    packer: &Packer,
     visible_len: &(dyn Fn(usize) -> usize + Sync),
 ) -> (Vec<u64>, Vec<I>) {
     let n = text.len();
@@ -272,7 +334,7 @@ fn seed_sort<I: Index>(
         .map(|&(start, end)| {
             let mut counts = vec![0u32; RADIX_BUCKETS];
             for p in start..end {
-                counts[bucket_of(key_at(text, p, bits, k))] += 1;
+                counts[bucket_of(packer.key_at(text, p))] += 1;
             }
             counts
         })
@@ -310,7 +372,7 @@ fn seed_sort<I: Index>(
                 let mut cursor: Vec<usize> =
                     offsets[c * RADIX_BUCKETS..(c + 1) * RADIX_BUCKETS].to_vec();
                 for p in start..end {
-                    let key = key_at(text, p, bits, k);
+                    let key = packer.key_at(text, p);
                     let slot = &mut cursor[bucket_of(key)];
                     // SAFETY: the prefix sum gives this (chunk, bucket) pair a
                     // range of exactly its own histogram count, and the cursor
@@ -373,8 +435,8 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     }
 
     let t0 = Instant::now();
-    let max_sym = text.par_iter().copied().max().unwrap_or(0);
-    let (bits, k) = pack_params(max_sym);
+    let packer = Packer::new(text);
+    let k = packer.k();
 
     // ---- Seed: sort by the first `k` symbols, then by visible length. ----
     //
@@ -397,7 +459,7 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         t0.elapsed().as_secs_f64()
     ));
     let t1 = Instant::now();
-    let (keys, mut sa) = seed_sort::<I>(text, bits, k, &visible_len);
+    let (keys, mut sa) = seed_sort::<I>(text, &packer, &visible_len);
     profile_log(&format!(
         "radix seed sort {:.3}s",
         t1.elapsed().as_secs_f64()
@@ -633,15 +695,43 @@ mod tests {
         check(b"abracadabra");
     }
 
+    /// The field width follows the number of *distinct* symbols, not the
+    /// largest byte value. Raw FASTA is the case that matters: six symbols
+    /// whose largest is `'T'` (84) would force 8-bit fields without ranking,
+    /// fitting only 8 symbols per key instead of 16.
     #[test]
-    fn pack_params_covers_every_width() {
-        assert_eq!(pack_params(0), (1, 64));
-        assert_eq!(pack_params(1), (1, 64));
-        assert_eq!(pack_params(3), (2, 32));
-        assert_eq!(pack_params(4), (4, 16));
-        assert_eq!(pack_params(15), (4, 16));
-        assert_eq!(pack_params(16), (8, 8));
-        assert_eq!(pack_params(255), (8, 8));
+    fn packer_width_follows_alphabet_size_not_byte_value() {
+        let two = Packer::new(b"abababab");
+        assert_eq!((two.bits(), two.k()), (1, 64));
+        let four = Packer::new(&[0u8, 1, 2, 3, 3, 2, 1, 0]);
+        assert_eq!((four.bits(), four.k()), (2, 32));
+
+        let mut fasta: Vec<u8> = b"ACGTN".to_vec();
+        fasta.push(b'\n');
+        let f = Packer::new(&fasta);
+        assert_eq!((f.bits(), f.k()), (4, 16), "6 symbols should pack 4 bits");
+
+        let dense: Vec<u8> = (0..=255u8).collect();
+        let d = Packer::new(&dense);
+        assert_eq!((d.bits(), d.k()), (8, 8));
+    }
+
+    /// The remap must be monotone, or a packed key would stop being
+    /// order-preserving and the whole seed would be wrong.
+    #[test]
+    fn packer_remap_is_monotone() {
+        let text: Vec<u8> = b"TGCAN\nZq".to_vec();
+        let p = Packer::new(&text);
+        let mut present: Vec<u8> = text.clone();
+        present.sort_unstable();
+        present.dedup();
+        for w in present.windows(2) {
+            assert!(
+                p.code[w[0] as usize] < p.code[w[1] as usize],
+                "codes must follow byte order: {:?}",
+                w
+            );
+        }
     }
 
     /// Texts whose symbols include a real `0`, so padding and a genuine
