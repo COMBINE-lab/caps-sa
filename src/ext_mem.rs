@@ -1139,6 +1139,7 @@ impl<'a> PositionSource<'a> {
 /// At genome scale this changes nothing: `PHASE1_MAX_PARTITIONS` already
 /// binds for any `n` above ~1 GB, so GRCh38 still gets `p = 8192`.
 const PHASE1_TARGET_CHUNK: usize = 131_072;
+
 /// Hard cap on the number of subarrays. Matches upstream CaPS-SA's
 /// default of 8192 — phase 3 is now parallelised across rayon
 /// workers (each subarray distributes independently into per-partition
@@ -1884,44 +1885,66 @@ impl<I: Index> CascadeWorkspace<I> {
             )
         };
 
-        let mut new_lens = Vec::with_capacity(run_lens.len().div_ceil(2));
-        let mut src_off = 0usize;
-        let mut dst_off = 0usize;
-        let mut i = 0;
-        while i < run_lens.len() {
-            let l1 = run_lens[i];
-            if i + 1 < run_lens.len() {
-                let l2 = run_lens[i + 1];
-                let x_end = src_off + l1;
-                let xy_end = x_end + l2;
-                let dst_end = dst_off + l1 + l2;
-                sample_sort::merge(
-                    text,
-                    lp,
-                    &src_sa[src_off..x_end],
-                    &src_sa[x_end..xy_end],
-                    &src_lcp[src_off..x_end],
-                    &src_lcp[x_end..xy_end],
-                    &mut dst_sa[dst_off..dst_end],
-                    &mut dst_lcp[dst_off..dst_end],
-                    max_ctx,
-                    cmp,
-                );
-                new_lens.push(l1 + l2);
-                src_off = xy_end;
-                dst_off = dst_end;
-                i += 2;
-            } else {
-                // Odd run carries over unchanged.
-                let end = dst_off + l1;
-                dst_sa[dst_off..end].copy_from_slice(&src_sa[src_off..src_off + l1]);
-                dst_lcp[dst_off..end].copy_from_slice(&src_lcp[src_off..src_off + l1]);
-                new_lens.push(l1);
-                src_off += l1;
-                dst_off = end;
-                i += 1;
+        // The pairs at one level are independent and write to disjoint
+        // destination ranges, so the only thing that made this sequential was
+        // the running `src_off` / `dst_off`. Both are prefix sums, so compute
+        // them up front and hand each pair its own sub-slices.
+        //
+        // This matters because the cascade's last level is a single merge over
+        // the whole partition. With `p` well above the thread count there is
+        // enough partition-level parallelism to hide that most of the time,
+        // but it is what caps phase 4's efficiency: it was running at ~8x on
+        // 12 threads.
+        let n_pairs = run_lens.len() / 2;
+        let mut new_lens: Vec<usize> = (0..n_pairs)
+            .map(|j| run_lens[2 * j] + run_lens[2 * j + 1])
+            .collect();
+        if run_lens.len() % 2 == 1 {
+            new_lens.push(run_lens[run_lens.len() - 1]);
+        }
+
+        // `dst` ranges are exactly `new_lens`; `src` ranges are the pairs.
+        let mut jobs: Vec<(usize, usize, &mut [I], &mut [I])> = Vec::with_capacity(new_lens.len());
+        {
+            let mut sa_rest: &mut [I] = dst_sa;
+            let mut lcp_rest: &mut [I] = dst_lcp;
+            let mut src_off = 0usize;
+            for (j, &out_len) in new_lens.iter().enumerate() {
+                let (sa_head, sa_tail) = sa_rest.split_at_mut(out_len);
+                let (lcp_head, lcp_tail) = lcp_rest.split_at_mut(out_len);
+                jobs.push((j, src_off, sa_head, lcp_head));
+                sa_rest = sa_tail;
+                lcp_rest = lcp_tail;
+                src_off += out_len;
             }
         }
+
+        jobs.into_par_iter()
+            .for_each(|(j, src_off, out_sa, out_lcp)| {
+                if 2 * j + 1 < run_lens.len() {
+                    let l1 = run_lens[2 * j];
+                    let l2 = run_lens[2 * j + 1];
+                    let x_end = src_off + l1;
+                    let xy_end = x_end + l2;
+                    sample_sort::merge(
+                        text,
+                        lp,
+                        &src_sa[src_off..x_end],
+                        &src_sa[x_end..xy_end],
+                        &src_lcp[src_off..x_end],
+                        &src_lcp[x_end..xy_end],
+                        out_sa,
+                        out_lcp,
+                        max_ctx,
+                        cmp,
+                    );
+                } else {
+                    // Odd run carries over unchanged.
+                    let l1 = run_lens[2 * j];
+                    out_sa.copy_from_slice(&src_sa[src_off..src_off + l1]);
+                    out_lcp.copy_from_slice(&src_lcp[src_off..src_off + l1]);
+                }
+            });
         new_lens
     }
 }
