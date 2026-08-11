@@ -227,10 +227,10 @@ external-memory path keeps its memory bound.
 
 | ext-mem input | before | after | CPU before | CPU after | peak RSS |
 | ------------- | ------ | ----- | ---------- | --------- | -------- |
-| chr21 FASTA, 47.5 MB | 24.2 s | **1.65 s** | 268 s | 17.5 s | 147 → 182 MB |
-| chr21 `N`-free, 80 MB | 3.49 s | **2.11 s** | 33.9 s | 25.0 s | 214 → 233 MB |
+| chr21 FASTA, 47.5 MB | 24.2 s | **1.45 s** | 268 s | 17.5 s | 147 → 194 MB |
+| chr21 `N`-free, 80 MB | 3.49 s | **1.85 s** | 33.9 s | 25.0 s | 214 → 240 MB |
 
-Four changes get there, each measured separately:
+Six changes get there, each measured separately:
 
 | change | chr21.0123 | chr21 FASTA |
 | ------ | ---------- | ----------- |
@@ -238,7 +238,9 @@ Four changes get there, each measured separately:
 | skip periodic runs | 3.55 s | 2.48 s |
 | prefetch the next candidates' text | 2.90 s | 1.99 s |
 | subarray target 64Ki → 128Ki records | 2.54 s | 1.86 s |
-| seed phase-1 subarrays with the packed key | **2.11 s** | **1.65 s** |
+| seed phase-1 subarrays with the packed key | 2.11 s | 1.65 s |
+| merge cascade run pairs in parallel | 2.02 s | 1.55 s |
+| pipeline the emit against the next merge | **1.85 s** | **1.45 s** |
 
 Phase 1 goes from 22.85 s to 0.42 s on the FASTA input, and from 1.20 s
 to 0.32 s on the `N`-free one. Peak RSS rises by under 30 MB, so the
