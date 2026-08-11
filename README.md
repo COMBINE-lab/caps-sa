@@ -15,8 +15,59 @@ streams the SA out as positions are emitted.
 ## Status
 
 Both the in-memory and external-memory paths are implemented, tested,
-and benchmarked. 43 unit tests pass and the SA output is differentially
-verified against a brute-force reference on small and random inputs.
+and benchmarked. 73 unit tests pass and the SA output is differentially
+verified against a brute-force reference on small and random inputs, and
+against [`verify_sa`](#verifying-a-suffix-array) at genome scale.
+
+### In-memory fast path
+
+`build_in_memory` on a byte text routes through a **radix-seeded prefix
+doubling** algorithm rather than the merge kernel. The merge kernel is
+still the general path and still backs everything else; the fast path is
+taken only when the comparator is provably plain lexicographic (see
+[Choosing a path](#choosing-a-path)).
+
+The reason is that a comparison-based suffix sort pays twice on real
+genomic input. It performs `n log n` merge steps, and every tied step
+scans the shared prefix of two suffixes from the beginning. Genome FASTA
+carries megabyte-scale runs of `N` — period-61 once 60-column line
+wrapping is included — so a single comparison can scan millions of
+bytes. Measured on chr21 that drives the cost per merge step from 13 ns
+to 222 ns, a 16x penalty that is entirely scan time.
+
+The fast path sorts by a packed fixed-depth key, then resolves what
+remains by doubling on ranks. The packing picks the narrowest field
+width that holds the alphabet, so DNA over `{0,1,2,3}` resolves 32
+symbols per key rather than the 8 a raw byte key gives. After the seed,
+no comparison reads the text again, so a megabyte-long run of `N` costs
+exactly what random DNA costs.
+
+Apple M4 Max (12 P-cores), 12 threads, suffix arrays byte-identical to
+the merge kernel's and independently verified:
+
+| input | before | after | CPU before | CPU after |
+| ----- | ------ | ----- | ---------- | --------- |
+| chr21 fwd ++ revcomp, `N`-free, 80 MB | 6.08 s | **0.84 s** | 28.1 s | 5.0 s |
+| chr21 FASTA, 47.5 MB, 6.6 Mb of `N`   | 27.8 s | **1.04 s** | 283.5 s | 5.2 s |
+| same, via `build_in_memory_sample_sort` | 3.41 s | **1.18 s** | 34.5 s | 7.2 s |
+
+Peak RSS on the 80 MB input is 2.21 GB, down from 2.83 GB, because the
+seed is an MSD counting sort that recomputes keys from the text rather
+than materialising a key array.
+
+Note the two inputs are different problems; benchmarking one
+implementation on the first and another on the second is not a
+comparison. `bench/chr21.sh` prepares both.
+
+### External memory
+
+On the human genome (GRCh38, 32 threads on AMD EPYC 9575F), caps-sa is
+**7% faster than upstream CaPS-SA's ext-mem path** and uses **23% less
+RAM**, while beating upstream's in-mem wall time by 3% at 1/10 of the
+RAM. See [`bench/README.md`](bench/README.md) for the full methodology
+and the optimisation ladder that got us there. Those paths still use the
+merge kernel, so they retain the scan cost described above on
+repeat-heavy input.
 
 On the human genome (GRCh38, 32 threads on AMD EPYC 9575F), caps-sa is
 **7% faster than upstream CaPS-SA's ext-mem path** and uses **23% less
@@ -85,6 +136,116 @@ build_ext_mem_for_positions(&text, positions, &opts, |sa_pos| {
     Ok(())
 })?;
 ```
+
+### Verifying a suffix array
+
+`verify_sa` checks a candidate in `O(n)` without re-running any
+construction algorithm and without depending on LCP length, so it stays
+usable on the repetitive inputs that are hardest to trust:
+
+```rust
+use caps_sa::{build_in_memory, verify_sa};
+
+let text = b"banana";
+let sa: Vec<u32> = build_in_memory(text);
+assert!(verify_sa(text, &sa).is_ok());
+```
+
+It inverts `sa` to get ranks, then checks that
+`(text[p], rank[p + 1])` increases strictly along it, with `rank[n]`
+treated as smaller than every real rank. A permutation of `0..n`
+satisfies that condition exactly when it is the suffix array. The bench
+CLI exposes it as `--verify`.
+
+## Choosing a path
+
+`build_in_memory` takes the radix-seeded doubling fast path only when
+the requested comparator is provably the plain lexicographic one. All
+three conditions are soundness requirements, and each defaults to
+declining:
+
+| Condition | Why |
+| --------- | --- |
+| `Opts::max_context` unbounded | A finite bound makes the merge comparator fall through to `LimitProvider::boundary_order`, which compares *lengths*, so it is not lexicographic. |
+| `LimitProvider::plain_lex_len()` reports the full text | Rules out `SegmentedText`, whose scans stop at segment boundaries, and any custom `boundary_order`. |
+| symbol type is exactly `u8` | Packing wider symbols into an order-preserving key is endianness-dependent: on a little-endian host `0x0100 > 0x0001` as `u16` values, but their byte views compare the other way. |
+
+`plain_lex_len` is a new `LimitProvider` method that defaults to `None`.
+An implementation that delegates `lim_at` to `PlainText` but overrides
+`boundary_order` for a different convention — STAR's spacer-as-largest
+ordering is the motivating example — inherits `None` and keeps today's
+semantics without changing a line.
+
+Given those, the fast path also covers two cases beyond a plain whole-text
+build:
+
+- **`*_for_positions` subsets.** Doubling cannot be restricted to a subset
+  directly, since a round compares `rank[p + d]` and that successor is
+  generally outside the subset, so ranks must exist for every text
+  position. The full array is built and filtered in one `O(n)` pass
+  instead. Below one eighth of the text this declines and the merge kernel
+  runs, since building and discarding a whole array would cost more than
+  sorting a small subset. That ratio is a performance heuristic, not a
+  correctness condition. Duplicate or out-of-range positions also decline,
+  because the output is a permutation of the input *multiset* and a
+  membership filter cannot reproduce that.
+- **`build_in_memory_sample_sort`.** This path exists to sort in RAM, so
+  where doubling applies it is strictly better: same output, no bucket
+  machinery, none of the scan cost.
+
+`build_ext_mem` deliberately stays on the merge kernel: its purpose is to
+bound peak memory, and prefix doubling needs a rank for every position in
+the text, which would defeat exactly that. Segmented texts and symbols
+wider than `u8` also stay on the merge kernel.
+
+### Skipping long repeats
+
+Those paths get the same pathology fixed in the comparator instead, which
+costs no extra memory. If `text[s..e)` has period `q` and two suffixes
+start at `a < b` inside it with `(b - a) % q == 0`, they agree until the
+later one reaches `e`, so
+
+```text
+lcp(a, b) >= e - b
+```
+
+is known in `O(1)` from the run's bounds with nothing scanned. When the
+phase does not match, the two suffixes differ within `q` symbols and the
+ordinary scan is already short. Scans are additionally bounded so they
+stop at a run's start rather than traversing it.
+
+Detecting only single-symbol runs would miss the case that actually
+occurs: in wrapped FASTA an `N` block is 60 `N`s followed by a newline,
+which is period 61, not period 1. Periods up to 64 are considered, which
+also covers satellite arrays.
+
+Detection is two-stage so texts without repeats pay almost nothing: a
+sampling pass collects the periods that occur at all, and the full scan
+runs only for those. On `N`-free DNA the table comes out empty and every
+query short-circuits. The table is a few dozen entries, so the
+external-memory path keeps its memory bound.
+
+| ext-mem input | before | after | CPU before | CPU after | peak RSS |
+| ------------- | ------ | ----- | ---------- | --------- | -------- |
+| chr21 FASTA, 47.5 MB | 24.2 s | **1.47 s** | 268 s | 17.5 s | 147 → 190 MB |
+| chr21 `N`-free, 80 MB | 3.49 s | **1.65 s** | 33.9 s | 15.1 s | 214 → 285 MB |
+
+Seven changes get there, each measured separately:
+
+| change | chr21.0123 | chr21 FASTA |
+| ------ | ---------- | ----------- |
+| baseline | 3.49 s | 24.19 s |
+| skip periodic runs | 3.55 s | 2.48 s |
+| prefetch the next candidates' text | 2.90 s | 1.99 s |
+| subarray target 64Ki → 128Ki records | 2.54 s | 1.86 s |
+| seed phase-1 subarrays with the packed key | 2.11 s | 1.65 s |
+| merge cascade run pairs in parallel | 2.02 s | 1.55 s |
+| pipeline the emit against the next merge | 1.85 s | 1.45 s |
+| re-sort run-free partitions by key | **1.65 s** | **1.47 s** |
+
+Phase 1 goes from 22.85 s to 0.42 s on the FASTA input, and from 1.20 s
+to 0.32 s on the `N`-free one. Peak RSS rises by under 30 MB, so the
+bounded-memory guarantee the path exists for is intact.
 
 ## Algorithm
 

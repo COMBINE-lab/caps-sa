@@ -33,7 +33,39 @@
 use crate::Index;
 use crate::lcp::{LcpDispatch, Symbol};
 use crate::limits::{LimitProvider, PlainText};
+use crate::runs::Cmp;
 use rayon::join;
+use rayon::prelude::*;
+
+/// How many merge steps ahead the text prefetch runs. Large enough to cover a
+/// DRAM round trip at the merge's step rate, small enough that the prefetched
+/// line is still resident when the step that needs it arrives.
+const PREFETCH_DISTANCE: usize = 8;
+
+/// Hint the CPU to start pulling `text[at]` into cache.
+///
+/// A no-op on targets without a stable prefetch intrinsic, and harmless when
+/// `at` is out of bounds: the address is never dereferenced, only used as a
+/// prefetch operand, and prefetch instructions on both supported targets
+/// ignore faulting addresses.
+#[inline(always)]
+fn prefetch_symbol<S>(text: &[S], at: usize) {
+    let _ = (text, at);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(
+            text.as_ptr().add(at.min(text.len())) as *const i8,
+            std::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // `core::arch::aarch64::_prefetch` is still unstable, so emit the
+        // instruction directly. `prfm` never faults.
+        let p = text.as_ptr().add(at.min(text.len()));
+        std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
 
 /// Tunable options for SA construction.
 #[derive(Clone, Debug)]
@@ -90,9 +122,115 @@ where
     I: Index,
     L: LimitProvider,
 {
+    if let Some(sa) = try_doubling_fast_path::<S, I, L>(text, lp, opts) {
+        return sa;
+    }
     let n = text.len();
     let positions: Vec<I> = (0..n).map(I::from_usize).collect();
     build_in_memory_for_positions_with(text, positions, lp, opts)
+}
+
+/// Route a whole-text byte build through [`crate::radix`]'s radix-seeded
+/// prefix doubling, which is dramatically faster on real genomic input, or
+/// return `None` to fall back to the CaPS-SA merge kernel.
+///
+/// Every condition below is a soundness requirement, not a heuristic. The
+/// doubling path implements exactly one comparator — plain lexicographic over
+/// bytes with shorter-is-smaller and no context bound — so anything that can
+/// change the comparator has to decline.
+///
+/// * `max_context` must be unbounded. With a finite bound the merge's
+///   comparator stops being lexicographic: once a scan hits the cap it falls
+///   through to [`LimitProvider::boundary_order`], which compares *lengths*.
+/// * `lp` must report [`plain_lex_len`][LimitProvider::plain_lex_len]. That
+///   rules out `SegmentedText`, whose LCP scans stop at segment boundaries,
+///   and any custom `boundary_order` such as STAR's spacer-as-largest.
+/// * `S` must be exactly `u8`. Wider symbols are excluded because packing
+///   them into an order-preserving key is endianness-dependent: for `u16` on
+///   a little-endian host, `0x0100 > 0x0001` as values but their byte views
+///   compare the other way. The rest of the crate is immune to this only
+///   because [`LcpDispatch`] resolves *equality* over bytes and recovers
+///   ordering through `S: Ord`.
+fn try_doubling_fast_path<S, I, L>(text: &[S], lp: &L, opts: &Opts) -> Option<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    if opts.max_context != usize::MAX {
+        return None;
+    }
+    if lp.plain_lex_len() != Some(text.len()) {
+        return None;
+    }
+    if std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>() {
+        return None;
+    }
+    // SAFETY: `S` is `u8` (just checked by `TypeId`, and `Symbol: 'static`
+    // so the comparison is exact), hence `&[S]` and `&[u8]` have identical
+    // layout, length and validity.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
+    Some(crate::radix::build_sa(bytes))
+}
+
+/// Sort a *subset* of positions by building the full suffix array with the
+/// doubling path and then keeping only the requested positions.
+///
+/// Doubling cannot be restricted to a subset directly: a round compares
+/// `rank[p + d]`, and that successor is generally not in the subset, so ranks
+/// have to be defined for every position in the text. Building the whole array
+/// and filtering it sidesteps that, and the filter is a single `O(n)` pass
+/// because the full SA is already in the right order.
+///
+/// Worth it when the subset is a decent fraction of the text, which is the
+/// case this API exists for (STAR-style indexing keeps every ACGT position and
+/// drops only spacers). For a small subset, `O(n)` to build the full array
+/// would dwarf the `O(m log m)` the merge kernel needs, so below one eighth of
+/// the text this declines and the merge kernel runs. That ratio is a
+/// performance heuristic, unlike the guards in [`try_doubling_fast_path`],
+/// which are correctness conditions.
+///
+/// Also declines on duplicate or out-of-range positions, which a
+/// membership filter cannot reproduce faithfully.
+fn try_doubling_subset<S, I, L>(text: &[S], positions: &[I], lp: &L, opts: &Opts) -> Option<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = text.len();
+    let m = positions.len();
+    if m == 0 || m.checked_mul(8)? < n {
+        return None;
+    }
+    if opts.max_context != usize::MAX
+        || lp.plain_lex_len() != Some(n)
+        || std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>()
+    {
+        return None;
+    }
+
+    let mut wanted = vec![false; n];
+    for p in positions {
+        let p = p.to_usize();
+        // Out of range, or the same position twice: a membership filter emits
+        // each position at most once, so it cannot reproduce either faithfully.
+        if p >= n || wanted[p] {
+            return None;
+        }
+        wanted[p] = true;
+    }
+
+    // SAFETY: `S` is `u8`, so `&[S]` and `&[u8]` have identical layout.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, n) };
+    let full: Vec<I> = crate::radix::build_sa(bytes);
+    let kept: Vec<I> = full
+        .into_par_iter()
+        .filter(|p| wanted[p.to_usize()])
+        .collect();
+    debug_assert_eq!(kept.len(), m);
+    Some(kept)
 }
 
 /// Sort the caller-supplied `positions` by the lexicographic order of
@@ -145,6 +283,10 @@ where
     I: Index,
     L: LimitProvider,
 {
+    if let Some(sa) = try_doubling_subset::<S, I, L>(text, &positions, lp, opts) {
+        return sa;
+    }
+
     let n = positions.len();
     if n == 0 {
         return Vec::new();
@@ -158,7 +300,8 @@ where
     // Choose the LCP implementation once for the whole build; the captured
     // function pointer travels through the recursion in a register, so the
     // inner merge loop pays no atomic load or feature-detection branch.
-    let dispatch = LcpDispatch::detect();
+    let runs = crate::runs::detect_for(text);
+    let cmp = Cmp::new(LcpDispatch::detect(), &runs);
 
     merge_sort(
         text,
@@ -168,7 +311,7 @@ where
         &mut lcp_arr,
         &mut lcp_w,
         opts.max_context,
-        dispatch,
+        cmp,
     );
 
     sa
@@ -186,7 +329,7 @@ where
 ///
 /// Visible to the rest of the crate so the external-memory path can sort
 /// individual subarrays of positions using the same kernel.
-#[allow(clippy::too_many_arguments)] // 4 buffers + text + lp + ctx + dispatch
+#[allow(clippy::too_many_arguments)] // 4 buffers + text + lp + ctx + cmp
 pub(crate) fn merge_sort<S, I, L>(
     text: &[S],
     lp: &L,
@@ -195,7 +338,7 @@ pub(crate) fn merge_sort<S, I, L>(
     lcp_arr: &mut [I],
     lcp_w: &mut [I],
     max_ctx: usize,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
 ) where
     S: Symbol,
     I: Index,
@@ -220,15 +363,15 @@ pub(crate) fn merge_sort<S, I, L>(
     let (lcp_w_l, lcp_w_r) = lcp_w.split_at_mut(mid);
 
     join(
-        || merge_sort(text, lp, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx, dispatch),
-        || merge_sort(text, lp, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx, dispatch),
+        || merge_sort(text, lp, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx, cmp),
+        || merge_sort(text, lp, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx, cmp),
     );
 
     // Merge the two sorted halves (still living in `sa`) into the workspace,
     // then copy the workspace back into the destination so the caller's
     // postcondition holds on `sa` / `lcp_arr`.
     merge(
-        text, lp, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx, dispatch,
+        text, lp, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx, cmp,
     );
     sa.copy_from_slice(sa_w);
     lcp_arr.copy_from_slice(lcp_w);
@@ -242,7 +385,7 @@ pub(crate) fn merge_sort<S, I, L>(
 ///
 /// Visible to the rest of the crate so the external-memory path can cascade
 /// 2-way merges across each partition's sub-subarrays during Phase 4.
-#[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + lp + ctx + dispatch
+#[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + lp + ctx + cmp
 pub(crate) fn merge<S, I, L>(
     text: &[S],
     lp: &L,
@@ -253,7 +396,7 @@ pub(crate) fn merge<S, I, L>(
     z: &mut [I],
     lcp_z: &mut [I],
     max_ctx: usize,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
 ) where
     S: Symbol,
     I: Index,
@@ -295,6 +438,26 @@ pub(crate) fn merge<S, I, L>(
     let mut lim_b_cache: Option<(usize, usize)> = None;
 
     while i_a < len_a && i_b < len_b {
+        // The tied branch below dereferences the text at two *random*
+        // addresses, and the address for step `i + 1` is not known until step
+        // `i` retires, so there is no memory-level parallelism to exploit and
+        // the hardware prefetcher cannot see the pattern either. But the
+        // candidate positions themselves live in `arr_a` / `arr_b`, which are
+        // sequential and already in cache, so the addresses a few steps ahead
+        // *are* known. Issue them now.
+        //
+        // This is not the prefetch that was tried and reverted in `lcp.rs`:
+        // that one sat inside the strided scan loop, which the hardware
+        // prefetcher already covers. Here the access is random, which is the
+        // case hardware cannot predict. `m` is the current boundary LCP and a
+        // good estimate of where the next scans will start.
+        if i_a + PREFETCH_DISTANCE < len_a {
+            prefetch_symbol(text, arr_a[i_a + PREFETCH_DISTANCE].to_usize() + m);
+        }
+        if i_b + PREFETCH_DISTANCE < len_b {
+            prefetch_symbol(text, arr_b[i_b + PREFETCH_DISTANCE].to_usize() + m);
+        }
+
         let l_a = lcp_a[i_a].to_usize();
 
         // (output_a, lcp_for_output, new_m)
@@ -333,7 +496,7 @@ pub(crate) fn merge<S, I, L>(
             // intersection — no extra work.
             let cap = lim_a.min(lim_b).min(max_ctx);
             let remaining_ctx = cap.saturating_sub(m);
-            let ext = dispatch.lcp(text, p_a + m, p_b + m, remaining_ctx);
+            let ext = cmp.lcp(text, p_a + m, p_b + m, remaining_ctx);
             let total = m + ext;
             let a_smaller = if total < lim_a && total < lim_b {
                 text[p_a + total] < text[p_b + total]
@@ -422,6 +585,119 @@ mod tests {
         assert_eq!(got, want, "mismatch on text {text:?}");
     }
 
+    /// Run the production kernel and return **both** the suffix array and
+    /// the LCP array it computes as a byproduct.
+    ///
+    /// The public entry points discard the LCP array, but it is not an
+    /// incidental artefact: the next merge level *consumes* it in the
+    /// three-case decision, so a single wrong LCP entry silently reorders
+    /// suffixes at the level above. It therefore needs direct coverage.
+    fn build_sa_and_lcp(text: &[u8], max_ctx: usize) -> (Vec<u32>, Vec<u32>) {
+        let n = text.len();
+        let mut sa: Vec<u32> = (0..n as u32).collect();
+        let mut sa_w = vec![0u32; n];
+        let mut lcp_arr = vec![0u32; n];
+        let mut lcp_w = vec![0u32; n];
+        merge_sort(
+            text,
+            &PlainText::new(n),
+            &mut sa,
+            &mut sa_w,
+            &mut lcp_arr,
+            &mut lcp_w,
+            max_ctx,
+            Cmp::new(LcpDispatch::detect(), &crate::runs::RunTable::empty()),
+        );
+        (sa, lcp_arr)
+    }
+
+    /// Byte-at-a-time LCP of `text[a..]` and `text[b..]`, capped at `max_ctx`.
+    fn naive_lcp(text: &[u8], a: usize, b: usize, max_ctx: usize) -> usize {
+        let lim = (text.len() - a).min(text.len() - b).min(max_ctx);
+        (0..lim).take_while(|&i| text[a + i] == text[b + i]).count()
+    }
+
+    /// Assert the LCP-array postcondition stated on [`merge_sort`]:
+    /// `lcp[0] == 0` and `lcp[i] == lcp(text[sa[i-1]..], text[sa[i]..])`.
+    fn assert_lcp_valid(text: &[u8], max_ctx: usize) {
+        let (sa, lcp) = build_sa_and_lcp(text, max_ctx);
+        if sa.is_empty() {
+            return;
+        }
+        assert_eq!(lcp[0], 0, "lcp[0] must be 0 (text {text:?})");
+        for i in 1..sa.len() {
+            let want = naive_lcp(text, sa[i - 1] as usize, sa[i] as usize, max_ctx);
+            assert_eq!(
+                lcp[i] as usize,
+                want,
+                "lcp[{i}] wrong for sa[{}]={} vs sa[{i}]={} (text {text:?})",
+                i - 1,
+                sa[i - 1],
+                sa[i],
+            );
+        }
+    }
+
+    #[test]
+    fn lcp_array_matches_naive_on_fixtures() {
+        for text in [
+            b"banana".as_slice(),
+            b"mississippi",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            b"abababababababababababababab",
+            b"a",
+            b"",
+        ] {
+            assert_lcp_valid(text, usize::MAX);
+        }
+    }
+
+    #[test]
+    fn lcp_array_matches_naive_on_random() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1CB0);
+        for &sigma in &[2u8, 4, 6, 255] {
+            for &n in &[2usize, 3, 7, 16, 17, 63, 64, 65, 200, 1000, 5000] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
+                assert_lcp_valid(&text, usize::MAX);
+            }
+        }
+    }
+
+    /// Long runs of one symbol are the worst case for the LCP invariant:
+    /// adjacent suffixes share almost everything, so every `lcp[i]` is
+    /// large and an off-by-one is easy to miss.
+    #[test]
+    fn lcp_array_on_long_runs_and_periodic_text() {
+        assert_lcp_valid(&vec![7u8; 2000], usize::MAX);
+        let periodic: Vec<u8> = (0..2000).map(|i| (i % 3) as u8).collect();
+        assert_lcp_valid(&periodic, usize::MAX);
+        // A run embedded in noise, the shape a poly-N genome block has.
+        let mut mixed: Vec<u8> = (0..500).map(|i| (i % 4) as u8).collect();
+        mixed.extend(std::iter::repeat_n(4u8, 1500));
+        mixed.extend((0..500).map(|i| (i % 4) as u8));
+        assert_lcp_valid(&mixed, usize::MAX);
+    }
+
+    #[test]
+    fn lcp_array_respects_max_context() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC7A);
+        for &max_ctx in &[1usize, 2, 4, 16] {
+            for &n in &[64usize, 500] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
+                let (sa, lcp) = build_sa_and_lcp(&text, max_ctx);
+                for i in 1..sa.len() {
+                    let want = naive_lcp(&text, sa[i - 1] as usize, sa[i] as usize, max_ctx);
+                    assert_eq!(
+                        lcp[i] as usize, want,
+                        "lcp[{i}] wrong with max_ctx={max_ctx}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn empty_text() {
         let sa: Vec<u32> = build_in_memory::<u8, u32>(&[]);
@@ -486,6 +762,45 @@ mod tests {
         want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
         let got = build_in_memory_for_positions(text, positions);
         assert_eq!(got, want);
+    }
+
+    /// Duplicated positions must survive: the output is a permutation of the
+    /// *input* multiset, which a membership filter cannot reproduce, so the
+    /// subset fast path has to decline and let the merge kernel run.
+    #[test]
+    fn for_positions_with_duplicates_keeps_multiplicity() {
+        let text = b"mississippi";
+        let positions: Vec<u32> = vec![0, 1, 1, 4, 4, 4, 7];
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(text, positions);
+        assert_eq!(got, want);
+    }
+
+    /// A subset far smaller than the text takes the merge kernel, since
+    /// building the whole suffix array to throw nearly all of it away would
+    /// cost more than sorting the subset directly. Correctness is identical
+    /// either way; this pins the behaviour.
+    #[test]
+    fn for_positions_tiny_subset_of_large_text() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5AB0);
+        let text: Vec<u8> = (0..20_000).map(|_| rng.random_range(0..4u8)).collect();
+        let positions: Vec<u32> = (0..20_000u32).step_by(500).collect();
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(&text, positions);
+        assert_eq!(got, want);
+    }
+
+    /// Positions out of range are the caller's error, but the subset fast path
+    /// must not turn them into a silently wrong answer or an unsafe index.
+    #[test]
+    #[should_panic]
+    fn for_positions_out_of_range_still_panics() {
+        let text = b"banana";
+        let positions: Vec<u32> = vec![0, 1, 99];
+        let _ = build_in_memory_for_positions(text, positions);
     }
 
     #[test]
