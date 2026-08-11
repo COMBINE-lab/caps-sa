@@ -73,6 +73,29 @@ pub trait LimitProvider: Sync {
         let _ = (p_a, p_b);
         lim_a.cmp(&lim_b)
     }
+
+    /// `Some(n)` iff this provider describes an unsegmented text of `n`
+    /// symbols under the *standard* comparator: `lim_at(p) == n - p` for
+    /// every `p`, and `boundary_order` left at its shorter-is-smaller
+    /// default.
+    ///
+    /// Returning `Some` lets the crate substitute a specialised suffix-array
+    /// algorithm that assumes plain lexicographic order. It is therefore a
+    /// promise about the *comparator*, not merely about the lengths.
+    ///
+    /// The default is `None`, which keeps every existing and third-party
+    /// implementation on the general merge kernel at today's semantics. In
+    /// particular, an implementation that delegates `lim_at` to [`PlainText`]
+    /// but overrides [`boundary_order`][LimitProvider::boundary_order] to get
+    /// a different convention (STAR's spacer-as-largest ordering is the
+    /// motivating example) inherits `None` and is safe without doing
+    /// anything.
+    ///
+    /// Override this only if you have *not* overridden `boundary_order`.
+    #[inline]
+    fn plain_lex_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Default provider for non-segmented texts: `lim_at(p) = n - p`.
@@ -98,6 +121,11 @@ impl LimitProvider for PlainText {
     #[inline(always)]
     fn lim_at(&self, p: usize) -> usize {
         self.n - p
+    }
+
+    #[inline]
+    fn plain_lex_len(&self) -> Option<usize> {
+        Some(self.n)
     }
 }
 
