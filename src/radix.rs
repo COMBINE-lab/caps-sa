@@ -82,9 +82,13 @@ use std::time::Instant;
 /// key_b` still implies `suffix_a < suffix_b`, and the zero-padding argument
 /// carries over because code `0` remains the minimum.
 pub(crate) struct Packer {
-    /// Byte to dense code. Bytes absent from the text map to `0`; they never
-    /// appear in a key.
-    code: [u8; 256],
+    /// The text with every byte replaced by its code, when the identity map
+    /// does not already do that. Materialising it once removes a dependent
+    /// table load from the packing loop, which is otherwise the chain that
+    /// sets the cost of building a key. `None` when the text is already dense
+    /// (a `0..3` DNA encoding, say), so the common pre-coded input pays no
+    /// extra memory.
+    ranked: Option<Vec<u8>>,
     /// Bits per packed field.
     bits: u32,
     /// Symbols per `u64` key.
@@ -94,7 +98,7 @@ pub(crate) struct Packer {
 impl Packer {
     /// Build the map for `text`.
     fn new(text: &[u8]) -> Self {
-        // Which bytes occur? One parallel pass, folded into a 256-bit set.
+        // Which bytes occur? One parallel pass, folded into a 256-entry set.
         let present = text
             .par_chunks(1 << 16)
             .map(|c| {
@@ -116,21 +120,37 @@ impl Packer {
 
         let mut code = [0u8; 256];
         let mut next = 0u16;
+        let mut identity = true;
         for (b, &seen) in present.iter().enumerate() {
             if seen {
                 code[b] = next as u8;
+                identity &= next as usize == b;
                 next += 1;
             }
         }
-        // `next` is the alphabet size; the largest code is `next - 1`.
         let bits: u32 = match next.saturating_sub(1) {
             0..=1 => 1,
             2..=3 => 2,
             4..=15 => 4,
             _ => 8,
         };
+        // An identity map, or 8-bit fields where the code never changes the
+        // packed value's order, both let the original text be read directly.
+        let ranked = if identity {
+            None
+        } else {
+            let mut out = vec![0u8; text.len()];
+            out.par_chunks_mut(1 << 16)
+                .zip(text.par_chunks(1 << 16))
+                .for_each(|(dst, src)| {
+                    for (d, &s) in dst.iter_mut().zip(src) {
+                        *d = code[s as usize];
+                    }
+                });
+            Some(out)
+        };
         Self {
-            code,
+            ranked,
             bits,
             k: 64 / bits as usize,
         }
@@ -146,17 +166,76 @@ impl Packer {
         self.k
     }
 
+    /// Gather the low `bits` of each of 8 ranked bytes into one contiguous
+    /// field, most-significant byte first.
+    ///
+    /// A binary-tree SWAR shuffle: each step folds neighbouring fields
+    /// together and halves the stride, so eight symbols cost three
+    /// shift-or-mask pairs instead of eight dependent shift-or steps. The
+    /// input is a big-endian load, so the text's first byte lands in the
+    /// result's most significant field, which is the order the key needs.
+    #[inline(always)]
+    fn gather8(v: u64, bits: u32) -> u64 {
+        match bits {
+            1 => {
+                let mut x = v & 0x0101_0101_0101_0101;
+                x = (x | (x >> 7)) & 0x0003_0003_0003_0003;
+                x = (x | (x >> 14)) & 0x0000_000F_0000_000F;
+                (x | (x >> 28)) & 0xFF
+            }
+            2 => {
+                let mut x = v & 0x0303_0303_0303_0303;
+                x = (x | (x >> 6)) & 0x000F_000F_000F_000F;
+                x = (x | (x >> 12)) & 0x0000_00FF_0000_00FF;
+                (x | (x >> 24)) & 0xFFFF
+            }
+            4 => {
+                let mut x = v & 0x0F0F_0F0F_0F0F_0F0F;
+                x = (x | (x >> 4)) & 0x00FF_00FF_00FF_00FF;
+                x = (x | (x >> 8)) & 0x0000_FFFF_0000_FFFF;
+                (x | (x >> 16)) & 0xFFFF_FFFF
+            }
+            _ => v,
+        }
+    }
+
     /// Pack the `k` symbols at `text[p..]` into one order-preserving `u64`,
     /// zero-padding past the end of the text.
     #[inline]
     pub(crate) fn key_at(&self, text: &[u8], p: usize) -> u64 {
-        let end = (p + self.k).min(text.len());
-        let mut key: u64 = 0;
-        for &s in &text[p..end] {
-            key = (key << self.bits) | self.code[s as usize] as u64;
+        let src = self.ranked.as_deref().unwrap_or(text);
+        let n = src.len();
+
+        // Fast path: a whole key's worth of symbols is available, so it is
+        // `k / 8` big-endian loads and their gathers, with no bounds fuss.
+        if p + self.k <= n {
+            return self
+                .fold(|i| u64::from_be_bytes(src[p + 8 * i..p + 8 * i + 8].try_into().unwrap()));
         }
-        // Shift the packed prefix up so the missing trailing fields read zero.
-        key << (self.bits as usize * (self.k - (end - p)))
+
+        // Tail: fewer than `k` symbols remain. Pad with zero codes, which are
+        // the alphabet's minimum, matching shorter-is-smaller.
+        let mut buf = [0u8; 64];
+        buf[..n - p].copy_from_slice(&src[p..n]);
+        self.fold(|i| u64::from_be_bytes(buf[8 * i..8 * i + 8].try_into().unwrap()))
+    }
+
+    /// Concatenate the gathers of the `k / 8` words produced by `word`.
+    ///
+    /// The first group is assigned rather than shifted in. With 8-bit fields
+    /// there is exactly one group and `8 * bits` is 64, which is not a legal
+    /// shift distance for `u64`; release builds mask it to 0 and happen to
+    /// give the right answer, debug builds panic. Assigning avoids relying on
+    /// either behaviour.
+    #[inline(always)]
+    fn fold(&self, word: impl Fn(usize) -> u64) -> u64 {
+        let shift = 8 * self.bits;
+        let mut key = 0u64;
+        for i in 0..self.k / 8 {
+            let g = Self::gather8(word(i), self.bits);
+            key = if i == 0 { g } else { (key << shift) | g };
+        }
+        key
     }
 }
 
@@ -717,20 +796,63 @@ mod tests {
     }
 
     /// The remap must be monotone, or a packed key would stop being
-    /// order-preserving and the whole seed would be wrong.
+    /// order-preserving and the whole seed would be wrong. Checked through
+    /// the observable behaviour: over a text whose bytes ascend and are all
+    /// distinct, successive suffixes must produce strictly increasing keys.
     #[test]
-    fn packer_remap_is_monotone() {
-        let text: Vec<u8> = b"TGCAN\nZq".to_vec();
-        let p = Packer::new(&text);
-        let mut present: Vec<u8> = text.clone();
-        present.sort_unstable();
-        present.dedup();
-        for w in present.windows(2) {
-            assert!(
-                p.code[w[0] as usize] < p.code[w[1] as usize],
-                "codes must follow byte order: {:?}",
-                w
-            );
+    fn packer_keys_follow_byte_order() {
+        for text in [
+            b"\nACGNTZq".to_vec(),
+            (0..40u8)
+                .map(|i| i.wrapping_mul(6).wrapping_add(3))
+                .collect(),
+            b"ACGT".to_vec(),
+        ] {
+            let mut ascending: Vec<u8> = text.clone();
+            ascending.sort_unstable();
+            ascending.dedup();
+            let p = Packer::new(&ascending);
+            let keys: Vec<u64> = (0..ascending.len())
+                .map(|i| p.key_at(&ascending, i))
+                .collect();
+            for (i, w) in keys.windows(2).enumerate() {
+                assert!(
+                    w[0] < w[1],
+                    "key({i}) = {:#x} should precede key({}) = {:#x} for {ascending:?}",
+                    w[0],
+                    i + 1,
+                    w[1],
+                );
+            }
+        }
+    }
+
+    /// The SWAR gather must agree with the obvious shift-or loop for every
+    /// field width and every alignment, including the zero-padded tail.
+    #[test]
+    fn swar_gather_matches_scalar_packing() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5AA5);
+        for &sigma in &[2u8, 4, 16, 200] {
+            for &n in &[1usize, 7, 8, 9, 31, 32, 33, 63, 64, 65, 200] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
+                let p = Packer::new(&text);
+                let (bits, k) = (p.bits(), p.k());
+                let ranked = p.ranked.as_deref().unwrap_or(&text);
+                for pos in 0..n {
+                    let end = (pos + k).min(n);
+                    let mut want: u64 = 0;
+                    for &c in &ranked[pos..end] {
+                        want = (want << bits) | c as u64;
+                    }
+                    want <<= bits as usize * (k - (end - pos));
+                    assert_eq!(
+                        p.key_at(&text, pos),
+                        want,
+                        "sigma={sigma} n={n} pos={pos} bits={bits}",
+                    );
+                }
+            }
         }
     }
 
