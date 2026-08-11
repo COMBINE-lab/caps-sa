@@ -94,6 +94,136 @@ fn key_at(text: &[u8], p: usize, bits: u32, k: usize) -> u64 {
     key << (bits as usize * (k - (end - p)))
 }
 
+/// Bits of the key used for the MSD counting-sort pass, and the resulting
+/// bucket count.
+///
+/// 2048 buckets keeps the write-combining state at 2048 × 2 streams × 128 B
+/// ≈ 512 KB, which stays inside a core's private cache. Going to 16 bits
+/// would need 16 MB of open write lines and thrashes the TLB instead.
+const RADIX_BITS: u32 = 11;
+const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
+
+/// Sort every suffix position by `(packed key, visible length)`, returning the
+/// sorted keys alongside the sorted positions.
+///
+/// This is an MSD counting sort rather than a comparison sort, for three
+/// reasons that all matter at genome scale:
+///
+/// * The source is never materialised. Keys are recomputed from `text` in
+///   both the histogram and the scatter pass, which is a sequential read of
+///   the text instead of a random read of an `n`-element key array.
+/// * Peak memory is the two destination buffers only, 12 bytes per position
+///   with `I = u32`, against the 16 a `(u64, u32, I)` record costs.
+/// * The top-level partition is a counting pass, so it parallelises evenly.
+///   A parallel comparison sort's first partitioning steps are close to
+///   serial, which is exactly where a `n log n` sort loses on many cores.
+fn seed_sort<I: Index>(
+    text: &[u8],
+    bits: u32,
+    k: usize,
+    visible_len: &(dyn Fn(usize) -> usize + Sync),
+) -> (Vec<u64>, Vec<I>) {
+    let n = text.len();
+    let bucket_of = |key: u64| -> usize { (key >> (64 - RADIX_BITS)) as usize };
+
+    // Chunk the position range so each worker builds a private histogram.
+    let n_chunks = (rayon::current_num_threads() * 4).clamp(1, 1024);
+    let chunk_len = n.div_ceil(n_chunks);
+    let bounds: Vec<(usize, usize)> = (0..n)
+        .step_by(chunk_len)
+        .map(|s| (s, (s + chunk_len).min(n)))
+        .collect();
+
+    // Pass 1: per-chunk histograms over the top `RADIX_BITS` of each key.
+    let histograms: Vec<Vec<u32>> = bounds
+        .par_iter()
+        .map(|&(start, end)| {
+            let mut counts = vec![0u32; RADIX_BUCKETS];
+            for p in start..end {
+                counts[bucket_of(key_at(text, p, bits, k))] += 1;
+            }
+            counts
+        })
+        .collect();
+
+    // Exclusive prefix sum, bucket-major then chunk-minor, so every (chunk,
+    // bucket) pair gets a disjoint destination range and the buckets come out
+    // in ascending key order.
+    let mut offsets = vec![0usize; bounds.len() * RADIX_BUCKETS];
+    let mut bucket_start = vec![0usize; RADIX_BUCKETS + 1];
+    {
+        let mut running = 0usize;
+        for b in 0..RADIX_BUCKETS {
+            bucket_start[b] = running;
+            for (c, hist) in histograms.iter().enumerate() {
+                offsets[c * RADIX_BUCKETS + b] = running;
+                running += hist[b] as usize;
+            }
+        }
+        bucket_start[RADIX_BUCKETS] = running;
+        debug_assert_eq!(running, n);
+    }
+
+    // Pass 2: scatter. Each chunk owns a disjoint slice of every bucket, so
+    // the writes never collide even though they are not contiguous.
+    let mut keys: Vec<u64> = vec![0; n];
+    let mut sa: Vec<I> = vec![I::zero(); n];
+    {
+        let key_out = Scatter::new(&mut keys);
+        let sa_out = Scatter::new(&mut sa);
+        bounds
+            .par_iter()
+            .enumerate()
+            .for_each(|(c, &(start, end))| {
+                let mut cursor: Vec<usize> =
+                    offsets[c * RADIX_BUCKETS..(c + 1) * RADIX_BUCKETS].to_vec();
+                for p in start..end {
+                    let key = key_at(text, p, bits, k);
+                    let slot = &mut cursor[bucket_of(key)];
+                    // SAFETY: the prefix sum gives this (chunk, bucket) pair a
+                    // range of exactly its own histogram count, and the cursor
+                    // never leaves it, so no other thread writes this index.
+                    unsafe {
+                        key_out.set(*slot, key);
+                        sa_out.set(*slot, I::from_usize(p));
+                    }
+                    *slot += 1;
+                }
+            });
+    }
+
+    // Pass 3: order within each bucket. Buckets share their top `RADIX_BITS`,
+    // so what remains is the low bits of the key and then the visible-length
+    // tie-break. Buckets are contiguous and independent.
+    let mut rest: &mut [u64] = &mut keys;
+    let mut rest_sa: &mut [I] = &mut sa;
+    let mut slices: Vec<(&mut [u64], &mut [I])> = Vec::with_capacity(RADIX_BUCKETS);
+    for b in 0..RADIX_BUCKETS {
+        let len = bucket_start[b + 1] - bucket_start[b];
+        let (kb, kt) = rest.split_at_mut(len);
+        let (sb, st) = rest_sa.split_at_mut(len);
+        slices.push((kb, sb));
+        rest = kt;
+        rest_sa = st;
+    }
+    slices.into_par_iter().for_each(|(kb, sb)| {
+        if kb.len() < 2 {
+            return;
+        }
+        let mut pairs: Vec<(u64, I)> = kb.iter().copied().zip(sb.iter().copied()).collect();
+        pairs.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| visible_len(a.1.to_usize()).cmp(&visible_len(b.1.to_usize())))
+        });
+        for (i, &(key, pos)) in pairs.iter().enumerate() {
+            kb[i] = key;
+            sb[i] = pos;
+        }
+    });
+
+    (keys, sa)
+}
+
 /// Build the standard lexicographic suffix array of `text` by radix-seeded
 /// prefix doubling.
 ///
@@ -125,30 +255,27 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     // never separates suffixes that the doubling rounds still need to see as
     // tied. Without it, `[0, 0]` leaves positions 0 and 1 permanently tied
     // and the doubling loop cannot terminate.
-    let mut seeded: Vec<(u64, u32, I)> = (0..n)
-        .into_par_iter()
-        .map(|p| {
-            (
-                key_at(text, p, bits, k),
-                (n - p).min(k) as u32,
-                I::from_usize(p),
-            )
-        })
-        .collect();
+    // Only the last `k - 1` positions can have a visible length below `k`, so
+    // the tie-break is a function of the position alone and never has to be
+    // stored alongside the key.
+    let visible_len = |p: usize| -> usize { (n - p).min(k) };
+
     profile_log(&format!(
-        "radix keys      {:.3}s",
+        "radix setup     {:.3}s",
         t0.elapsed().as_secs_f64()
     ));
     let t1 = Instant::now();
-    seeded.par_sort_unstable();
+    let (keys, mut sa) = seed_sort::<I>(text, bits, k, &visible_len);
     profile_log(&format!(
         "radix seed sort {:.3}s",
         t1.elapsed().as_secs_f64()
     ));
     let t2 = Instant::now();
 
-    let mut sa: Vec<I> = Vec::with_capacity(n);
-    sa.par_extend(seeded.par_iter().map(|&(_, _, p)| p));
+    // Two seeded entries tie exactly when key and visible length both match.
+    let seed_eq = |a: usize, b: usize| -> bool {
+        keys[a] == keys[b] && visible_len(sa[a].to_usize()) == visible_len(sa[b].to_usize())
+    };
 
     // `rank[p]` is the index in `sa` of the first element of `p`'s group, so
     // two suffixes tie at the current depth exactly when their ranks match,
@@ -165,12 +292,11 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     let groups: Vec<(usize, usize)> = (0..n)
         .into_par_iter()
         .filter_map(|h| {
-            let key = (seeded[h].0, seeded[h].1);
-            if h > 0 && (seeded[h - 1].0, seeded[h - 1].1) == key {
+            if h > 0 && seed_eq(h - 1, h) {
                 return None;
             }
             let mut e = h + 1;
-            while e < n && (seeded[e].0, seeded[e].1) == key {
+            while e < n && seed_eq(e, h) {
                 e += 1;
             }
             let g = I::from_usize(h);
@@ -184,7 +310,7 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         })
         .collect();
     let mut groups = groups;
-    drop(seeded);
+    drop(keys);
     profile_log(&format!(
         "radix grouping  {:.3}s",
         t2.elapsed().as_secs_f64()
