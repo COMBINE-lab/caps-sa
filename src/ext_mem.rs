@@ -505,6 +505,7 @@ where
     let p = effective_subproblem_count(n, opts.subproblem_count);
     let runs = crate::runs::detect_for(text);
     let cmp = Cmp::new(LcpDispatch::detect(), &runs);
+    let seed_params = crate::radix::seed_params(text);
     let work_dir = opts.work_dir.clone();
 
     // Pool the `2 × p` bucket files into one anonymous tempfile per
@@ -529,8 +530,16 @@ where
     let part_factory = |j: usize| phase3_pool.new_bucket::<SaLcp<I>>(j);
 
     let t = Instant::now();
-    let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, cmp, sub_factory)?;
+    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, L, _, _>(
+        text,
+        lp,
+        &source,
+        p,
+        opts,
+        cmp,
+        seed_params,
+        sub_factory,
+    )?;
     profile_log(&format!(
         "phase1 (sort+sample+spill) {:.3}s",
         t.elapsed().as_secs_f64()
@@ -619,11 +628,20 @@ where
     let p = effective_subproblem_count(n, opts.subproblem_count);
     let runs = crate::runs::detect_for(text);
     let cmp = Cmp::new(LcpDispatch::detect(), &runs);
+    let seed_params = crate::radix::seed_params(text);
 
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
 
-    let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, cmp, factory)?;
+    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, L, _, _>(
+        text,
+        lp,
+        &source,
+        p,
+        opts,
+        cmp,
+        seed_params,
+        factory,
+    )?;
     // Same rationale as in `build_ext_mem_inner` — drop the source
     // as soon as phase 1's `fill_chunk` calls have stopped.
     drop(source);
@@ -1188,6 +1206,7 @@ fn phase1_sort_sample_spill<S, I, L, B, MkB>(
     p: usize,
     opts: &ExtMemOpts,
     cmp: Cmp<'_>,
+    seed_params: Option<(u32, usize)>,
     mk_bucket: MkB,
 ) -> io::Result<(Vec<B>, Vec<I>)>
 where
@@ -1220,16 +1239,32 @@ where
             let mut sa_w = vec![I::zero(); len];
             let mut lcp_arr = vec![I::zero(); len];
             let mut lcp_w = vec![I::zero(); len];
-            sample_sort::merge_sort(
+            // Seed with the packed key where the comparator allows it: that
+            // resolves the first `k` symbols with no text access and yields
+            // the LCP between runs from the key difference, leaving the merge
+            // kernel only the suffixes that agree through all `k`.
+            if !crate::radix::seed_subarray(
                 text,
                 lp,
+                seed_params,
                 &mut sa,
-                &mut sa_w,
                 &mut lcp_arr,
+                &mut sa_w,
                 &mut lcp_w,
                 opts.max_context,
                 cmp,
-            );
+            ) {
+                sample_sort::merge_sort(
+                    text,
+                    lp,
+                    &mut sa,
+                    &mut sa_w,
+                    &mut lcp_arr,
+                    &mut lcp_w,
+                    opts.max_context,
+                    cmp,
+                );
+            }
 
             // Pull `samples_per_subarray` evenly-spaced positions out of
             // the now-sorted subarray. Deterministic — no RNG needed for
