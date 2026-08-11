@@ -462,6 +462,41 @@ rank-only, so they cost a sort over a shrinking residual rather than a
 text scan, which is why the pathology disappears rather than merely
 shrinking.
 
+### chr21 external memory — skipping long repeats
+
+Same machine and inputs as the section above. The external-memory path
+stays on the merge kernel by design (prefix doubling needs a rank per
+text position, which would defeat the memory bound it exists to
+provide), so it was still paying the full scan cost. Profiling put 94%
+of the FASTA run in phase 1:
+
+```
+                     phase1     phase2   phase3   phase4    total
+chr21.0123  before    1.15 s    0.005 s  0.215 s  2.080 s   3.49 s
+chr21.fa    before   22.85 s    0.058 s  0.317 s  0.948 s  24.19 s
+```
+
+Fixing it in the comparator rather than the algorithm keeps the memory
+bound intact:
+
+| ext-mem input | before | after | CPU before | CPU after | peak RSS |
+| ------------- | ------ | ----- | ---------- | --------- | -------- |
+| `chr21.fa`, 47.5 MB | 24.19 s | **2.48 s** | 268 s | 23.3 s | 147 → 151 MB |
+| `chr21.0123`, 80 MB | 3.49 s | 3.55 s | 33.9 s | 33.8 s | 214 → 220 MB |
+
+Phase 1 goes from 22.85 s to 0.95 s. The `N`-free row is flat, which is
+the expected result: the sampling stage finds no periodic window, the
+run table comes out empty, and every query short-circuits.
+
+Output was verified identical to the in-memory suffix array on both
+inputs (127.7 M entries).
+
+The detail worth recording is that **a homopolymer detector would not
+have worked**. In 60-column wrapped FASTA the longest run of a single
+byte is 60, because each line of `N`s is terminated by a newline. The
+real structure is a period-61 repeat spanning 6.6 Mb. Periods up to 64
+are considered, which also covers satellite arrays.
+
 ### Reading the 97.54% LCP profile correctly
 
 The profile in the next section shows `lcp_u8_avx2` taking 97.54% of

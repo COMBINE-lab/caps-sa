@@ -193,10 +193,45 @@ build:
   where doubling applies it is strictly better: same output, no bucket
   machinery, none of the scan cost.
 
-`build_ext_mem` deliberately stays on the merge kernel. Its purpose is to
-bound peak memory, and routing it through an in-memory algorithm would
-defeat exactly that, so it keeps the scan cost on repeat-heavy input.
-Segmented texts and symbols wider than `u8` also stay on the merge kernel.
+`build_ext_mem` deliberately stays on the merge kernel: its purpose is to
+bound peak memory, and prefix doubling needs a rank for every position in
+the text, which would defeat exactly that. Segmented texts and symbols
+wider than `u8` also stay on the merge kernel.
+
+### Skipping long repeats
+
+Those paths get the same pathology fixed in the comparator instead, which
+costs no extra memory. If `text[s..e)` has period `q` and two suffixes
+start at `a < b` inside it with `(b - a) % q == 0`, they agree until the
+later one reaches `e`, so
+
+```text
+lcp(a, b) >= e - b
+```
+
+is known in `O(1)` from the run's bounds with nothing scanned. When the
+phase does not match, the two suffixes differ within `q` symbols and the
+ordinary scan is already short. Scans are additionally bounded so they
+stop at a run's start rather than traversing it.
+
+Detecting only single-symbol runs would miss the case that actually
+occurs: in wrapped FASTA an `N` block is 60 `N`s followed by a newline,
+which is period 61, not period 1. Periods up to 64 are considered, which
+also covers satellite arrays.
+
+Detection is two-stage so texts without repeats pay almost nothing: a
+sampling pass collects the periods that occur at all, and the full scan
+runs only for those. On `N`-free DNA the table comes out empty and every
+query short-circuits. The table is a few dozen entries, so the
+external-memory path keeps its memory bound.
+
+| ext-mem input | before | after | CPU before | CPU after | peak RSS |
+| ------------- | ------ | ----- | ---------- | --------- | -------- |
+| chr21 FASTA, 47.5 MB | 24.2 s | **2.48 s** | 268 s | 23.3 s | 147 → 151 MB |
+| chr21 `N`-free, 80 MB | 3.49 s | 3.55 s | 33.9 s | 33.8 s | 214 → 220 MB |
+
+Phase 1 alone goes from 22.85 s to 0.95 s on the FASTA input. The `N`-free
+row is unchanged, as expected: there are no runs to find.
 
 ## Algorithm
 
