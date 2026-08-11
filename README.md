@@ -227,11 +227,22 @@ external-memory path keeps its memory bound.
 
 | ext-mem input | before | after | CPU before | CPU after | peak RSS |
 | ------------- | ------ | ----- | ---------- | --------- | -------- |
-| chr21 FASTA, 47.5 MB | 24.2 s | **2.48 s** | 268 s | 23.3 s | 147 → 151 MB |
-| chr21 `N`-free, 80 MB | 3.49 s | 3.55 s | 33.9 s | 33.8 s | 214 → 220 MB |
+| chr21 FASTA, 47.5 MB | 24.2 s | **1.65 s** | 268 s | 17.5 s | 147 → 182 MB |
+| chr21 `N`-free, 80 MB | 3.49 s | **2.11 s** | 33.9 s | 25.0 s | 214 → 233 MB |
 
-Phase 1 alone goes from 22.85 s to 0.95 s on the FASTA input. The `N`-free
-row is unchanged, as expected: there are no runs to find.
+Four changes get there, each measured separately:
+
+| change | chr21.0123 | chr21 FASTA |
+| ------ | ---------- | ----------- |
+| baseline | 3.49 s | 24.19 s |
+| skip periodic runs | 3.55 s | 2.48 s |
+| prefetch the next candidates' text | 2.90 s | 1.99 s |
+| subarray target 64Ki → 128Ki records | 2.54 s | 1.86 s |
+| seed phase-1 subarrays with the packed key | **2.11 s** | **1.65 s** |
+
+Phase 1 goes from 22.85 s to 0.42 s on the FASTA input, and from 1.20 s
+to 0.32 s on the `N`-free one. Peak RSS rises by under 30 MB, so the
+bounded-memory guarantee the path exists for is intact.
 
 ## Algorithm
 
