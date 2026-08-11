@@ -15,6 +15,19 @@ categories = ["algorithms", "data-structures"]
 repository = "https://github.com/COMBINE-lab/caps-sa"
 readme = "README.md"
 
+# The published benchmark numbers in `bench/` were taken with fat LTO and a
+# single codegen unit. That configuration used to come from a parent workspace
+# that no longer exists in this repo, so pin it here. A `[profile.release]` in a
+# library crate applies only when this crate is the workspace root — i.e. to
+# this repo's own tests, examples and benches — and is invisible to downstream
+# consumers, who keep their own profile.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+
 [dependencies]
 rayon = "1"
 tempfile = "3"
