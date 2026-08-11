@@ -34,6 +34,7 @@ use crate::Index;
 use crate::lcp::{LcpDispatch, Symbol};
 use crate::limits::{LimitProvider, PlainText};
 use rayon::join;
+use rayon::prelude::*;
 
 /// Tunable options for SA construction.
 #[derive(Clone, Debug)]
@@ -142,6 +143,65 @@ where
     Some(crate::radix::build_sa(bytes))
 }
 
+/// Sort a *subset* of positions by building the full suffix array with the
+/// doubling path and then keeping only the requested positions.
+///
+/// Doubling cannot be restricted to a subset directly: a round compares
+/// `rank[p + d]`, and that successor is generally not in the subset, so ranks
+/// have to be defined for every position in the text. Building the whole array
+/// and filtering it sidesteps that, and the filter is a single `O(n)` pass
+/// because the full SA is already in the right order.
+///
+/// Worth it when the subset is a decent fraction of the text, which is the
+/// case this API exists for (STAR-style indexing keeps every ACGT position and
+/// drops only spacers). For a small subset, `O(n)` to build the full array
+/// would dwarf the `O(m log m)` the merge kernel needs, so below one eighth of
+/// the text this declines and the merge kernel runs. That ratio is a
+/// performance heuristic, unlike the guards in [`try_doubling_fast_path`],
+/// which are correctness conditions.
+///
+/// Also declines on duplicate or out-of-range positions, which a
+/// membership filter cannot reproduce faithfully.
+fn try_doubling_subset<S, I, L>(text: &[S], positions: &[I], lp: &L, opts: &Opts) -> Option<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = text.len();
+    let m = positions.len();
+    if m == 0 || m.checked_mul(8)? < n {
+        return None;
+    }
+    if opts.max_context != usize::MAX
+        || lp.plain_lex_len() != Some(n)
+        || std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>()
+    {
+        return None;
+    }
+
+    let mut wanted = vec![false; n];
+    for p in positions {
+        let p = p.to_usize();
+        // Out of range, or the same position twice: a membership filter emits
+        // each position at most once, so it cannot reproduce either faithfully.
+        if p >= n || wanted[p] {
+            return None;
+        }
+        wanted[p] = true;
+    }
+
+    // SAFETY: `S` is `u8`, so `&[S]` and `&[u8]` have identical layout.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, n) };
+    let full: Vec<I> = crate::radix::build_sa(bytes);
+    let kept: Vec<I> = full
+        .into_par_iter()
+        .filter(|p| wanted[p.to_usize()])
+        .collect();
+    debug_assert_eq!(kept.len(), m);
+    Some(kept)
+}
+
 /// Sort the caller-supplied `positions` by the lexicographic order of
 /// their suffixes in `text`. Returns the positions reordered so that
 /// `text[output[i]..]` is the i-th smallest suffix among the input set.
@@ -192,6 +252,10 @@ where
     I: Index,
     L: LimitProvider,
 {
+    if let Some(sa) = try_doubling_subset::<S, I, L>(text, &positions, lp, opts) {
+        return sa;
+    }
+
     let n = positions.len();
     if n == 0 {
         return Vec::new();
@@ -646,6 +710,45 @@ mod tests {
         want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
         let got = build_in_memory_for_positions(text, positions);
         assert_eq!(got, want);
+    }
+
+    /// Duplicated positions must survive: the output is a permutation of the
+    /// *input* multiset, which a membership filter cannot reproduce, so the
+    /// subset fast path has to decline and let the merge kernel run.
+    #[test]
+    fn for_positions_with_duplicates_keeps_multiplicity() {
+        let text = b"mississippi";
+        let positions: Vec<u32> = vec![0, 1, 1, 4, 4, 4, 7];
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(text, positions);
+        assert_eq!(got, want);
+    }
+
+    /// A subset far smaller than the text takes the merge kernel, since
+    /// building the whole suffix array to throw nearly all of it away would
+    /// cost more than sorting the subset directly. Correctness is identical
+    /// either way; this pins the behaviour.
+    #[test]
+    fn for_positions_tiny_subset_of_large_text() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5AB0);
+        let text: Vec<u8> = (0..20_000).map(|_| rng.random_range(0..4u8)).collect();
+        let positions: Vec<u32> = (0..20_000u32).step_by(500).collect();
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(&text, positions);
+        assert_eq!(got, want);
+    }
+
+    /// Positions out of range are the caller's error, but the subset fast path
+    /// must not turn them into a silently wrong answer or an unsafe index.
+    #[test]
+    #[should_panic]
+    fn for_positions_out_of_range_still_panics() {
+        let text = b"banana";
+        let positions: Vec<u32> = vec![0, 1, 99];
+        let _ = build_in_memory_for_positions(text, positions);
     }
 
     #[test]

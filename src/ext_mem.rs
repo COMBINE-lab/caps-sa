@@ -709,6 +709,26 @@ where
     L: LimitProvider,
     F: FnMut(u64) -> Result<(), E>,
 {
+    // This path exists to sort in RAM, so when the doubling path applies it is
+    // strictly better here: same output, no bucket machinery, and none of the
+    // scan cost the merge kernel pays on repeat-heavy text. `build_ext_mem`
+    // deliberately does *not* do this -- its whole purpose is to bound peak
+    // memory, and routing it through an in-memory algorithm would defeat that.
+    if opts.max_context == usize::MAX
+        && lp.plain_lex_len() == Some(text.len())
+        && std::any::TypeId::of::<S>() == std::any::TypeId::of::<u8>()
+    {
+        // SAFETY: `S` is `u8`, so `&[S]` and `&[u8]` have identical layout.
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
+        let sa: Vec<u64> = crate::radix::build_sa(bytes);
+        let mut emit = emit;
+        for pos in sa {
+            emit(pos).map_err(BuildError::Emit)?;
+        }
+        return Ok(());
+    }
+
     if text.len() <= u32::MAX as usize + 1 {
         build_in_memory_ss_inner::<S, u32, L, E, F>(
             text,
