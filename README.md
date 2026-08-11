@@ -47,8 +47,13 @@ the merge kernel's and independently verified:
 
 | input | before | after | CPU before | CPU after |
 | ----- | ------ | ----- | ---------- | --------- |
-| chr21 fwd ++ revcomp, `N`-free, 80 MB | 6.08 s | **0.89 s** | 28.1 s | 5.0 s |
+| chr21 fwd ++ revcomp, `N`-free, 80 MB | 6.08 s | **0.84 s** | 28.1 s | 5.0 s |
 | chr21 FASTA, 47.5 MB, 6.6 Mb of `N`   | 27.8 s | **1.04 s** | 283.5 s | 5.2 s |
+| same, via `build_in_memory_sample_sort` | 3.41 s | **1.18 s** | 34.5 s | 7.2 s |
+
+Peak RSS on the 80 MB input is 2.21 GB, down from 2.83 GB, because the
+seed is an MSD counting sort that recomputes keys from the text rather
+than materialising a key array.
 
 Note the two inputs are different problems; benchmarking one
 implementation on the first and another on the second is not a
@@ -185,9 +190,27 @@ An implementation that delegates `lim_at` to `PlainText` but overrides
 ordering is the motivating example — inherits `None` and keeps today's
 semantics without changing a line.
 
-Everything else (`*_for_positions`, `build_in_memory_sample_sort`,
-`build_ext_mem`, segmented texts, wider symbols) runs on the CaPS-SA
-merge kernel exactly as before.
+Given those, the fast path also covers two cases beyond a plain whole-text
+build:
+
+- **`*_for_positions` subsets.** Doubling cannot be restricted to a subset
+  directly, since a round compares `rank[p + d]` and that successor is
+  generally outside the subset, so ranks must exist for every text
+  position. The full array is built and filtered in one `O(n)` pass
+  instead. Below one eighth of the text this declines and the merge kernel
+  runs, since building and discarding a whole array would cost more than
+  sorting a small subset. That ratio is a performance heuristic, not a
+  correctness condition. Duplicate or out-of-range positions also decline,
+  because the output is a permutation of the input *multiset* and a
+  membership filter cannot reproduce that.
+- **`build_in_memory_sample_sort`.** This path exists to sort in RAM, so
+  where doubling applies it is strictly better: same output, no bucket
+  machinery, none of the scan cost.
+
+`build_ext_mem` deliberately stays on the merge kernel. Its purpose is to
+bound peak memory, and routing it through an in-memory algorithm would
+defeat exactly that, so it keeps the scan cost on repeat-heavy input.
+Segmented texts and symbols wider than `u8` also stay on the merge kernel.
 
 ## Algorithm
 
