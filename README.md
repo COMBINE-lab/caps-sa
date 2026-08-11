@@ -47,8 +47,8 @@ the merge kernel's and independently verified:
 
 | input | before | after | CPU before | CPU after |
 | ----- | ------ | ----- | ---------- | --------- |
-| chr21 fwd ++ revcomp, ASCII `ACGT`, 80 MB | 6.08 s | **0.76 s** | 28.1 s | 5.0 s |
-| same, pre-coded to `0..3`, 80 MB | 6.08 s | **0.73 s** | 28.1 s | 5.0 s |
+| chr21 fwd ++ revcomp, ASCII `ACGT`, 80 MB | 6.08 s | **0.61 s** | 28.1 s | 5.0 s |
+| same, pre-coded to `0..3`, 80 MB | 6.08 s | **0.57 s** | 28.1 s | 5.0 s |
 | chr21 FASTA, 47.5 MB, 6.6 Mb of `N`   | 27.8 s | **1.04 s** | 283.5 s | 5.2 s |
 | same, via `build_in_memory_sample_sort` | 3.41 s | **1.18 s** | 34.5 s | 7.2 s |
 
@@ -60,7 +60,7 @@ The two DNA rows above land in the same place because the alphabet is
 ranked to a dense code range before packing. Without that step the ASCII
 row would use 8-bit fields — its largest byte is `'T'` (84) even though
 it has four symbols — fitting 8 symbols per key instead of 32, and would
-take 1.40 s rather than 0.76 s. Keys are then built by a SWAR gather
+take 1.40 s rather than 0.61 s. Keys are then built by a SWAR gather
 over the ranked text, so eight symbols cost three shift-or-mask pairs
 instead of eight dependent shift-or-lookup steps.
 
