@@ -15,8 +15,54 @@ streams the SA out as positions are emitted.
 ## Status
 
 Both the in-memory and external-memory paths are implemented, tested,
-and benchmarked. 43 unit tests pass and the SA output is differentially
-verified against a brute-force reference on small and random inputs.
+and benchmarked. 73 unit tests pass and the SA output is differentially
+verified against a brute-force reference on small and random inputs, and
+against [`verify_sa`](#verifying-a-suffix-array) at genome scale.
+
+### In-memory fast path
+
+`build_in_memory` on a byte text routes through a **radix-seeded prefix
+doubling** algorithm rather than the merge kernel. The merge kernel is
+still the general path and still backs everything else; the fast path is
+taken only when the comparator is provably plain lexicographic (see
+[Choosing a path](#choosing-a-path)).
+
+The reason is that a comparison-based suffix sort pays twice on real
+genomic input. It performs `n log n` merge steps, and every tied step
+scans the shared prefix of two suffixes from the beginning. Genome FASTA
+carries megabyte-scale runs of `N` — period-61 once 60-column line
+wrapping is included — so a single comparison can scan millions of
+bytes. Measured on chr21 that drives the cost per merge step from 13 ns
+to 222 ns, a 16x penalty that is entirely scan time.
+
+The fast path sorts by a packed fixed-depth key, then resolves what
+remains by doubling on ranks. The packing picks the narrowest field
+width that holds the alphabet, so DNA over `{0,1,2,3}` resolves 32
+symbols per key rather than the 8 a raw byte key gives. After the seed,
+no comparison reads the text again, so a megabyte-long run of `N` costs
+exactly what random DNA costs.
+
+Apple M4 Max (12 P-cores), 12 threads, suffix arrays byte-identical to
+the merge kernel's and independently verified:
+
+| input | before | after | CPU before | CPU after |
+| ----- | ------ | ----- | ---------- | --------- |
+| chr21 fwd ++ revcomp, `N`-free, 80 MB | 6.08 s | **0.89 s** | 28.1 s | 5.0 s |
+| chr21 FASTA, 47.5 MB, 6.6 Mb of `N`   | 27.8 s | **1.04 s** | 283.5 s | 5.2 s |
+
+Note the two inputs are different problems; benchmarking one
+implementation on the first and another on the second is not a
+comparison. `bench/chr21.sh` prepares both.
+
+### External memory
+
+On the human genome (GRCh38, 32 threads on AMD EPYC 9575F), caps-sa is
+**7% faster than upstream CaPS-SA's ext-mem path** and uses **23% less
+RAM**, while beating upstream's in-mem wall time by 3% at 1/10 of the
+RAM. See [`bench/README.md`](bench/README.md) for the full methodology
+and the optimisation ladder that got us there. Those paths still use the
+merge kernel, so they retain the scan cost described above on
+repeat-heavy input.
 
 On the human genome (GRCh38, 32 threads on AMD EPYC 9575F), caps-sa is
 **7% faster than upstream CaPS-SA's ext-mem path** and uses **23% less
@@ -85,6 +131,49 @@ build_ext_mem_for_positions(&text, positions, &opts, |sa_pos| {
     Ok(())
 })?;
 ```
+
+### Verifying a suffix array
+
+`verify_sa` checks a candidate in `O(n)` without re-running any
+construction algorithm and without depending on LCP length, so it stays
+usable on the repetitive inputs that are hardest to trust:
+
+```rust
+use caps_sa::{build_in_memory, verify_sa};
+
+let text = b"banana";
+let sa: Vec<u32> = build_in_memory(text);
+assert!(verify_sa(text, &sa).is_ok());
+```
+
+It inverts `sa` to get ranks, then checks that
+`(text[p], rank[p + 1])` increases strictly along it, with `rank[n]`
+treated as smaller than every real rank. A permutation of `0..n`
+satisfies that condition exactly when it is the suffix array. The bench
+CLI exposes it as `--verify`.
+
+## Choosing a path
+
+`build_in_memory` takes the radix-seeded doubling fast path only when
+the requested comparator is provably the plain lexicographic one. All
+three conditions are soundness requirements, and each defaults to
+declining:
+
+| Condition | Why |
+| --------- | --- |
+| `Opts::max_context` unbounded | A finite bound makes the merge comparator fall through to `LimitProvider::boundary_order`, which compares *lengths*, so it is not lexicographic. |
+| `LimitProvider::plain_lex_len()` reports the full text | Rules out `SegmentedText`, whose scans stop at segment boundaries, and any custom `boundary_order`. |
+| symbol type is exactly `u8` | Packing wider symbols into an order-preserving key is endianness-dependent: on a little-endian host `0x0100 > 0x0001` as `u16` values, but their byte views compare the other way. |
+
+`plain_lex_len` is a new `LimitProvider` method that defaults to `None`.
+An implementation that delegates `lim_at` to `PlainText` but overrides
+`boundary_order` for a different convention — STAR's spacer-as-largest
+ordering is the motivating example — inherits `None` and keeps today's
+semantics without changing a line.
+
+Everything else (`*_for_positions`, `build_in_memory_sample_sort`,
+`build_ext_mem`, segmented texts, wider symbols) runs on the CaPS-SA
+merge kernel exactly as before.
 
 ## Algorithm
 
