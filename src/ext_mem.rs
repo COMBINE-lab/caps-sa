@@ -388,8 +388,8 @@ where
 /// bytes — ~770 MB on the human genome, vs the ~50 GB the equivalent
 /// `Vec<u64>` would take). Phase 1's per-subarray fill is then driven
 /// by popcount-walking the bitmap; the predicate is **never invoked
-/// again** after the initial build. See [`FilteredSource`] for the
-/// memory accounting and the inner loop.
+/// again** after the initial build. See the crate-internal
+/// `FilteredSource` for the memory accounting and the inner loop.
 ///
 /// Use this entry when the caller already has the text in RAM and
 /// the kept positions are described by a cheap per-position
