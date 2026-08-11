@@ -37,6 +37,36 @@ use crate::runs::Cmp;
 use rayon::join;
 use rayon::prelude::*;
 
+/// How many merge steps ahead the text prefetch runs. Large enough to cover a
+/// DRAM round trip at the merge's step rate, small enough that the prefetched
+/// line is still resident when the step that needs it arrives.
+const PREFETCH_DISTANCE: usize = 8;
+
+/// Hint the CPU to start pulling `text[at]` into cache.
+///
+/// A no-op on targets without a stable prefetch intrinsic, and harmless when
+/// `at` is out of bounds: the address is never dereferenced, only used as a
+/// prefetch operand, and prefetch instructions on both supported targets
+/// ignore faulting addresses.
+#[inline(always)]
+fn prefetch_symbol<S>(text: &[S], at: usize) {
+    let _ = (text, at);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(
+            text.as_ptr().add(at.min(text.len())) as *const i8,
+            std::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // `core::arch::aarch64::_prefetch` is still unstable, so emit the
+        // instruction directly. `prfm` never faults.
+        let p = text.as_ptr().add(at.min(text.len()));
+        std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
+
 /// Tunable options for SA construction.
 #[derive(Clone, Debug)]
 pub struct Opts {
@@ -408,6 +438,26 @@ pub(crate) fn merge<S, I, L>(
     let mut lim_b_cache: Option<(usize, usize)> = None;
 
     while i_a < len_a && i_b < len_b {
+        // The tied branch below dereferences the text at two *random*
+        // addresses, and the address for step `i + 1` is not known until step
+        // `i` retires, so there is no memory-level parallelism to exploit and
+        // the hardware prefetcher cannot see the pattern either. But the
+        // candidate positions themselves live in `arr_a` / `arr_b`, which are
+        // sequential and already in cache, so the addresses a few steps ahead
+        // *are* known. Issue them now.
+        //
+        // This is not the prefetch that was tried and reverted in `lcp.rs`:
+        // that one sat inside the strided scan loop, which the hardware
+        // prefetcher already covers. Here the access is random, which is the
+        // case hardware cannot predict. `m` is the current boundary LCP and a
+        // good estimate of where the next scans will start.
+        if i_a + PREFETCH_DISTANCE < len_a {
+            prefetch_symbol(text, arr_a[i_a + PREFETCH_DISTANCE].to_usize() + m);
+        }
+        if i_b + PREFETCH_DISTANCE < len_b {
+            prefetch_symbol(text, arr_b[i_b + PREFETCH_DISTANCE].to_usize() + m);
+        }
+
         let l_a = lcp_a[i_a].to_usize();
 
         // (output_a, lcp_for_output, new_m)
