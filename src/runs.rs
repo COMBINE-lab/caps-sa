@@ -232,6 +232,16 @@ impl<'a> Cmp<'a> {
         Self { dispatch, runs }
     }
 
+    /// Whether the text contains long periodic repeats.
+    ///
+    /// Callers use this to decide whether a fixed-depth key can be expected
+    /// to resolve most suffixes: a long run is precisely a stretch where it
+    /// cannot, because every suffix inside it shares the whole key.
+    #[inline]
+    pub(crate) fn has_long_runs(&self) -> bool {
+        !self.runs.is_empty()
+    }
+
     /// LCP of `text[p..]` and `text[q..]` in symbols, bounded by `max_ctx`,
     /// using run structure to jump over long periodic stretches.
     ///

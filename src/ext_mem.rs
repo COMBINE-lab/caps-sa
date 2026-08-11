@@ -588,6 +588,7 @@ where
         opts.ordered_phase4_emit,
         &mut emit,
         cmp,
+        seed_params,
     );
     profile_log(&format!(
         "phase4 (merge+emit)          {:.3}s",
@@ -665,6 +666,7 @@ where
         opts.ordered_phase4_emit,
         &mut emit,
         cmp,
+        seed_params,
     )
 }
 
@@ -1492,6 +1494,7 @@ where
 /// subarrays the per-partition size is `≈ n / p`, so this stays
 /// proportional to `n / 4 = 0.25 n` even at the peak — well below the
 /// in-memory path's `~4 n` working set.
+#[allow(clippy::too_many_arguments)] // buckets + text + lp + ctx + emit + cmp + seed + flag
 fn phase4_merge_and_emit<S, I, L, B, E, F>(
     text: &[S],
     lp: &L,
@@ -1500,6 +1503,7 @@ fn phase4_merge_and_emit<S, I, L, B, E, F>(
     ordered_emit: bool,
     emit: &mut F,
     cmp: Cmp<'_>,
+    seed_params: Option<(u32, usize)>,
 ) -> Result<(), BuildError<E>>
 where
     S: Symbol,
@@ -1551,6 +1555,7 @@ where
                 max_ctx,
                 emit,
                 cmp,
+                seed_params,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1586,7 +1591,15 @@ where
                         .par_iter_mut()
                         .map(|bucket| {
                             merge_one_partition(
-                                text, lp, bucket, max_ctx, cmp, profile, load_ref, merge_ref,
+                                text,
+                                lp,
+                                bucket,
+                                max_ctx,
+                                cmp,
+                                seed_params,
+                                profile,
+                                load_ref,
+                                merge_ref,
                             )
                         })
                         .collect();
@@ -1631,6 +1644,7 @@ fn phase4_merge_chunk_ordered_emit<S, I, L, B, E, F>(
     max_ctx: usize,
     emit: &mut F,
     cmp: Cmp<'_>,
+    seed_params: Option<(u32, usize)>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1660,7 +1674,15 @@ where
                 .enumerate()
                 .for_each_with(tx, |tx, (local_idx, bucket)| {
                     let result = merge_one_partition(
-                        text, lp, bucket, max_ctx, cmp, profile, load_us, merge_us,
+                        text,
+                        lp,
+                        bucket,
+                        max_ctx,
+                        cmp,
+                        seed_params,
+                        profile,
+                        load_us,
+                        merge_us,
                     );
                     let _ = tx.send((local_idx, result));
                 });
@@ -1718,6 +1740,7 @@ fn merge_one_partition<S, I, L, B>(
     bucket: &mut B,
     max_ctx: usize,
     cmp: Cmp<'_>,
+    seed_params: Option<(u32, usize)>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1742,8 +1765,55 @@ where
     }
 
     let t = Instant::now();
-    let workspace = CascadeWorkspace::<I>::new();
-    let result = workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, cmp);
+    // A partition arrives as `p` sorted sub-subarrays, and the cascade merges
+    // them pairwise in `log2(p)` levels, each a full pass with LCP-enhanced
+    // comparisons. That was the single largest cost in the whole ext-mem
+    // build (15.4 CPU-seconds of a 15.1-second run on 80 MB of DNA).
+    //
+    // When the comparator allows a packed key, throwing the existing
+    // sortedness away and re-sorting the partition outright is dramatically
+    // cheaper: one key sort resolves the leading `k` symbols with no text
+    // access, and only suffixes agreeing through all of them need the merge
+    // kernel. `log2(p)` passes collapse into one.
+    //
+    // Only when the text has no long periodic runs, though. A run is exactly
+    // a stretch where a fixed-depth key resolves nothing, since every suffix
+    // inside it shares the whole key, so the re-sort would hand the merge
+    // kernel one enormous tied group and lose the ordering phase 1 had
+    // already established. Measured on chr21 FASTA (6.6 Mb of `N`) the
+    // unconditional version was 2.23 s against the cascade's 1.45 s, while on
+    // run-free DNA it is 1.65 s against 1.95 s. So: key re-sort when the run
+    // table is empty, cascade otherwise.
+    let result = match seed_params {
+        Some(_)
+            if lp.plain_lex_len() == Some(text.len())
+                && max_ctx == usize::MAX
+                && !cmp.has_long_runs() =>
+        {
+            let mut sa: Vec<I> = records.iter().map(|r| r.pos).collect();
+            let len = sa.len();
+            let mut lcp = vec![I::zero(); len];
+            let mut sa_w = vec![I::zero(); len];
+            let mut lcp_w = vec![I::zero(); len];
+            let seeded = crate::radix::seed_subarray(
+                text,
+                lp,
+                seed_params,
+                &mut sa,
+                &mut lcp,
+                &mut sa_w,
+                &mut lcp_w,
+                max_ctx,
+                cmp,
+            );
+            debug_assert!(seeded, "guards agreed but seed_subarray declined");
+            sa
+        }
+        _ => {
+            let workspace = CascadeWorkspace::<I>::new();
+            workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, cmp)
+        }
+    };
     if profile {
         merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
     }
