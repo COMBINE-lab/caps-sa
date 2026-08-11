@@ -121,9 +121,56 @@ where
     I: Index,
     L: LimitProvider,
 {
+    if let Some(sa) = try_doubling_fast_path::<S, I, L>(text, lp, opts) {
+        return sa;
+    }
     let n = text.len();
     let positions: Vec<I> = (0..n).map(I::from_usize).collect();
     build_in_memory_for_positions_with(text, positions, lp, opts)
+}
+
+/// Route a whole-text byte build through [`crate::radix`]'s radix-seeded
+/// prefix doubling, which is dramatically faster on real genomic input, or
+/// return `None` to fall back to the CaPS-SA merge kernel.
+///
+/// Every condition below is a soundness requirement, not a heuristic. The
+/// doubling path implements exactly one comparator — plain lexicographic over
+/// bytes with shorter-is-smaller and no context bound — so anything that can
+/// change the comparator has to decline.
+///
+/// * `max_context` must be unbounded. With a finite bound the merge's
+///   comparator stops being lexicographic: once a scan hits the cap it falls
+///   through to [`LimitProvider::boundary_order`], which compares *lengths*.
+/// * `lp` must report [`plain_lex_len`][LimitProvider::plain_lex_len]. That
+///   rules out `SegmentedText`, whose LCP scans stop at segment boundaries,
+///   and any custom `boundary_order` such as STAR's spacer-as-largest.
+/// * `S` must be exactly `u8`. Wider symbols are excluded because packing
+///   them into an order-preserving key is endianness-dependent: for `u16` on
+///   a little-endian host, `0x0100 > 0x0001` as values but their byte views
+///   compare the other way. The rest of the crate is immune to this only
+///   because [`LcpDispatch`] resolves *equality* over bytes and recovers
+///   ordering through `S: Ord`.
+fn try_doubling_fast_path<S, I, L>(text: &[S], lp: &L, opts: &Opts) -> Option<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    if opts.max_context != usize::MAX {
+        return None;
+    }
+    if lp.plain_lex_len() != Some(text.len()) {
+        return None;
+    }
+    if std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>() {
+        return None;
+    }
+    // SAFETY: `S` is `u8` (just checked by `TypeId`, and `Symbol: 'static`
+    // so the comparison is exact), hence `&[S]` and `&[u8]` have identical
+    // layout, length and validity.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
+    Some(crate::radix::build_sa(bytes))
 }
 
 /// Sort the caller-supplied `positions` by the lexicographic order of

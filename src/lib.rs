@@ -22,6 +22,7 @@ mod ext_mem;
 mod lcp;
 mod lcp_memo;
 mod limits;
+mod radix;
 mod sample_sort;
 
 pub use ext_mem::{
