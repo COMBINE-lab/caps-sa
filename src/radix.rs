@@ -368,6 +368,10 @@ fn p_as<I: Index>(p: usize) -> I {
     I::from_usize(p)
 }
 
+/// Largest tied group whose key vector is built on the stack. Groups average
+/// about four elements, so nearly every one avoids the allocator entirely.
+const DOUBLING_STACK_GROUP: usize = 32;
+
 /// Bits of the key used for the MSD counting-sort pass, and the resulting
 /// bucket count.
 ///
@@ -597,34 +601,59 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     let mut next_rank: Vec<I> = vec![I::zero(); n];
 
     while !groups.is_empty() {
+        let round_t = Instant::now();
         // Phase A: sort each tied group by the successor rank, and record the
         // ranks it should get. Groups are disjoint `sa` ranges, so this is
         // data-parallel with no synchronisation.
-        let sub: Vec<Vec<(usize, usize)>> = split_disjoint(&mut sa, &mut next_rank, &groups)
-            .into_par_iter()
-            .zip(groups.par_iter())
-            .map(|((sa_g, nr_g), &(start, _))| {
+        // Groups average about four elements, and there are millions of them
+        // per round, so the two things that dominated here were not the sort
+        // or the rank probes but the bookkeeping around them: one heap
+        // allocation per group for the key vector, and a sequential
+        // `split_at_mut` chain to hand each group its sub-slices.
+        //
+        // Both go. `Scatter` already encodes "disjoint ranges, one owner
+        // each", which is exactly the property the groups have, so each group
+        // takes its own sub-slices directly with no sequential prepass. And a
+        // group that fits the stack buffer never touches the allocator.
+        let sa_cell = Scatter::new(&mut sa);
+        let nr_cell = Scatter::new(&mut next_rank);
+        let rank_ref = &rank;
+        let sub: Vec<(usize, usize)> = groups
+            .par_iter()
+            .flat_map_iter(|&(start, end)| {
+                let len = end - start;
+                // SAFETY: `groups` are disjoint, sorted `sa` ranges, so this
+                // group is the sole owner of `start..end` in both arrays.
+                let (sa_g, nr_g) =
+                    unsafe { (sa_cell.slice_mut(start, len), nr_cell.slice_mut(start, len)) };
                 let succ = |p: usize| -> u64 {
                     // End-of-text sorts first: the shorter suffix is smaller.
                     match p.checked_add(depth) {
-                        Some(q) if q < n => rank[q].to_usize() as u64 + 1,
+                        Some(q) if q < n => rank_ref[q].to_usize() as u64 + 1,
                         _ => 0,
                     }
                 };
-                // Materialise the successor ranks once. `sort_unstable_by_key`
-                // re-evaluates its key function O(len log len) times, and each
-                // evaluation is a random probe into `rank`; paying for it once
-                // per element turns the sort's memory traffic sequential.
-                let mut keyed: Vec<(u64, I)> =
-                    sa_g.iter().map(|&e| (succ(e.to_usize()), e)).collect();
+
+                let mut stack = [(0u64, I::zero()); DOUBLING_STACK_GROUP];
+                let mut heap: Vec<(u64, I)>;
+                let keyed: &mut [(u64, I)] = if len <= DOUBLING_STACK_GROUP {
+                    let slot = &mut stack[..len];
+                    for (dst, &e) in slot.iter_mut().zip(sa_g.iter()) {
+                        *dst = (succ(e.to_usize()), e);
+                    }
+                    slot
+                } else {
+                    heap = sa_g.iter().map(|&e| (succ(e.to_usize()), e)).collect();
+                    &mut heap
+                };
                 keyed.sort_unstable();
 
                 let mut fresh = Vec::new();
                 let mut i = 0;
-                while i < keyed.len() {
+                while i < len {
                     let key = keyed[i].0;
                     let mut j = i + 1;
-                    while j < keyed.len() && keyed[j].0 == key {
+                    while j < len && keyed[j].0 == key {
                         j += 1;
                     }
                     let g = I::from_usize(start + i);
@@ -656,7 +685,8 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         });
 
         let before: usize = groups.iter().map(|&(s, e)| e - s).sum();
-        groups = sub.into_iter().flatten().collect();
+        let n_groups = groups.len();
+        groups = sub;
         let after: usize = groups.iter().map(|&(s, e)| e - s).sum();
 
         // A doubling round can only ever refine, so `after <= before`. If a
@@ -665,6 +695,12 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         // `depth` grows geometrically and every suffix eventually runs off
         // the end of the text, which the sentinel orders. Guard against
         // overflow rather than against non-progress.
+        profile_log(&format!(
+            "  doubling round depth={depth}: {before} tied in {} groups              (avg {:.1}) -> {after} tied, {:.3}s",
+            n_groups,
+            before as f64 / n_groups.max(1) as f64,
+            round_t.elapsed().as_secs_f64()
+        ));
         debug_assert!(after <= before);
         match depth.checked_mul(2) {
             Some(d) if d <= n.saturating_mul(2) => depth = d,
@@ -708,6 +744,18 @@ impl<T> Scatter<T> {
         }
     }
 
+    /// Borrow `len` elements starting at `index` mutably.
+    ///
+    /// # Safety
+    ///
+    /// No other live borrow may overlap `index..index + len`, and the borrow
+    /// the `Scatter` was built from must still be live.
+    #[inline]
+    unsafe fn slice_mut<'a>(&self, index: usize, len: usize) -> &'a mut [T] {
+        debug_assert!(index + len <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(index), len) }
+    }
+
     /// Write `value` at `index`.
     ///
     /// # Safety
@@ -719,35 +767,6 @@ impl<T> Scatter<T> {
         debug_assert!(index < self.len);
         unsafe { self.ptr.add(index).write(value) };
     }
-}
-
-/// Borrow each `(start, end)` range of `sa` and `next_rank` mutably and
-/// simultaneously. The ranges come from a scan of `sa` so they are sorted and
-/// non-overlapping, which is what makes the repeated `split_at_mut` sound.
-fn split_disjoint<'a, I: Index>(
-    sa: &'a mut [I],
-    next_rank: &'a mut [I],
-    groups: &[(usize, usize)],
-) -> Vec<(&'a mut [I], &'a mut [I])> {
-    let mut out = Vec::with_capacity(groups.len());
-    let mut sa_rest = sa;
-    let mut nr_rest = next_rank;
-    let mut consumed = 0usize;
-    for &(start, end) in groups {
-        debug_assert!(
-            start >= consumed,
-            "group ranges must be sorted and disjoint"
-        );
-        let (_, sa_tail) = sa_rest.split_at_mut(start - consumed);
-        let (_, nr_tail) = nr_rest.split_at_mut(start - consumed);
-        let (sa_g, sa_tail) = sa_tail.split_at_mut(end - start);
-        let (nr_g, nr_tail) = nr_tail.split_at_mut(end - start);
-        out.push((sa_g, nr_g));
-        sa_rest = sa_tail;
-        nr_rest = nr_tail;
-        consumed = end;
-    }
-    out
 }
 
 #[cfg(test)]
