@@ -1540,15 +1540,14 @@ where
     let merge_us = AtomicU64::new(0);
     let mut emit_secs: f64 = 0.0;
 
-    let mut start = 0;
-    while start < n_partitions {
-        let end = (start + chunk_size).min(n_partitions);
-        let chunk = &mut partition_buckets[start..end];
-        if ordered_emit {
+    if ordered_emit {
+        let mut start = 0;
+        while start < n_partitions {
+            let end = (start + chunk_size).min(n_partitions);
             phase4_merge_chunk_ordered_emit(
                 text,
                 lp,
-                chunk,
+                &mut partition_buckets[start..end],
                 max_ctx,
                 emit,
                 cmp,
@@ -1557,21 +1556,61 @@ where
                 &merge_us,
                 &mut emit_secs,
             )?;
-        } else {
-            phase4_merge_chunk_collect_emit(
-                text,
-                lp,
-                chunk,
-                max_ctx,
-                emit,
-                cmp,
-                profile,
-                &load_us,
-                &merge_us,
-                &mut emit_secs,
-            )?;
+            start = end;
         }
-        start = end;
+    } else {
+        // Emitting is `Θ(n)` and single-threaded by construction: the caller's
+        // closure is `FnMut` and its ordering is the whole point. Previously
+        // it also did not overlap anything, so every worker sat idle once per
+        // chunk while the main thread drained the merged results.
+        //
+        // Pipeline it instead. A scoped producer merges chunk `c + 1` (itself
+        // rayon-parallel) while the main thread emits chunk `c`. A bound of
+        // one keeps at most two chunks resident, so the transient cost is one
+        // extra chunk of merged positions rather than the unbounded queue an
+        // unsynchronised producer would build.
+        //
+        // This is not the `ordered_phase4_emit` path, which coordinates at
+        // *partition* granularity through a `BTreeMap` and measured slower.
+        // Here the producer emits whole chunks already in order, so the
+        // consumer just drains them.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Vec<Vec<I>>>>(1);
+        let load_ref = &load_us;
+        let merge_ref = &merge_us;
+        std::thread::scope(|scope| -> Result<(), BuildError<E>> {
+            scope.spawn(move || {
+                let mut start = 0;
+                while start < n_partitions {
+                    let end = (start + chunk_size).min(n_partitions);
+                    let merged: io::Result<Vec<Vec<I>>> = partition_buckets[start..end]
+                        .par_iter_mut()
+                        .map(|bucket| {
+                            merge_one_partition(
+                                text, lp, bucket, max_ctx, cmp, profile, load_ref, merge_ref,
+                            )
+                        })
+                        .collect();
+                    let failed = merged.is_err();
+                    if tx.send(merged).is_err() || failed {
+                        return;
+                    }
+                    start = end;
+                }
+            });
+
+            for merged in rx {
+                let t = Instant::now();
+                for positions in merged? {
+                    for pos in positions {
+                        emit(pos.to_usize() as u64).map_err(BuildError::Emit)?;
+                    }
+                }
+                if profile {
+                    emit_secs += t.elapsed().as_secs_f64();
+                }
+            }
+            Ok(())
+        })?;
     }
     if profile {
         profile_log(&format!(
@@ -1580,48 +1619,6 @@ where
             merge_us.load(AtomicOrdering::Relaxed) as f64 * 1e-6,
             emit_secs,
         ));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn phase4_merge_chunk_collect_emit<S, I, L, B, E, F>(
-    text: &[S],
-    lp: &L,
-    chunk: &mut [B],
-    max_ctx: usize,
-    emit: &mut F,
-    cmp: Cmp<'_>,
-    profile: bool,
-    load_us: &std::sync::atomic::AtomicU64,
-    merge_us: &std::sync::atomic::AtomicU64,
-    emit_secs: &mut f64,
-) -> Result<(), BuildError<E>>
-where
-    S: Symbol,
-    I: Index,
-    L: LimitProvider,
-    SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>> + Send,
-    F: FnMut(u64) -> Result<(), E>,
-{
-    // Default fast path: let rayon merge the whole chunk with minimal
-    // coordination, then emit the collected partition results in order.
-    let merged: Vec<Vec<I>> = chunk
-        .par_iter_mut()
-        .map(|bucket| -> io::Result<Vec<I>> {
-            merge_one_partition(text, lp, bucket, max_ctx, cmp, profile, load_us, merge_us)
-        })
-        .collect::<Result<Vec<_>, io::Error>>()?;
-
-    let t = Instant::now();
-    for positions in merged {
-        for pos in positions {
-            emit(pos.to_usize() as u64).map_err(BuildError::Emit)?;
-        }
-    }
-    if profile {
-        *emit_secs += t.elapsed().as_secs_f64();
     }
     Ok(())
 }
