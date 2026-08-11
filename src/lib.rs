@@ -20,6 +20,7 @@ mod ext_bucket;
 mod ext_mem;
 mod lcp;
 mod limits;
+mod runs;
 mod sample_sort;
 
 pub use ext_mem::{

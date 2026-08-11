@@ -42,6 +42,7 @@ use crate::ext_bucket::{
 };
 use crate::lcp::{LcpDispatch, Symbol};
 use crate::limits::{LimitProvider, PlainText};
+use crate::runs::Cmp;
 use crate::sample_sort;
 
 /// Emit a phase-timing line to stderr if `CAPS_SA_PROFILE` is set in
@@ -502,7 +503,8 @@ where
         return Ok(());
     }
     let p = effective_subproblem_count(n, opts.subproblem_count);
-    let dispatch = LcpDispatch::detect();
+    let runs = crate::runs::detect_for(text);
+    let cmp = Cmp::new(LcpDispatch::detect(), &runs);
     let work_dir = opts.work_dir.clone();
 
     // Pool the `2 × p` bucket files into one anonymous tempfile per
@@ -527,15 +529,8 @@ where
     let part_factory = |j: usize| phase3_pool.new_bucket::<SaLcp<I>>(j);
 
     let t = Instant::now();
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, L, _, _>(
-        text,
-        lp,
-        &source,
-        p,
-        opts,
-        dispatch,
-        sub_factory,
-    )?;
+    let (mut subarray_buckets, samples) =
+        phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, cmp, sub_factory)?;
     profile_log(&format!(
         "phase1 (sort+sample+spill) {:.3}s",
         t.elapsed().as_secs_f64()
@@ -551,7 +546,7 @@ where
     drop(source);
 
     let t = Instant::now();
-    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
+    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, cmp);
     profile_log(&format!(
         "phase2 (select pivots)      {:.3}s",
         t.elapsed().as_secs_f64()
@@ -565,7 +560,7 @@ where
         &pivots,
         p,
         opts,
-        dispatch,
+        cmp,
         part_factory,
     )?;
     profile_log(&format!(
@@ -583,7 +578,7 @@ where
         opts.max_context,
         opts.ordered_phase4_emit,
         &mut emit,
-        dispatch,
+        cmp,
     );
     profile_log(&format!(
         "phase4 (merge+emit)          {:.3}s",
@@ -622,16 +617,17 @@ where
         return Ok(());
     }
     let p = effective_subproblem_count(n, opts.subproblem_count);
-    let dispatch = LcpDispatch::detect();
+    let runs = crate::runs::detect_for(text);
+    let cmp = Cmp::new(LcpDispatch::detect(), &runs);
 
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
 
     let (mut subarray_buckets, samples) =
-        phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, dispatch, factory)?;
+        phase1_sort_sample_spill::<S, I, L, _, _>(text, lp, &source, p, opts, cmp, factory)?;
     // Same rationale as in `build_ext_mem_inner` — drop the source
     // as soon as phase 1's `fill_chunk` calls have stopped.
     drop(source);
-    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
+    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, cmp);
     let mut partition_buckets = phase3_distribute::<S, I, L, _, _>(
         text,
         lp,
@@ -639,7 +635,7 @@ where
         &pivots,
         p,
         opts,
-        dispatch,
+        cmp,
         factory,
     )?;
     drop(subarray_buckets);
@@ -650,7 +646,7 @@ where
         opts.max_context,
         opts.ordered_phase4_emit,
         &mut emit,
-        dispatch,
+        cmp,
     )
 }
 
@@ -1143,7 +1139,7 @@ fn phase1_sort_sample_spill<S, I, L, B, MkB>(
     source: &PositionSource<'_>,
     p: usize,
     opts: &ExtMemOpts,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
     mk_bucket: MkB,
 ) -> io::Result<(Vec<B>, Vec<I>)>
 where
@@ -1184,7 +1180,7 @@ where
                 &mut lcp_arr,
                 &mut lcp_w,
                 opts.max_context,
-                dispatch,
+                cmp,
             );
 
             // Pull `samples_per_subarray` evenly-spaced positions out of
@@ -1247,7 +1243,7 @@ fn phase2_select_pivots<S, I, L>(
     mut samples: Vec<I>,
     p: usize,
     max_ctx: usize,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
 ) -> Vec<I>
 where
     S: Symbol,
@@ -1269,7 +1265,7 @@ where
         &mut lcp,
         &mut lcp_w,
         max_ctx,
-        dispatch,
+        cmp,
     );
 
     // p-1 pivots at evenly-spaced ranks across the sorted sample pool.
@@ -1300,7 +1296,7 @@ fn phase3_distribute<S, I, L, B, MkB>(
     pivots: &[I],
     p: usize,
     opts: &ExtMemOpts,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
     mk_bucket: MkB,
 ) -> io::Result<Vec<B>>
 where
@@ -1333,7 +1329,7 @@ where
                     text,
                     lp,
                     opts.max_context,
-                    dispatch,
+                    cmp,
                 ));
             }
             splits.push(records.len());
@@ -1371,7 +1367,7 @@ fn upper_bound_by_pivot<S, I, L>(
     text: &[S],
     lp: &L,
     max_ctx: usize,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
 ) -> usize
 where
     S: Symbol,
@@ -1382,7 +1378,7 @@ where
     let mut hi = records.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        match dispatch.suffix_cmp_with(
+        match cmp.suffix_cmp_with(
             text,
             lp,
             records[mid].pos.to_usize(),
@@ -1419,7 +1415,7 @@ fn phase4_merge_and_emit<S, I, L, B, E, F>(
     max_ctx: usize,
     ordered_emit: bool,
     emit: &mut F,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
 ) -> Result<(), BuildError<E>>
 where
     S: Symbol,
@@ -1442,7 +1438,7 @@ where
     // GRCh38 / 32 t).
     //
     // Bumping the chunk to `4 × num_threads` gives rayon four
-    // partitions per thread to dispatch — fast threads can steal from
+    // partitions per thread to cmp — fast threads can steal from
     // slow neighbours, smoothing out the size variance. Peak RAM
     // grows linearly: each in-flight merged partition holds its
     // result `Vec<I>` (~3 MB at human-genome scale with `u32`
@@ -1471,7 +1467,7 @@ where
                 chunk,
                 max_ctx,
                 emit,
-                dispatch,
+                cmp,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1484,7 +1480,7 @@ where
                 chunk,
                 max_ctx,
                 emit,
-                dispatch,
+                cmp,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1511,7 +1507,7 @@ fn phase4_merge_chunk_collect_emit<S, I, L, B, E, F>(
     chunk: &mut [B],
     max_ctx: usize,
     emit: &mut F,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1530,9 +1526,7 @@ where
     let merged: Vec<Vec<I>> = chunk
         .par_iter_mut()
         .map(|bucket| -> io::Result<Vec<I>> {
-            merge_one_partition(
-                text, lp, bucket, max_ctx, dispatch, profile, load_us, merge_us,
-            )
+            merge_one_partition(text, lp, bucket, max_ctx, cmp, profile, load_us, merge_us)
         })
         .collect::<Result<Vec<_>, io::Error>>()?;
 
@@ -1555,7 +1549,7 @@ fn phase4_merge_chunk_ordered_emit<S, I, L, B, E, F>(
     chunk: &mut [B],
     max_ctx: usize,
     emit: &mut F,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1585,7 +1579,7 @@ where
                 .enumerate()
                 .for_each_with(tx, |tx, (local_idx, bucket)| {
                     let result = merge_one_partition(
-                        text, lp, bucket, max_ctx, dispatch, profile, load_us, merge_us,
+                        text, lp, bucket, max_ctx, cmp, profile, load_us, merge_us,
                     );
                     let _ = tx.send((local_idx, result));
                 });
@@ -1642,7 +1636,7 @@ fn merge_one_partition<S, I, L, B>(
     lp: &L,
     bucket: &mut B,
     max_ctx: usize,
-    dispatch: LcpDispatch,
+    cmp: Cmp<'_>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1668,7 +1662,7 @@ where
 
     let t = Instant::now();
     let workspace = CascadeWorkspace::<I>::new();
-    let result = workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch);
+    let result = workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, cmp);
     if profile {
         merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
     }
@@ -1725,7 +1719,7 @@ impl<I: Index> CascadeWorkspace<I> {
         records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
-        dispatch: LcpDispatch,
+        cmp: Cmp<'_>,
     ) -> Vec<I>
     where
         S: Symbol,
@@ -1753,7 +1747,7 @@ impl<I: Index> CascadeWorkspace<I> {
 
         let mut src_is_a = true;
         while run_lens.len() > 1 {
-            run_lens = self.merge_one_level(src_is_a, &run_lens, text, lp, max_ctx, dispatch);
+            run_lens = self.merge_one_level(src_is_a, &run_lens, text, lp, max_ctx, cmp);
             src_is_a = !src_is_a;
         }
 
@@ -1777,7 +1771,7 @@ impl<I: Index> CascadeWorkspace<I> {
         text: &[S],
         lp: &L,
         max_ctx: usize,
-        dispatch: LcpDispatch,
+        cmp: Cmp<'_>,
     ) -> Vec<usize>
     where
         S: Symbol,
@@ -1828,7 +1822,7 @@ impl<I: Index> CascadeWorkspace<I> {
                     &mut dst_sa[dst_off..dst_end],
                     &mut dst_lcp[dst_off..dst_end],
                     max_ctx,
-                    dispatch,
+                    cmp,
                 );
                 new_lens.push(l1 + l2);
                 src_off = xy_end;
