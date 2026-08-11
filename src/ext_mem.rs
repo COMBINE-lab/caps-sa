@@ -1090,9 +1090,37 @@ impl<'a> PositionSource<'a> {
 /// Target subarray size used by [`effective_subproblem_count`] when
 /// auto-picking `p`. Smaller means more (smaller) subarrays — lower
 /// per-task phase-1 scratch, at the cost of more phase-3 distribute
-/// work (which scales as `O(p² · log(n/p))`, sequentially) and a
-/// higher temp-file count.
-const PHASE1_TARGET_CHUNK: usize = 65_536;
+/// work (which scales as `O(p² · log(n/p))`) and a higher temp-file
+/// count.
+///
+/// Raised from 65 536 after measuring the trade-off directly. Total work
+/// is `n log n` either way, since a smaller `p` moves levels out of
+/// phase 4's per-partition cascade and into phase 1's merge sort, but
+/// the constants are not equal: phase 3 shrinks quadratically in `p`,
+/// and phase 4's cascade does one full pass over its partition per
+/// level. Peak RSS is set by phase 4 holding `4 × threads` partitions of
+/// `n / p` records at once, so it only starts growing once `p` is small
+/// enough for that product to rival the text itself.
+///
+/// Measured on chr21 forward ++ revcomp (80 MB), 12 threads:
+///
+/// ```text
+///   p     total     peak RSS
+///    48   2.58 s      987 MB
+///    96   2.49 s      538 MB
+///   306   2.85 s      282 MB
+///   612   2.80 s      202 MB     <- 131 072
+///  1224   3.05 s      205 MB     <- 65 536 (previous default)
+/// ```
+///
+/// 131 072 is the largest step that costs nothing in memory: same peak
+/// RSS as before, ~8% less wall time. Going further trades real memory
+/// for speed, which is the opposite of what this path is for, so it is
+/// left to the caller via `ExtMemOpts::subproblem_count`.
+///
+/// At genome scale this changes nothing: `PHASE1_MAX_PARTITIONS` already
+/// binds for any `n` above ~1 GB, so GRCh38 still gets `p = 8192`.
+const PHASE1_TARGET_CHUNK: usize = 131_072;
 /// Hard cap on the number of subarrays. Matches upstream CaPS-SA's
 /// default of 8192 — phase 3 is now parallelised across rayon
 /// workers (each subarray distributes independently into per-partition
