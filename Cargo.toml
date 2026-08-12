@@ -39,3 +39,7 @@ rand = "0.10"
 [[example]]
 name = "caps_sa"
 path = "examples/caps_sa.rs"
+
+[[example]]
+name = "gsj_bench"
+path = "examples/gsj_bench.rs"
