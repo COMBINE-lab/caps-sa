@@ -1,9 +1,14 @@
 name: CI
 
 on:
+  # Every branch, not just `main`. A pull request opened from a fork by a
+  # first-time contributor does not run workflows until a maintainer approves
+  # them, so `pull_request` alone leaves reviewers with no check runs to look
+  # at. Building on push means the contributor's own fork produces evidence
+  # that can be linked from the PR.
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

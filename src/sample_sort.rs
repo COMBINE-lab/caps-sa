@@ -465,7 +465,8 @@ mod tests {
         for i in 1..sa.len() {
             let want = naive_lcp(text, sa[i - 1] as usize, sa[i] as usize, max_ctx);
             assert_eq!(
-                lcp[i] as usize, want,
+                lcp[i] as usize,
+                want,
                 "lcp[{i}] wrong for sa[{}]={} vs sa[{i}]={} (text {text:?})",
                 i - 1,
                 sa[i - 1],
@@ -525,7 +526,10 @@ mod tests {
                 let (sa, lcp) = build_sa_and_lcp(&text, max_ctx);
                 for i in 1..sa.len() {
                     let want = naive_lcp(&text, sa[i - 1] as usize, sa[i] as usize, max_ctx);
-                    assert_eq!(lcp[i] as usize, want, "lcp[{i}] wrong with max_ctx={max_ctx}");
+                    assert_eq!(
+                        lcp[i] as usize, want,
+                        "lcp[{i}] wrong with max_ctx={max_ctx}"
+                    );
                 }
             }
         }
