@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  # Every branch, not just `main`. A pull request opened from a fork by a
+  # first-time contributor does not run workflows until a maintainer approves
+  # them, so `pull_request` alone leaves reviewers with no check runs to look
+  # at. Building on push means the contributor's own fork produces evidence
+  # that can be linked from the PR.
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is aarch64/NEON, Ubuntu is x86_64/AVX2. The LCP kernel and the
+        # pooled external-memory bucket path are the parts that differ per
+        # platform, so both need to run.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Debug catches the `debug_assert`s that guard the unchecked scatter in
+      # `radix.rs` and the buffer-length invariants in the merge kernel.
+      - name: Test (debug)
+        run: cargo test --all-targets
+      - name: Test (release)
+        run: cargo test --release --all-targets
+      - name: Doc tests
+        run: cargo test --doc
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the `rust-version` in Cargo.toml, which is set by the
+      # stabilised AVX-512 intrinsics the LCP fast path uses.
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

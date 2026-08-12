@@ -422,6 +422,119 @@ mod tests {
         assert_eq!(got, want, "mismatch on text {text:?}");
     }
 
+    /// Run the production kernel and return **both** the suffix array and
+    /// the LCP array it computes as a byproduct.
+    ///
+    /// The public entry points discard the LCP array, but it is not an
+    /// incidental artefact: the next merge level *consumes* it in the
+    /// three-case decision, so a single wrong LCP entry silently reorders
+    /// suffixes at the level above. It therefore needs direct coverage.
+    fn build_sa_and_lcp(text: &[u8], max_ctx: usize) -> (Vec<u32>, Vec<u32>) {
+        let n = text.len();
+        let mut sa: Vec<u32> = (0..n as u32).collect();
+        let mut sa_w = vec![0u32; n];
+        let mut lcp_arr = vec![0u32; n];
+        let mut lcp_w = vec![0u32; n];
+        merge_sort(
+            text,
+            &PlainText::new(n),
+            &mut sa,
+            &mut sa_w,
+            &mut lcp_arr,
+            &mut lcp_w,
+            max_ctx,
+            LcpDispatch::detect(),
+        );
+        (sa, lcp_arr)
+    }
+
+    /// Byte-at-a-time LCP of `text[a..]` and `text[b..]`, capped at `max_ctx`.
+    fn naive_lcp(text: &[u8], a: usize, b: usize, max_ctx: usize) -> usize {
+        let lim = (text.len() - a).min(text.len() - b).min(max_ctx);
+        (0..lim).take_while(|&i| text[a + i] == text[b + i]).count()
+    }
+
+    /// Assert the LCP-array postcondition stated on [`merge_sort`]:
+    /// `lcp[0] == 0` and `lcp[i] == lcp(text[sa[i-1]..], text[sa[i]..])`.
+    fn assert_lcp_valid(text: &[u8], max_ctx: usize) {
+        let (sa, lcp) = build_sa_and_lcp(text, max_ctx);
+        if sa.is_empty() {
+            return;
+        }
+        assert_eq!(lcp[0], 0, "lcp[0] must be 0 (text {text:?})");
+        for i in 1..sa.len() {
+            let want = naive_lcp(text, sa[i - 1] as usize, sa[i] as usize, max_ctx);
+            assert_eq!(
+                lcp[i] as usize,
+                want,
+                "lcp[{i}] wrong for sa[{}]={} vs sa[{i}]={} (text {text:?})",
+                i - 1,
+                sa[i - 1],
+                sa[i],
+            );
+        }
+    }
+
+    #[test]
+    fn lcp_array_matches_naive_on_fixtures() {
+        for text in [
+            b"banana".as_slice(),
+            b"mississippi",
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            b"abababababababababababababab",
+            b"a",
+            b"",
+        ] {
+            assert_lcp_valid(text, usize::MAX);
+        }
+    }
+
+    #[test]
+    fn lcp_array_matches_naive_on_random() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1CB0);
+        for &sigma in &[2u8, 4, 6, 255] {
+            for &n in &[2usize, 3, 7, 16, 17, 63, 64, 65, 200, 1000, 5000] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
+                assert_lcp_valid(&text, usize::MAX);
+            }
+        }
+    }
+
+    /// Long runs of one symbol are the worst case for the LCP invariant:
+    /// adjacent suffixes share almost everything, so every `lcp[i]` is
+    /// large and an off-by-one is easy to miss.
+    #[test]
+    fn lcp_array_on_long_runs_and_periodic_text() {
+        assert_lcp_valid(&vec![7u8; 2000], usize::MAX);
+        let periodic: Vec<u8> = (0..2000).map(|i| (i % 3) as u8).collect();
+        assert_lcp_valid(&periodic, usize::MAX);
+        // A run embedded in noise, the shape a poly-N genome block has.
+        let mut mixed: Vec<u8> = (0..500).map(|i| (i % 4) as u8).collect();
+        mixed.extend(std::iter::repeat_n(4u8, 1500));
+        mixed.extend((0..500).map(|i| (i % 4) as u8));
+        assert_lcp_valid(&mixed, usize::MAX);
+    }
+
+    #[test]
+    fn lcp_array_respects_max_context() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC7A);
+        for &max_ctx in &[1usize, 2, 4, 16] {
+            for &n in &[64usize, 500] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
+                let (sa, lcp) = build_sa_and_lcp(&text, max_ctx);
+                for i in 1..sa.len() {
+                    let want = naive_lcp(&text, sa[i - 1] as usize, sa[i] as usize, max_ctx);
+                    assert_eq!(
+                        lcp[i] as usize, want,
+                        "lcp[{i}] wrong with max_ctx={max_ctx}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn empty_text() {
         let sa: Vec<u32> = build_in_memory::<u8, u32>(&[]);
