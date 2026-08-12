@@ -731,6 +731,21 @@ mod tests {
         assert_eq!(got, brute(text), "mismatch on {text:?}");
     }
 
+    /// `Symbol` is implemented for `i8`, and a one-byte-wide check alone lets a
+    /// signed text through a packer that orders bytes as unsigned. `-1` has
+    /// byte `0xFF`, so it would sort above `1`, inverting the true order.
+    #[test]
+    fn signed_symbols_are_not_eligible_for_packing() {
+        let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
+        assert!(
+            seed_params(&text).is_none(),
+            "i8 texts must not get a packed key"
+        );
+        // u8 of the same width still qualifies.
+        let bytes: Vec<u8> = vec![1, 0, 1, 2, 3, 0];
+        assert!(seed_params(&bytes).is_some());
+    }
+
     #[test]
     fn fixtures() {
         check(b"");
