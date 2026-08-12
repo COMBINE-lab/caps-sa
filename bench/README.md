@@ -462,6 +462,46 @@ rank-only, so they cost a sort over a shrinking residual rather than a
 text scan, which is why the pathology disappears rather than merely
 shrinking.
 
+### Measuring the external-memory path reliably
+
+Wall times on the external-memory path drift by 30% or more between
+sessions on the same machine and the same commit, and the cause is
+mundane: each build streams several GB of bucket data through the page
+cache, so anything that has recently filled that cache makes the next
+build slower.
+
+This was diagnosed the hard way, after a phantom "regression" that
+bisected to a commit predating it. The actual sequence was that 32 GB of
+benchmark *output* files had accumulated in the working directory over a
+long session. Deleting them restored the original numbers immediately:
+
+```
+                        wall             user CPU
+  with 32 GB resident   20.5-21.1 s        —
+  after deleting them   15.8-17.5 s      154-166 s
+```
+
+The temp files themselves are not the problem and do not leak: the
+pooled buckets are anonymous and `$TMPDIR` measured 454 MB and 801
+entries both before and after a run.
+
+So, when measuring here:
+
+- **Write output to `/dev/null`** unless the run is specifically checking
+  correctness, and delete any output that is kept.
+- **Interleave A and B** rather than measuring all of A then all of B.
+  An interleaved three-pair comparison of the segmented-key change gave
+  20.5/21.0/21.1 s against 30.0/31.3/32.2 s — a ratio of 0.67 — on a
+  session where the absolute numbers were 30% above their clean-state
+  values. The ratio was right even though neither side's absolute number
+  was.
+- **Report CPU time alongside wall.** It is measured against the same
+  drift and makes an I/O-bound artefact visible as a wall/CPU divergence.
+- Treat a single reading as a hypothesis. Two figures in this file were
+  published from unreplicated single runs and both turned out wrong: a
+  claimed +54% RSS that replication showed to be flat, and an 11.4 s
+  phase-4 time that was 15-16 s on repetition.
+
 ### chr21 external memory — skipping long repeats
 
 Same machine and inputs as the section above. The external-memory path
