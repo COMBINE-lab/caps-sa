@@ -26,26 +26,36 @@
 //! comparison worth having: it shows what the same positions cost when the
 //! segmented comparator is not required.
 //!
-//! ## Measured, and the trade-off it exposes
+//! ## Measured
 //!
 //! Apple M4 Max, 12 threads, chr21 plus a 698,597-junction library
 //! (372,858,766 symbols, 1,397,196 segments, 320,856,244 retained ACGT-start
-//! positions) — the same segment count as a GENCODE v50 primary-assembly
-//! fixture:
+//! positions) — the same junction and segment counts as a GENCODE v50
+//! primary-assembly fixture. Three runs per configuration:
 //!
 //! ```text
 //!                          segmented keys off    segmented keys on
-//!   phase 1                      9.544 s              3.313 s
-//!   phase 4                     11.616 s             11.421 s
-//!   total                       22.718 s             16.256 s   -28%
-//!   peak RSS                     3.45 GB              5.33 GB   +54%
+//!   phase 1                      9.54 s               3.31 s
+//!   phase 4                     11.62 s              11.42 s
+//!   total                    23.5-24.0 s          15.8-16.2 s   -33%
+//!   peak RSS                  3.22-3.94 GB         3.21-3.23 GB
 //! ```
 //!
-//! Phase 1 is cut by 65%, but peak memory rises by half: the ranked text copy
-//! and the per-subarray key vectors are both proportional to the input. For a
-//! constructor whose argument against the alternatives is memory, that is not
-//! a trade to make unconditionally, which is why this wants a memory budget
-//! rather than a default. Recording it here so the number is not lost.
+//! Phase 1 drops by 65% at unchanged peak memory. An earlier single-run pair
+//! suggested a large RSS increase; replicating both sides showed that was one
+//! outlier measured against another, not a real cost.
+//!
+//! Partition-count sweep on the same fixture, which re-checks the 128 Ki
+//! target on a segmented workload rather than the plain one it was tuned on:
+//!
+//! ```text
+//!   p =  2845 (128 Ki target, current default)   15.26 s   3.22 GB
+//!   p =  5690 (64 Ki target, previous default)   19.09 s   3.71 GB
+//!   p = 11380                                    26.97 s   5.19 GB
+//! ```
+//!
+//! The target holds up here: the current default is both faster and smaller
+//! than the one it replaced, and the trend continues in the same direction.
 
 use std::cmp::Ordering;
 use std::env;
@@ -85,6 +95,7 @@ fn main() -> std::io::Result<()> {
     let mut threads: Option<usize> = None;
     let mut plain = false;
     let mut verify = false;
+    let mut subproblems: usize = 0;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -99,6 +110,12 @@ fn main() -> std::io::Result<()> {
             "--verify" => {
                 verify = true;
                 i += 1;
+            }
+            "--subproblem-count" => {
+                subproblems = argv[i + 1]
+                    .parse()
+                    .expect("--subproblem-count expects an integer");
+                i += 2;
             }
             _ => {
                 positional.push(argv[i].clone());
@@ -142,7 +159,10 @@ fn main() -> std::io::Result<()> {
         if plain { "plain" } else { "segmented+STAR" },
     );
 
-    let opts = ExtMemOpts::default();
+    let opts = ExtMemOpts {
+        subproblem_count: subproblems,
+        ..ExtMemOpts::default()
+    };
     let mut count = 0usize;
     let mut last = 0u64;
     let mut ordered = true;
