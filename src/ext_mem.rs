@@ -1440,15 +1440,10 @@ where
             // *upper bound* in the sorted subarray.
             let mut splits = Vec::with_capacity(p + 1);
             splits.push(0usize);
+            let mut from = 0usize;
             for &pivot in pivots {
-                splits.push(upper_bound_by_pivot(
-                    &records,
-                    pivot,
-                    text,
-                    lp,
-                    opts.max_context,
-                    cmp,
-                ));
+                from = upper_bound_from(&records, from, pivot, text, lp, opts.max_context, cmp);
+                splits.push(from);
             }
             splits.push(records.len());
 
@@ -1476,11 +1471,25 @@ where
         .collect())
 }
 
-/// Upper-bound binary search: returns the first index `i` such that the
-/// suffix at `records[i].pos` is **strictly greater than** the suffix at
-/// `pivot`.
-fn upper_bound_by_pivot<S, I, L>(
+/// Upper bound of `pivot` in `records`, searched forward from `from`.
+///
+/// Returns the first index at or after `from` whose suffix is strictly
+/// greater than `pivot`'s.
+///
+/// Phase 3 asks this `p` times per subarray, once per pivot, and the pivots
+/// are sorted, so the answers are non-decreasing. Searching the whole array
+/// each time wasted that: at `p = 612` over 131 K-record subarrays a plain
+/// binary search costs about 17 suffix comparisons per pivot regardless of how
+/// close the answer is to the previous one. Galloping from the previous split
+/// costs one comparison when the bracket is empty, which it usually is once
+/// `p` is large enough that consecutive pivots land within a few records of
+/// each other.
+///
+/// Each probe is a random access into `records` plus a suffix comparison, so
+/// the count is what matters here, not the constant.
+fn upper_bound_from<S, I, L>(
     records: &[SaLcp<I>],
+    from: usize,
     pivot: I,
     text: &[S],
     lp: &L,
@@ -1492,22 +1501,59 @@ where
     I: Index,
     L: LimitProvider,
 {
-    let mut lo = 0;
-    let mut hi = records.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        match cmp.suffix_cmp_with(
+    let n = records.len();
+    let greater = |i: usize| -> bool {
+        cmp.suffix_cmp_with(
             text,
             lp,
-            records[mid].pos.to_usize(),
+            records[i].pos.to_usize(),
             pivot.to_usize(),
             max_ctx,
-        ) {
-            Ordering::Greater => hi = mid,
-            Ordering::Equal | Ordering::Less => lo = mid + 1,
+        ) == Ordering::Greater
+    };
+
+    if from >= n {
+        return n;
+    }
+    // The common case: this pivot's split is the previous one.
+    if greater(from) {
+        return from;
+    }
+
+    // Gallop to bracket the answer, then bisect inside the bracket.
+    let mut lo = from;
+    let mut step = 1usize;
+    loop {
+        let probe = from + step;
+        if probe >= n {
+            break;
+        }
+        if greater(probe) {
+            let mut hi = probe;
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if greater(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return hi;
+        }
+        lo = probe;
+        step *= 2;
+    }
+    // Never greater within the array: bisect the tail.
+    let mut hi = n;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if greater(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
         }
     }
-    lo
+    hi
 }
 
 /// Phase 4 + 5: parallel-merge partitions in chunks of `num_threads`,
