@@ -117,11 +117,8 @@ the direct and memoized times were 4.035 and 4.045 seconds respectively. This
 is consistent with the existing periodic run-skipping optimization already
 capturing the dense special case cheaply.
 
-The focused result does not justify the roughly five-minute complete-GRCh38
-A/B: the prototype remains opt-in and is not proposed for default enablement.
-The interval invariant and table are nevertheless retained on this feature
-branch as a measured starting point for a future integration with phase 1 or a
-cheaper per-diagonal lookup scheme.
+At this stage, the focused result did not justify the roughly five-minute
+complete-GRCh38 A/B. The revised integration below supersedes that conclusion.
 
 ## Performance analysis and revised integration (2026-08-12)
 
@@ -202,8 +199,14 @@ ran as high as 13.166 seconds versus 12.737 seconds for the flat vector in a
 paired run; the inline version alternated between 12.754 versus 12.709 and
 12.759 versus 12.802. Its hardware-counter run retired 2.643 trillion
 instructions, about 15 billion more than the flat vector. Hashing and many
-small allocations outweigh the few saved comparisons. The flat vector remains
-the best production representation measured here.
+small allocations outweigh the few saved comparisons.
+
+Complete-GRCh38 runs reached the same conclusion at the larger table size. The
+inline hash took 269.224 and 270.377 seconds versus 270.063 seconds for the
+flat vector, i.e. no repeatable timing difference. Its measured peak RSS was
+10,542,468 KiB versus 9,879,268 KiB for the flat vector: a 648 MiB (6.7%)
+penalty. The flat vector remains the best production representation measured
+here.
 
 The next promising work is therefore not another general map. It is either a
 fixed-capacity, allocation-free per-diagonal cache (which must beat the flat
