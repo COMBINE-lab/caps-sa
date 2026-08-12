@@ -75,12 +75,36 @@ pub struct Opts {
     /// caller's text doesn't guarantee comparisons terminate via sentinels
     /// within a known window.
     pub max_context: usize,
+
+    /// Peak extra bytes `*_for_positions` may spend to sort a *subset* by
+    /// building the whole suffix array and filtering it.
+    ///
+    /// Prefix doubling cannot be restricted to a subset: a round compares
+    /// `rank[p + d]`, and that successor is generally outside the subset, so
+    /// ranks have to exist for every position in the text. Building the whole
+    /// array and filtering it in one `O(n)` pass sidesteps that, and is much
+    /// faster when the subset is a real fraction of the text — but it is a
+    /// resource decision, not a speed one: the arrays it needs are sized by
+    /// the *text*, not by the subset.
+    ///
+    /// `None`, the default, never makes that trade: subsets always take the
+    /// merge kernel, whose footprint stays proportional to the subset.
+    /// `Some(budget)` allows it when the estimated extra footprint fits, which
+    /// is `n * (3 * size_of::<I>() + 9)` bytes: three index-wide arrays for
+    /// the suffix array, the ranks and the round scratch, eight bytes of key
+    /// per position, and a one-byte membership flag.
+    ///
+    /// Set it from what the caller can actually spare. It was previously a
+    /// silent `subset >= text / 8` rule, which made a large allocation on the
+    /// caller's behalf without telling them.
+    pub subset_full_sa_budget: Option<usize>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
         Self {
             max_context: usize::MAX,
+            subset_full_sa_budget: None,
         }
     }
 }
@@ -183,13 +207,12 @@ where
 /// and filtering it sidesteps that, and the filter is a single `O(n)` pass
 /// because the full SA is already in the right order.
 ///
-/// Worth it when the subset is a decent fraction of the text, which is the
-/// case this API exists for (STAR-style indexing keeps every ACGT position and
-/// drops only spacers). For a small subset, `O(n)` to build the full array
-/// would dwarf the `O(m log m)` the merge kernel needs, so below one eighth of
-/// the text this declines and the merge kernel runs. That ratio is a
-/// performance heuristic, unlike the guards in [`try_doubling_fast_path`],
-/// which are correctness conditions.
+/// Gated on [`Opts::subset_full_sa_budget`], which defaults to `None` and so
+/// declines. The arrays this needs are sized by the *text*, not by the subset,
+/// so it is a resource decision the caller has to make: a small subset of a
+/// large text can cost far more this way than sorting it directly would. That
+/// is a budget, not a correctness condition — unlike the guards in
+/// [`try_doubling_fast_path`].
 ///
 /// Also declines on duplicate or out-of-range positions, which a
 /// membership filter cannot reproduce faithfully.
@@ -201,7 +224,14 @@ where
 {
     let n = text.len();
     let m = positions.len();
-    if m == 0 || m.checked_mul(8)? < n {
+    if m == 0 {
+        return None;
+    }
+    // Explicitly budgeted: the arrays below are sized by the text, not by the
+    // subset, so a small subset of a large text can cost far more than
+    // sorting it directly would.
+    let estimate = n.checked_mul(3 * size_of::<I>() + 9)?;
+    if estimate > opts.subset_full_sa_budget? {
         return None;
     }
     if opts.max_context != usize::MAX
@@ -801,6 +831,51 @@ mod tests {
         let text = b"banana";
         let positions: Vec<u32> = vec![0, 1, 99];
         let _ = build_in_memory_for_positions(text, positions);
+    }
+
+    /// The subset full-SA path is now opt-in through a byte budget. Check both
+    /// that it is correct when allowed, and that it is actually declined when
+    /// the budget is too small to cover its footprint.
+    #[test]
+    fn for_positions_budget_gates_the_full_sa_path() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xB0D6E7);
+        for &n in &[64usize, 500, 4000] {
+            let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..4u8)).collect();
+            let positions: Vec<u32> = (0..n as u32).filter(|p| p % 3 != 0).collect();
+            let mut want = positions.clone();
+            want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+
+            // Estimate the path advertises: n * (3 * 4 + 9) for `I = u32`.
+            let need = n * (3 * size_of::<u32>() + 9);
+
+            let generous = Opts {
+                subset_full_sa_budget: Some(need),
+                ..Opts::default()
+            };
+            assert_eq!(
+                build_in_memory_for_positions_with_opts(&text, positions.clone(), &generous),
+                want,
+                "budgeted path wrong at n={n}"
+            );
+
+            let tight = Opts {
+                subset_full_sa_budget: Some(need - 1),
+                ..Opts::default()
+            };
+            assert_eq!(
+                build_in_memory_for_positions_with_opts(&text, positions.clone(), &tight),
+                want,
+                "declined path wrong at n={n}"
+            );
+
+            // Default declines outright.
+            assert_eq!(
+                build_in_memory_for_positions(&text, positions.clone()),
+                want,
+                "default path wrong at n={n}"
+            );
+        }
     }
 
     #[test]
