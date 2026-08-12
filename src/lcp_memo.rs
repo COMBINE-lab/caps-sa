@@ -53,6 +53,13 @@ fn env_usize(name: &str, default: usize) -> usize {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MemoStats {
     pub(crate) tables: u64,
+    pub(crate) active_tables: u64,
+    pub(crate) tables_0_15: u64,
+    pub(crate) tables_16_31: u64,
+    pub(crate) tables_32_63: u64,
+    pub(crate) tables_64_127: u64,
+    pub(crate) tables_128_255: u64,
+    pub(crate) tables_256_plus: u64,
     pub(crate) calls: u64,
     pub(crate) cold_direct: u64,
     pub(crate) probe_resolved: u64,
@@ -67,11 +74,26 @@ pub(crate) struct MemoStats {
     pub(crate) skipped_matches: u64,
     pub(crate) final_entries: u64,
     pub(crate) max_entries: u64,
+    pub(crate) unique_diagonals: u64,
+    pub(crate) singleton_diagonals: u64,
+    pub(crate) max_entries_per_diagonal: u64,
+    pub(crate) lookup_steps: u64,
+    pub(crate) insert_steps: u64,
+    pub(crate) insert_shifts: u64,
+    pub(crate) gap_mismatches: u64,
+    pub(crate) gap_caps: u64,
 }
 
 impl MemoStats {
     pub(crate) fn add_assign(&mut self, other: Self) {
         self.tables = self.tables.saturating_add(other.tables);
+        self.active_tables = self.active_tables.saturating_add(other.active_tables);
+        self.tables_0_15 = self.tables_0_15.saturating_add(other.tables_0_15);
+        self.tables_16_31 = self.tables_16_31.saturating_add(other.tables_16_31);
+        self.tables_32_63 = self.tables_32_63.saturating_add(other.tables_32_63);
+        self.tables_64_127 = self.tables_64_127.saturating_add(other.tables_64_127);
+        self.tables_128_255 = self.tables_128_255.saturating_add(other.tables_128_255);
+        self.tables_256_plus = self.tables_256_plus.saturating_add(other.tables_256_plus);
         self.calls = self.calls.saturating_add(other.calls);
         self.cold_direct = self.cold_direct.saturating_add(other.cold_direct);
         self.probe_resolved = self.probe_resolved.saturating_add(other.probe_resolved);
@@ -86,6 +108,18 @@ impl MemoStats {
         self.skipped_matches = self.skipped_matches.saturating_add(other.skipped_matches);
         self.final_entries = self.final_entries.saturating_add(other.final_entries);
         self.max_entries = self.max_entries.max(other.max_entries);
+        self.unique_diagonals = self.unique_diagonals.saturating_add(other.unique_diagonals);
+        self.singleton_diagonals = self
+            .singleton_diagonals
+            .saturating_add(other.singleton_diagonals);
+        self.max_entries_per_diagonal = self
+            .max_entries_per_diagonal
+            .max(other.max_entries_per_diagonal);
+        self.lookup_steps = self.lookup_steps.saturating_add(other.lookup_steps);
+        self.insert_steps = self.insert_steps.saturating_add(other.insert_steps);
+        self.insert_shifts = self.insert_shifts.saturating_add(other.insert_shifts);
+        self.gap_mismatches = self.gap_mismatches.saturating_add(other.gap_mismatches);
+        self.gap_caps = self.gap_caps.saturating_add(other.gap_caps);
     }
 }
 
@@ -99,11 +133,6 @@ struct MemoEntry {
 /// A bounded successor map local to one phase-4 partition cascade.
 pub(crate) struct GeometricMemo {
     config: MemoConfig,
-    // `(diagonal, mismatch endpoint) -> earliest proved matching start`.
-    //
-    // Partition tables are small in practice, so keep them in one sorted,
-    // contiguous allocation. This avoids one heap allocation and pointer
-    // chase per tree node while retaining logarithmic successor lookup.
     entries: Vec<MemoEntry>,
     stats: MemoStats,
 }
@@ -122,13 +151,48 @@ impl GeometricMemo {
         if self.config.collect_stats {
             self.stats.tables = 1;
             self.stats.final_entries = self.entries.len() as u64;
+            self.stats.active_tables = u64::from(self.is_active());
+            match self.entries.len() {
+                0..=15 => self.stats.tables_0_15 = 1,
+                16..=31 => self.stats.tables_16_31 = 1,
+                32..=63 => self.stats.tables_32_63 = 1,
+                64..=127 => self.stats.tables_64_127 = 1,
+                128..=255 => self.stats.tables_128_255 = 1,
+                _ => self.stats.tables_256_plus = 1,
+            }
+            let mut group_start = 0usize;
+            while group_start < self.entries.len() {
+                let diagonal = self.entries[group_start].diagonal;
+                let mut group_end = group_start + 1;
+                while group_end < self.entries.len() && self.entries[group_end].diagonal == diagonal
+                {
+                    group_end += 1;
+                }
+                let group_len = group_end - group_start;
+                self.stats.unique_diagonals += 1;
+                self.stats.singleton_diagonals += u64::from(group_len == 1);
+                self.stats.max_entries_per_diagonal =
+                    self.stats.max_entries_per_diagonal.max(group_len as u64);
+                group_start = group_end;
+            }
         }
         self.stats
+    }
+
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.entries.len() >= self.config.activate_entries
+    }
+
+    #[inline]
+    pub(crate) fn probe(&self, max_ext: usize) -> usize {
+        max_ext.min(self.config.probe)
     }
 
     /// Extend the LCP of `text[p..]` and `text[q..]` after a prefix of
     /// `known` symbols has already been proved equal by the merge invariant.
     /// The returned extension is bounded by `max_ext`.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn lcp<S: Symbol>(
         &mut self,
@@ -139,7 +203,97 @@ impl GeometricMemo {
         known: usize,
         max_ext: usize,
     ) -> usize {
-        if self.config.collect_stats {
+        if self.is_active() {
+            self.lcp_active_impl::<S, false>(text, dispatch, p, q, known, max_ext)
+        } else {
+            let got = dispatch.lcp(text, p + known, q + known, max_ext);
+            self.observe_training_impl::<false>(p, q, known, got, max_ext);
+            got
+        }
+    }
+
+    /// Instrumented form of [`Self::lcp`]. Keeping the choice outside the hot
+    /// merge loop lets LLVM erase all counter branches from normal runs.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn lcp_profiled<S: Symbol>(
+        &mut self,
+        text: &[S],
+        dispatch: LcpDispatch,
+        p: usize,
+        q: usize,
+        known: usize,
+        max_ext: usize,
+    ) -> usize {
+        if self.is_active() {
+            self.lcp_active_impl::<S, true>(text, dispatch, p, q, known, max_ext)
+        } else {
+            let got = dispatch.lcp(text, p + known, q + known, max_ext);
+            self.observe_training_impl::<true>(p, q, known, got, max_ext);
+            got
+        }
+    }
+
+    #[inline]
+    pub(crate) fn observe_training(
+        &mut self,
+        p: usize,
+        q: usize,
+        known: usize,
+        got: usize,
+        max_ext: usize,
+    ) {
+        self.observe_training_impl::<false>(p, q, known, got, max_ext);
+    }
+
+    #[inline]
+    pub(crate) fn observe_training_profiled(
+        &mut self,
+        p: usize,
+        q: usize,
+        known: usize,
+        got: usize,
+        max_ext: usize,
+    ) {
+        self.observe_training_impl::<true>(p, q, known, got, max_ext);
+    }
+
+    #[inline]
+    fn observe_training_impl<const STATS: bool>(
+        &mut self,
+        p: usize,
+        q: usize,
+        known: usize,
+        got: usize,
+        max_ext: usize,
+    ) {
+        if STATS {
+            self.stats.calls = self.stats.calls.saturating_add(1);
+            self.stats.cold_direct = self.stats.cold_direct.saturating_add(1);
+            self.stats.scanned_matches = self.stats.scanned_matches.saturating_add(got as u64);
+        }
+        let total = known + got;
+        // Long LCPs are rare. Test the selective condition first so ordinary
+        // short mismatches pay one branch, not the exactness and active-state
+        // checks as well.
+        if total >= self.config.min_lcp && got < max_ext && !self.is_active() {
+            let (base, other) = if p < q { (p, q) } else { (q, p) };
+            self.insert_exact::<STATS>(base, other - base, total);
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn lcp_active_impl<S: Symbol, const STATS: bool>(
+        &mut self,
+        text: &[S],
+        dispatch: LcpDispatch,
+        p: usize,
+        q: usize,
+        known: usize,
+        max_ext: usize,
+    ) -> usize {
+        if STATS {
             self.stats.calls = self.stats.calls.saturating_add(1);
         }
         if max_ext == 0 || p == q {
@@ -151,63 +305,114 @@ impl GeometricMemo {
             );
         }
 
-        let (base, other) = if p < q { (p, q) } else { (q, p) };
-        let diagonal = other - base;
         let scan_p = p.saturating_add(known);
         let scan_q = q.saturating_add(known);
 
-        // Until this partition has enough useful intervals, preserve the
-        // original one-call SIMD path and use its exact result to seed the
-        // table instead of splitting the scan at the probe boundary.
-        if self.entries.len() < self.config.activate_entries {
-            if self.config.collect_stats {
-                self.stats.cold_direct = self.stats.cold_direct.saturating_add(1);
+        // Resolve ordinary short comparisons before paying for a table query.
+        let probe = self.probe(max_ext);
+        let got = dispatch.lcp(text, scan_p, scan_q, probe);
+        self.add_scanned::<STATS>(got);
+        if got < probe {
+            if STATS {
+                self.stats.probe_resolved = self.stats.probe_resolved.saturating_add(1);
             }
-            let got = dispatch.lcp(text, scan_p, scan_q, max_ext);
-            self.add_scanned(got);
-            if got < max_ext {
-                self.insert_exact(base, diagonal, known.saturating_add(got));
+            return got;
+        }
+        if probe == max_ext {
+            if STATS {
+                self.stats.probe_resolved = self.stats.probe_resolved.saturating_add(1);
             }
             return got;
         }
 
-        // Resolve ordinary short comparisons before paying for a table query.
-        let probe = max_ext.min(self.config.probe);
-        let got = dispatch.lcp(text, scan_p, scan_q, probe);
-        self.add_scanned(got);
-        if got < probe {
-            if self.config.collect_stats {
-                self.stats.probe_resolved = self.stats.probe_resolved.saturating_add(1);
-            }
-            self.insert_exact(base, diagonal, known.saturating_add(got));
-            return got;
+        self.lcp_after_probe_impl::<S, STATS>(text, dispatch, p, q, known, probe, max_ext)
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lcp_after_probe<S: Symbol>(
+        &mut self,
+        text: &[S],
+        dispatch: LcpDispatch,
+        p: usize,
+        q: usize,
+        known: usize,
+        probe: usize,
+        max_ext: usize,
+    ) -> usize {
+        debug_assert!(self.is_active());
+        self.lcp_after_probe_impl::<S, false>(text, dispatch, p, q, known, probe, max_ext)
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lcp_after_probe_profiled<S: Symbol>(
+        &mut self,
+        text: &[S],
+        dispatch: LcpDispatch,
+        p: usize,
+        q: usize,
+        known: usize,
+        probe: usize,
+        max_ext: usize,
+    ) -> usize {
+        debug_assert!(self.is_active());
+        self.lcp_after_probe_impl::<S, true>(text, dispatch, p, q, known, probe, max_ext)
+    }
+
+    #[inline]
+    pub(crate) fn record_probe_profiled(&mut self, got: usize, probe: usize, max_ext: usize) {
+        self.stats.calls = self.stats.calls.saturating_add(1);
+        self.stats.scanned_matches = self.stats.scanned_matches.saturating_add(got as u64);
+        if got < probe || probe == max_ext {
+            self.stats.probe_resolved = self.stats.probe_resolved.saturating_add(1);
         }
-        if probe == max_ext {
-            if self.config.collect_stats {
-                self.stats.probe_resolved = self.stats.probe_resolved.saturating_add(1);
-            }
-            return got;
-        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lcp_after_probe_impl<S: Symbol, const STATS: bool>(
+        &mut self,
+        text: &[S],
+        dispatch: LcpDispatch,
+        p: usize,
+        q: usize,
+        known: usize,
+        probe: usize,
+        max_ext: usize,
+    ) -> usize {
+        let scan_p = p.saturating_add(known);
+        let scan_q = q.saturating_add(known);
+        let (base, other) = if p < q { (p, q) } else { (q, p) };
+        let diagonal = other - base;
 
         let query = base.saturating_add(known).saturating_add(probe);
         let remaining = max_ext - probe;
 
-        if self.config.collect_stats {
+        if STATS {
             self.stats.lookups = self.stats.lookups.saturating_add(1);
         }
-        let successor_index = self
-            .entries
-            .partition_point(|entry| (entry.diagonal, entry.end) < (diagonal, query));
+        let successor_index = if STATS {
+            let mut steps = 0u64;
+            let index = self.entries.partition_point(|entry| {
+                steps += 1;
+                (entry.diagonal, entry.end) < (diagonal, query)
+            });
+            self.stats.lookup_steps = self.stats.lookup_steps.saturating_add(steps);
+            index
+        } else {
+            self.entries
+                .partition_point(|entry| (entry.diagonal, entry.end) < (diagonal, query))
+        };
         let successor = self.entries.get(successor_index).and_then(|entry| {
             (entry.diagonal == diagonal).then_some((successor_index, entry.end, entry.start))
         });
 
         let Some((successor_index, end, start)) = successor else {
-            if self.config.collect_stats {
+            if STATS {
                 self.stats.misses = self.stats.misses.saturating_add(1);
             }
             return probe
-                + self.scan_tail_and_insert(
+                + self.scan_tail_and_insert::<S, STATS>(
                     text, dispatch, p, q, base, diagonal, known, probe, remaining,
                 );
         };
@@ -217,11 +422,11 @@ impl GeometricMemo {
             // observed mismatch, unless the caller's cap stops us first.
             let available = end - query;
             let skipped = available.min(remaining);
-            if self.config.collect_stats {
+            if STATS {
                 self.stats.direct_hits = self.stats.direct_hits.saturating_add(1);
             }
-            self.add_skipped(skipped);
-            self.extend_start(successor_index, base);
+            self.add_skipped::<STATS>(skipped);
+            self.extend_start::<STATS>(successor_index, base);
             return probe + skipped;
         }
 
@@ -236,9 +441,12 @@ impl GeometricMemo {
             scan_q.saturating_add(probe),
             gap_cap,
         );
-        self.add_scanned(gap_lcp);
+        self.add_scanned::<STATS>(gap_lcp);
         if gap_lcp < gap_cap {
-            self.insert_exact(
+            if STATS {
+                self.stats.gap_mismatches = self.stats.gap_mismatches.saturating_add(1);
+            }
+            self.insert_exact::<STATS>(
                 base,
                 diagonal,
                 known.saturating_add(probe).saturating_add(gap_lcp),
@@ -246,21 +454,24 @@ impl GeometricMemo {
             return probe + gap_lcp;
         }
         if gap_cap == remaining {
+            if STATS {
+                self.stats.gap_caps = self.stats.gap_caps.saturating_add(1);
+            }
             return max_ext;
         }
 
         let interval_len = end - start;
         let skipped = interval_len.min(remaining - gap);
-        if self.config.collect_stats {
+        if STATS {
             self.stats.gap_hits = self.stats.gap_hits.saturating_add(1);
         }
-        self.add_skipped(skipped);
-        self.extend_start(successor_index, base);
+        self.add_skipped::<STATS>(skipped);
+        self.extend_start::<STATS>(successor_index, base);
         probe + gap + skipped
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn scan_tail_and_insert<S: Symbol>(
+    fn scan_tail_and_insert<S: Symbol, const STATS: bool>(
         &mut self,
         text: &[S],
         dispatch: LcpDispatch,
@@ -278,9 +489,9 @@ impl GeometricMemo {
             q.saturating_add(known).saturating_add(already_scanned),
             remaining,
         );
-        self.add_scanned(got);
+        self.add_scanned::<STATS>(got);
         if got < remaining {
-            self.insert_exact(
+            self.insert_exact::<STATS>(
                 base,
                 diagonal,
                 known.saturating_add(already_scanned).saturating_add(got),
@@ -289,15 +500,24 @@ impl GeometricMemo {
         got
     }
 
-    fn insert_exact(&mut self, base: usize, diagonal: usize, lcp: usize) {
+    fn insert_exact<const STATS: bool>(&mut self, base: usize, diagonal: usize, lcp: usize) {
         if lcp < self.config.min_lcp {
             return;
         }
         let end = base.saturating_add(lcp);
         let key = (diagonal, end);
-        let index = self
-            .entries
-            .partition_point(|entry| (entry.diagonal, entry.end) < key);
+        let index = if STATS {
+            let mut steps = 0u64;
+            let index = self.entries.partition_point(|entry| {
+                steps += 1;
+                (entry.diagonal, entry.end) < key
+            });
+            self.stats.insert_steps = self.stats.insert_steps.saturating_add(steps);
+            index
+        } else {
+            self.entries
+                .partition_point(|entry| (entry.diagonal, entry.end) < key)
+        };
         if let Some(entry) = self
             .entries
             .get_mut(index)
@@ -305,17 +525,23 @@ impl GeometricMemo {
         {
             if base < entry.start {
                 entry.start = base;
-                if self.config.collect_stats {
+                if STATS {
                     self.stats.extensions = self.stats.extensions.saturating_add(1);
                 }
             }
             return;
         }
         if self.entries.len() >= self.config.capacity {
-            if self.config.collect_stats {
+            if STATS {
                 self.stats.capacity_rejects = self.stats.capacity_rejects.saturating_add(1);
             }
             return;
+        }
+        if STATS {
+            self.stats.insert_shifts = self
+                .stats
+                .insert_shifts
+                .saturating_add((self.entries.len() - index) as u64);
         }
         self.entries.insert(
             index,
@@ -325,32 +551,32 @@ impl GeometricMemo {
                 start: base,
             },
         );
-        if self.config.collect_stats {
+        if STATS {
             self.stats.inserts = self.stats.inserts.saturating_add(1);
             self.stats.max_entries = self.stats.max_entries.max(self.entries.len() as u64);
         }
     }
 
-    fn extend_start(&mut self, index: usize, start: usize) {
+    fn extend_start<const STATS: bool>(&mut self, index: usize, start: usize) {
         let Some(entry) = self.entries.get_mut(index) else {
             return;
         };
         if start < entry.start {
             entry.start = start;
-            if self.config.collect_stats {
+            if STATS {
                 self.stats.extensions = self.stats.extensions.saturating_add(1);
             }
         }
     }
 
-    fn add_scanned(&mut self, value: usize) {
-        if self.config.collect_stats {
+    fn add_scanned<const STATS: bool>(&mut self, value: usize) {
+        if STATS {
             self.stats.scanned_matches = self.stats.scanned_matches.saturating_add(value as u64);
         }
     }
 
-    fn add_skipped(&mut self, value: usize) {
-        if self.config.collect_stats {
+    fn add_skipped<const STATS: bool>(&mut self, value: usize) {
+        if STATS {
             self.stats.skipped_matches = self.stats.skipped_matches.saturating_add(value as u64);
         }
     }
@@ -398,8 +624,14 @@ mod tests {
         let text = repeated_blocks();
         let dispatch = LcpDispatch::detect();
         let mut memo = GeometricMemo::new(config());
-        assert_eq!(memo.lcp(&text, dispatch, 0, 3_000, 0, 2_500), 2_000);
-        assert_eq!(memo.lcp(&text, dispatch, 500, 3_500, 0, 2_000), 1_500);
+        assert_eq!(
+            memo.lcp_profiled(&text, dispatch, 0, 3_000, 0, 2_500),
+            2_000
+        );
+        assert_eq!(
+            memo.lcp_profiled(&text, dispatch, 500, 3_500, 0, 2_000),
+            1_500
+        );
         let stats = memo.finish();
         assert_eq!(stats.inserts, 1);
         assert_eq!(stats.direct_hits, 1);
@@ -411,8 +643,14 @@ mod tests {
         let text = repeated_blocks();
         let dispatch = LcpDispatch::detect();
         let mut memo = GeometricMemo::new(config());
-        assert_eq!(memo.lcp(&text, dispatch, 500, 3_500, 0, 2_000), 1_500);
-        assert_eq!(memo.lcp(&text, dispatch, 0, 3_000, 0, 2_500), 2_000);
+        assert_eq!(
+            memo.lcp_profiled(&text, dispatch, 500, 3_500, 0, 2_000),
+            1_500
+        );
+        assert_eq!(
+            memo.lcp_profiled(&text, dispatch, 0, 3_000, 0, 2_500),
+            2_000
+        );
         assert_eq!(entry_start(&memo, 3_000, 2_000), Some(0));
         let stats = memo.finish();
         assert_eq!(stats.gap_hits, 1);

@@ -1710,25 +1710,40 @@ where
         if let Some(config) = memo_config {
             let stats = *memo_stats.lock().expect("memo profile mutex poisoned");
             profile_log(&format!(
-                "geometric memo probe={} min_lcp={} cap={} activate_entries={} stats={} tables={} calls={} training_direct={} probe_resolved={} lookups={} direct_hits={} gap_hits={} misses={} inserts={} extensions={} cap_rejects={} final_entries={} max_entries={} scanned_matches={} skipped_matches={}",
+                "geometric memo probe={} min_lcp={} cap={} activate_entries={} stats={} tables={} active_tables={} table_bins=[{},{},{},{},{},{}] calls={} training_direct={} probe_resolved={} lookups={} direct_hits={} gap_hits={} gap_mismatches={} gap_caps={} misses={} inserts={} extensions={} cap_rejects={} final_entries={} max_entries={} unique_diagonals={} singleton_diagonals={} max_entries_per_diagonal={} lookup_steps={} insert_steps={} insert_shifts={} scanned_matches={} skipped_matches={}",
                 config.probe,
                 config.min_lcp,
                 config.capacity,
                 config.activate_entries,
                 config.collect_stats,
                 stats.tables,
+                stats.active_tables,
+                stats.tables_0_15,
+                stats.tables_16_31,
+                stats.tables_32_63,
+                stats.tables_64_127,
+                stats.tables_128_255,
+                stats.tables_256_plus,
                 stats.calls,
                 stats.cold_direct,
                 stats.probe_resolved,
                 stats.lookups,
                 stats.direct_hits,
                 stats.gap_hits,
+                stats.gap_mismatches,
+                stats.gap_caps,
                 stats.misses,
                 stats.inserts,
                 stats.extensions,
                 stats.capacity_rejects,
                 stats.final_entries,
                 stats.max_entries,
+                stats.unique_diagonals,
+                stats.singleton_diagonals,
+                stats.max_entries_per_diagonal,
+                stats.lookup_steps,
+                stats.insert_steps,
+                stats.insert_shifts,
                 stats.scanned_matches,
                 stats.skipped_matches,
             ));
@@ -1927,15 +1942,27 @@ where
     let workspace = CascadeWorkspace::<I>::new();
     let result = if let Some(config) = memo_config {
         let mut memo = GeometricMemo::new(config);
-        let result = workspace.cascade_merge_memoized(
-            text,
-            lp,
-            &records,
-            &boundaries,
-            max_ctx,
-            dispatch,
-            &mut memo,
-        );
+        let result = if config.collect_stats {
+            workspace.cascade_merge_memoized_profiled(
+                text,
+                lp,
+                &records,
+                &boundaries,
+                max_ctx,
+                dispatch,
+                &mut memo,
+            )
+        } else {
+            workspace.cascade_merge_memoized(
+                text,
+                lp,
+                &records,
+                &boundaries,
+                max_ctx,
+                dispatch,
+                &mut memo,
+            )
+        };
         if profile {
             memo_stats
                 .lock()
@@ -2008,7 +2035,9 @@ impl<I: Index> CascadeWorkspace<I> {
         S: Symbol,
         L: LimitProvider,
     {
-        self.cascade_merge_impl(text, lp, records, boundaries, max_ctx, dispatch, None)
+        self.cascade_merge_impl(
+            text, lp, records, boundaries, max_ctx, dispatch, None, false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2026,7 +2055,43 @@ impl<I: Index> CascadeWorkspace<I> {
         S: Symbol,
         L: LimitProvider,
     {
-        self.cascade_merge_impl(text, lp, records, boundaries, max_ctx, dispatch, Some(memo))
+        self.cascade_merge_impl(
+            text,
+            lp,
+            records,
+            boundaries,
+            max_ctx,
+            dispatch,
+            Some(memo),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cascade_merge_memoized_profiled<S, L>(
+        self,
+        text: &[S],
+        lp: &L,
+        records: &[SaLcp<I>],
+        boundaries: &[usize],
+        max_ctx: usize,
+        dispatch: LcpDispatch,
+        memo: &mut GeometricMemo,
+    ) -> Vec<I>
+    where
+        S: Symbol,
+        L: LimitProvider,
+    {
+        self.cascade_merge_impl(
+            text,
+            lp,
+            records,
+            boundaries,
+            max_ctx,
+            dispatch,
+            Some(memo),
+            true,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2039,6 +2104,7 @@ impl<I: Index> CascadeWorkspace<I> {
         max_ctx: usize,
         dispatch: LcpDispatch,
         mut memo: Option<&mut GeometricMemo>,
+        memo_profiled: bool,
     ) -> Vec<I>
     where
         S: Symbol,
@@ -2074,6 +2140,7 @@ impl<I: Index> CascadeWorkspace<I> {
                 max_ctx,
                 dispatch,
                 memo.as_deref_mut(),
+                memo_profiled,
             );
             src_is_a = !src_is_a;
         }
@@ -2101,6 +2168,7 @@ impl<I: Index> CascadeWorkspace<I> {
         max_ctx: usize,
         dispatch: LcpDispatch,
         mut memo: Option<&mut GeometricMemo>,
+        memo_profiled: bool,
     ) -> Vec<usize>
     where
         S: Symbol,
@@ -2142,19 +2210,63 @@ impl<I: Index> CascadeWorkspace<I> {
                 let xy_end = x_end + l2;
                 let dst_end = dst_off + l1 + l2;
                 if let Some(memo) = memo.as_deref_mut() {
-                    sample_sort::merge_memoized(
-                        text,
-                        lp,
-                        &src_sa[src_off..x_end],
-                        &src_sa[x_end..xy_end],
-                        &src_lcp[src_off..x_end],
-                        &src_lcp[x_end..xy_end],
-                        &mut dst_sa[dst_off..dst_end],
-                        &mut dst_lcp[dst_off..dst_end],
-                        max_ctx,
-                        dispatch,
-                        memo,
-                    );
+                    if memo.is_active() && memo_profiled {
+                        sample_sort::merge_memoized_profiled(
+                            text,
+                            lp,
+                            &src_sa[src_off..x_end],
+                            &src_sa[x_end..xy_end],
+                            &src_lcp[src_off..x_end],
+                            &src_lcp[x_end..xy_end],
+                            &mut dst_sa[dst_off..dst_end],
+                            &mut dst_lcp[dst_off..dst_end],
+                            max_ctx,
+                            dispatch,
+                            memo,
+                        );
+                    } else if memo.is_active() {
+                        sample_sort::merge_memoized(
+                            text,
+                            lp,
+                            &src_sa[src_off..x_end],
+                            &src_sa[x_end..xy_end],
+                            &src_lcp[src_off..x_end],
+                            &src_lcp[x_end..xy_end],
+                            &mut dst_sa[dst_off..dst_end],
+                            &mut dst_lcp[dst_off..dst_end],
+                            max_ctx,
+                            dispatch,
+                            memo,
+                        );
+                    } else if memo_profiled {
+                        sample_sort::merge_memoized_training_profiled(
+                            text,
+                            lp,
+                            &src_sa[src_off..x_end],
+                            &src_sa[x_end..xy_end],
+                            &src_lcp[src_off..x_end],
+                            &src_lcp[x_end..xy_end],
+                            &mut dst_sa[dst_off..dst_end],
+                            &mut dst_lcp[dst_off..dst_end],
+                            max_ctx,
+                            dispatch,
+                            memo,
+                        );
+                    } else {
+                        sample_sort::merge_memoized_training(
+                            text,
+                            lp,
+                            &src_sa[src_off..x_end],
+                            &src_sa[x_end..xy_end],
+                            &src_lcp[src_off..x_end],
+                            &src_lcp[x_end..xy_end],
+                            &mut dst_sa[dst_off..dst_end],
+                            &mut dst_lcp[dst_off..dst_end],
+                            max_ctx,
+                            dispatch,
+                            memo,
+                        );
+                    }
                 } else {
                     sample_sort::merge(
                         text,

@@ -277,9 +277,35 @@ macro_rules! merge_extension {
     (direct, $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {
         $dispatch.lcp($text, $p + $known, $q + $known, $max_ext)
     };
-    ((memo $memo:ident), $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {
-        $memo.lcp($text, $dispatch, $p, $q, $known, $max_ext)
-    };
+    ((memo $memo:ident), $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {{
+        let probe = $memo.probe($max_ext);
+        let got = $dispatch.lcp($text, $p + $known, $q + $known, probe);
+        if got < probe || probe == $max_ext {
+            got
+        } else {
+            $memo.lcp_after_probe($text, $dispatch, $p, $q, $known, probe, $max_ext)
+        }
+    }};
+    ((memo_profiled $memo:ident), $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {{
+        let probe = $memo.probe($max_ext);
+        let got = $dispatch.lcp($text, $p + $known, $q + $known, probe);
+        $memo.record_probe_profiled(got, probe, $max_ext);
+        if got < probe || probe == $max_ext {
+            got
+        } else {
+            $memo.lcp_after_probe_profiled($text, $dispatch, $p, $q, $known, probe, $max_ext)
+        }
+    }};
+    ((training $memo:ident), $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {{
+        let got = $dispatch.lcp($text, $p + $known, $q + $known, $max_ext);
+        $memo.observe_training($p, $q, $known, got, $max_ext);
+        got
+    }};
+    ((training_profiled $memo:ident), $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {{
+        let got = $dispatch.lcp($text, $p + $known, $q + $known, $max_ext);
+        $memo.observe_training_profiled($p, $q, $known, got, $max_ext);
+        got
+    }};
 }
 
 // Keep the direct and memoized kernels as separate monomorphized functions.
@@ -429,6 +455,71 @@ pub(crate) fn merge_memoized<S, I, L>(
     L: LimitProvider,
 {
     merge_body!((memo memo); text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
+}
+
+/// Instrumented counterpart of [`merge_memoized`]. Selected once per
+/// partition so normal memoized comparisons contain no counter branches.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_memoized_profiled<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    memo: &mut GeometricMemo,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    merge_body!((memo_profiled memo); text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_memoized_training<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    memo: &mut GeometricMemo,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    merge_body!((training memo); text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_memoized_training_profiled<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    memo: &mut GeometricMemo,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    merge_body!((training_profiled memo); text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
 }
 
 #[inline]
