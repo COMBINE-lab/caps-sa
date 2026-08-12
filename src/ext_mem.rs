@@ -505,17 +505,10 @@ where
     let dispatch = LcpDispatch::detect();
     let work_dir = opts.work_dir.clone();
 
-    // Pool the `2 × p` bucket files into one anonymous tempfile per
-    // worker thread. With `p` in the thousands and `num_threads` in
-    // the dozens this collapses the openat/close/unlink budget from
-    // ~3·p (per-bucket-file path) to N (per-worker-file pool),
-    // eliminating the metadata-syscall pain on networked filesystems
-    // and the open-file-handle limit headache on tiny inputs. Per-
-    // bucket in-memory buffers and write volumes are unchanged, so
-    // local-disk wall time is neutral or marginally improved. See
-    // `bench/README.md` for the empirical sizing.
+    // The fused phase 1 writes directly to partition buckets, so this path
+    // needs only one file pool. The previous subarray pool held a complete
+    // spilled copy that phase 3 read and wrote again before the final merge.
     let n_phys = effective_physical_file_count(opts.physical_file_count);
-    let phase1_pool = BucketPool::new(n_phys, &work_dir)?;
     let phase3_pool = BucketPool::new(n_phys, &work_dir)?;
 
     profile_log(&format!(
@@ -523,45 +516,20 @@ where
         std::mem::size_of::<I>() * 8
     ));
 
-    let sub_factory = |i: usize| phase1_pool.new_bucket::<SaLcp<I>>(i);
     let part_factory = |j: usize| phase3_pool.new_bucket::<SaLcp<I>>(j);
 
     let t = Instant::now();
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, L, _, _>(
+    let pivots = phase0_presample_pivots::<S, I, L>(text, lp, &source, p, opts, dispatch);
+    profile_log(&format!(
+        "phase0 (presample pivots)  {:.3}s",
+        t.elapsed().as_secs_f64()
+    ));
+
+    let t = Instant::now();
+    let mut partition_buckets = phase1_sort_and_distribute::<S, I, L, _, _>(
         text,
         lp,
         &source,
-        p,
-        opts,
-        dispatch,
-        sub_factory,
-    )?;
-    profile_log(&format!(
-        "phase1 (sort+sample+spill) {:.3}s",
-        t.elapsed().as_secs_f64()
-    ));
-
-    // Drop the position source as soon as phase 1 returns — phases
-    // 2/3/4 don't touch it. For `PositionSource::Subset` this frees
-    // the caller's `Vec<u64>` (e.g. ~47 GB on a human-scale
-    // _for_positions build); for `PositionSource::Filtered` it
-    // frees the bitmap + cumsum (~770 MB); for `Identity` it's a
-    // no-op. The text and the spilled `subarray_buckets` are all
-    // phase 2+ needs.
-    drop(source);
-
-    let t = Instant::now();
-    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, dispatch);
-    profile_log(&format!(
-        "phase2 (select pivots)      {:.3}s",
-        t.elapsed().as_secs_f64()
-    ));
-
-    let t = Instant::now();
-    let mut partition_buckets = phase3_distribute::<S, I, L, _, _>(
-        text,
-        lp,
-        &mut subarray_buckets,
         &pivots,
         p,
         opts,
@@ -569,11 +537,17 @@ where
         part_factory,
     )?;
     profile_log(&format!(
-        "phase3 (distribute)          {:.3}s",
+        "phase1 (sort+distribute)   {:.3}s",
         t.elapsed().as_secs_f64()
     ));
 
-    drop(subarray_buckets);
+    // Drop the position source as soon as phase 1 returns. For
+    // `PositionSource::Subset` this frees
+    // the caller's `Vec<u64>` (e.g. ~47 GB on a human-scale
+    // _for_positions build); for `PositionSource::Filtered` it
+    // frees the bitmap + cumsum (~770 MB); for `Identity` it's a
+    // no-op. Phase 4 needs only the text and partition buckets.
+    drop(source);
 
     let t = Instant::now();
     let result = phase4_merge_and_emit::<S, I, L, _, E, F>(
@@ -1360,6 +1334,232 @@ where
         .into_iter()
         .map(|m| m.into_inner().expect("partition mutex poisoned"))
         .collect())
+}
+
+/// Choose `p - 1` pivots before sorting the phase-1 subarrays.
+///
+/// Any sorted splitters produce a correct sample sort; their quality affects
+/// partition balance, not ordering. Selecting them from a cheap block-strided
+/// pre-sample lets phase 1 write sorted pieces directly to final partition
+/// buckets instead of spilling and re-reading every record in a separate
+/// distribution phase.
+fn phase0_presample_pivots<S, I, L>(
+    text: &[S],
+    lp: &L,
+    source: &PositionSource<'_>,
+    p: usize,
+    opts: &ExtMemOpts,
+    dispatch: LcpDispatch,
+) -> Vec<I>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = source.len();
+    if p <= 1 || n == 0 {
+        return Vec::new();
+    }
+
+    // PositionSource::fill_chunk is substantially cheaper for a contiguous
+    // block than for the same number of singleton calls, particularly for the
+    // filtered bitmap source used by ruSTAR.
+    const BLOCK: usize = 64;
+    let target = sample_target_total(n, p).min(n);
+    let n_blocks = target.div_ceil(BLOCK).max(1);
+    let stride = (n / n_blocks).max(1);
+
+    let mut sample: Vec<I> = Vec::with_capacity(n_blocks * BLOCK);
+    let mut start = 0usize;
+    while start < n && sample.len() < target {
+        let len = BLOCK.min(n - start);
+        let base = sample.len();
+        sample.resize(base + len, I::zero());
+        source.fill_chunk(start, &mut sample[base..]);
+        start += stride;
+    }
+    if sample.is_empty() {
+        return Vec::new();
+    }
+
+    let m = sample.len();
+    let mut sa_w = vec![I::zero(); m];
+    let mut lcp = vec![I::zero(); m];
+    let mut lcp_w = vec![I::zero(); m];
+    sample_sort::merge_sort(
+        text,
+        lp,
+        &mut sample,
+        &mut sa_w,
+        &mut lcp,
+        &mut lcp_w,
+        opts.max_context,
+        dispatch,
+    );
+
+    (1..p).map(|i| sample[(i * m / p).min(m - 1)]).collect()
+}
+
+/// Sort each phase-1 subarray and distribute its sorted pieces directly to
+/// the final partition buckets.
+///
+/// Pivots have already been selected by [`phase0_presample_pivots`], so the
+/// subarrays never need to be written to one bucket pool and read back into a
+/// second one. The partition pieces remain individually sorted and retain an
+/// LCP reset at every boundary, exactly as the cascade merge requires.
+#[allow(clippy::too_many_arguments)]
+fn phase1_sort_and_distribute<S, I, L, B, MkB>(
+    text: &[S],
+    lp: &L,
+    source: &PositionSource<'_>,
+    pivots: &[I],
+    p: usize,
+    opts: &ExtMemOpts,
+    dispatch: LcpDispatch,
+    mk_bucket: MkB,
+) -> io::Result<Vec<B>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+    SaLcp<I>: BucketRecord,
+    B: SaLcpBucketStore<I> + Send,
+    MkB: Fn(usize) -> B + Send + Sync,
+{
+    let n = source.len();
+    let chunk_size = n.div_ceil(p);
+    let partition_buckets: Vec<Mutex<B>> = (0..p).map(|j| Mutex::new(mk_bucket(j))).collect();
+
+    (0..p).into_par_iter().try_for_each(|i| -> io::Result<()> {
+        let start = (i * chunk_size).min(n);
+        let end = ((i + 1) * chunk_size).min(n);
+        let len = end - start;
+        if len == 0 {
+            return Ok(());
+        }
+
+        let mut sa: Vec<I> = vec![I::zero(); len];
+        source.fill_chunk(start, &mut sa);
+        let mut sa_w = vec![I::zero(); len];
+        let mut lcp_arr = vec![I::zero(); len];
+        let mut lcp_w = vec![I::zero(); len];
+        sample_sort::merge_sort(
+            text,
+            lp,
+            &mut sa,
+            &mut sa_w,
+            &mut lcp_arr,
+            &mut lcp_w,
+            opts.max_context,
+            dispatch,
+        );
+        drop(sa_w);
+        drop(lcp_w);
+
+        let records: Vec<SaLcp<I>> = sa
+            .iter()
+            .zip(lcp_arr.iter())
+            .map(|(&pos, &lcp)| SaLcp { pos, lcp })
+            .collect();
+        drop(sa);
+        drop(lcp_arr);
+
+        // Consecutive pivots have non-decreasing upper bounds. Galloping from
+        // the previous split avoids restarting a full binary search p times.
+        let mut splits = Vec::with_capacity(p + 1);
+        splits.push(0usize);
+        let mut from = 0usize;
+        for &pivot in pivots {
+            from = upper_bound_from(&records, from, pivot, text, lp, opts.max_context, dispatch);
+            splits.push(from);
+        }
+        splits.push(records.len());
+
+        for j in 0..p {
+            let (lo, hi) = (splits[j], splits[j + 1]);
+            if lo >= hi {
+                continue;
+            }
+            let mut bucket = partition_buckets[j].lock().unwrap();
+            bucket.add_slice_reset_first_lcp(&records[lo..hi])?;
+            bucket.mark_boundary();
+        }
+        Ok(())
+    })?;
+
+    Ok(partition_buckets
+        .into_iter()
+        .map(|m| m.into_inner().expect("partition mutex poisoned"))
+        .collect())
+}
+
+/// Upper bound of `pivot` in `records`, searched forward from the previous
+/// pivot's split. Pivots are sorted, so upper bounds never move backward.
+fn upper_bound_from<S, I, L>(
+    records: &[SaLcp<I>],
+    from: usize,
+    pivot: I,
+    text: &[S],
+    lp: &L,
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+) -> usize
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = records.len();
+    let greater = |i: usize| -> bool {
+        dispatch.suffix_cmp_with(
+            text,
+            lp,
+            records[i].pos.to_usize(),
+            pivot.to_usize(),
+            max_ctx,
+        ) == Ordering::Greater
+    };
+
+    if from >= n {
+        return n;
+    }
+    if greater(from) {
+        return from;
+    }
+
+    let mut lo = from;
+    let mut step = 1usize;
+    loop {
+        let probe = from.saturating_add(step);
+        if probe >= n {
+            break;
+        }
+        if greater(probe) {
+            let mut hi = probe;
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                if greater(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return hi;
+        }
+        lo = probe;
+        step = step.saturating_mul(2);
+    }
+
+    let mut hi = n;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if greater(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
 }
 
 /// Upper-bound binary search: returns the first index `i` such that the
