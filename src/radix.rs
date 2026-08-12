@@ -543,6 +543,7 @@ fn seed_sort<I: Index>(
         .map(|s| (s, (s + chunk_len).min(n)))
         .collect();
 
+    let ht = Instant::now();
     // Pass 1: per-chunk histograms over the top `RADIX_BITS` of each key.
     let histograms: Vec<Vec<u32>> = bounds
         .par_iter()
@@ -555,6 +556,11 @@ fn seed_sort<I: Index>(
         })
         .collect();
 
+    profile_log(&format!(
+        "    seed histogram {:.3}s",
+        ht.elapsed().as_secs_f64()
+    ));
+    let pt = Instant::now();
     // Exclusive prefix sum, bucket-major then chunk-minor, so every (chunk,
     // bucket) pair gets a disjoint destination range and the buckets come out
     // in ascending key order.
@@ -573,6 +579,11 @@ fn seed_sort<I: Index>(
         debug_assert_eq!(running, n);
     }
 
+    profile_log(&format!(
+        "    seed prefixsum {:.3}s",
+        pt.elapsed().as_secs_f64()
+    ));
+    let st = Instant::now();
     // Pass 2: scatter. Each chunk owns a disjoint slice of every bucket, so
     // the writes never collide even though they are not contiguous.
     let mut keys: Vec<u64> = vec![0; n];
@@ -601,6 +612,11 @@ fn seed_sort<I: Index>(
             });
     }
 
+    profile_log(&format!(
+        "    seed scatter   {:.3}s",
+        st.elapsed().as_secs_f64()
+    ));
+    let bt = Instant::now();
     // Pass 3: order within each bucket. Buckets share their top `RADIX_BITS`,
     // so what remains is the low bits of the key and then the visible-length
     // tie-break. Buckets are contiguous and independent.
@@ -630,6 +646,10 @@ fn seed_sort<I: Index>(
         }
     });
 
+    profile_log(&format!(
+        "    seed bucketsort {:.3}s",
+        bt.elapsed().as_secs_f64()
+    ));
     (keys, sa)
 }
 
