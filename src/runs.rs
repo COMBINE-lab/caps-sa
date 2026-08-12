@@ -8,9 +8,16 @@
 //!
 //! Genome assemblies always contain these. An `N` block is the obvious case,
 //! and note that in wrapped FASTA it is **not** a run of one symbol: 60 `N`s
-//! followed by a newline is a run of period 61. Satellite arrays are runs of
-//! period 171. So detecting only single-symbol runs would miss the case that
-//! actually shows up.
+//! followed by a newline is a run of period 61. So detecting only
+//! single-symbol runs would miss the representation that actually shows up.
+//!
+//! The detector covers periods up to [`MAX_PERIOD`] and **not** beyond.
+//! Measured on synthetic 1 MiB periodic inputs, periods 1, 2, 61 and 64 are
+//! detected with full coverage and sort 5.8-6.9x faster; periods 65 and 171
+//! are not detected at all and run at parity. Alpha-satellite arrays, whose
+//! canonical monomer is 171 bases, are therefore *outside* this detector.
+//! The sampling stage can also miss a run that is localised enough to fall
+//! between its windows.
 //!
 //! The observation that makes this cheap: if `text[s..e)` has period `q`, and
 //! two suffixes start at `a < b` inside it with `(b - a) % q == 0`, then they
@@ -45,13 +52,26 @@ use std::cmp::Ordering;
 /// the run faster than the binary search that would find it.
 const MIN_RUN: usize = 1024;
 
-/// Longest period considered. Covers homopolymers (1), wrapped-FASTA `N`
-/// blocks (61), and alpha-satellite monomers (171 exceeds this, but a
-/// satellite array is also periodic at shorter scales in practice).
+/// Longest period considered. Covers homopolymers (period 1) and
+/// wrapped-FASTA `N` blocks (period 61), which are the cases that occur in
+/// practice in assembly FASTA.
+///
+/// It does **not** cover alpha-satellite arrays: their canonical monomer is
+/// 171 bases, and a synthetic period-171 input measures at parity with no
+/// detection at all. Raising this is a constant change, but the detection
+/// scan is `O(periods x n)`, so it is not free.
 const MAX_PERIOD: usize = 64;
 
 /// Window used by the sampling pass to decide whether a period occurs at all.
 const SAMPLE_WINDOW: usize = 512;
+
+/// Symbols an ordinary scan must match before the run table is consulted.
+///
+/// Two suffixes of real sequence that agree this far are already unusual, so
+/// the table is reached only when it might actually help. Small enough that
+/// the probe is a handful of vector compares, and the probe is not wasted
+/// work: whatever it matches counts towards the answer.
+const RUN_PROBE: usize = 256;
 
 /// A maximal stretch `[start, end)` of the text with period `period`, meaning
 /// `text[i] == text[i + period]` for every `i` in `start..end - period`.
@@ -247,12 +267,33 @@ impl<'a> Cmp<'a> {
     ///
     /// With an empty run table this is exactly [`LcpDispatch::lcp`] plus one
     /// predictable branch.
+    ///
+    /// When a table *is* present, the ordinary bounded scan still runs first.
+    /// Consulting the table costs up to three binary searches before any
+    /// comparison happens, and the overwhelming majority of LCP calls in real
+    /// sequence mismatch within a few symbols and never reach a run at all.
+    /// Paying the lookup up front taxed every one of them: on a filtered,
+    /// `N`-containing chr21 that alone turned a 1.80 s build into 2.72 s even
+    /// though the answers were identical.
+    ///
+    /// So: probe first, and only once a match has survived [`RUN_PROBE`]
+    /// symbols — which ordinary genomic difference does not — is it worth
+    /// asking whether a run explains it.
     #[inline]
     pub(crate) fn lcp<S: Symbol>(&self, text: &[S], p: usize, q: usize, max_ctx: usize) -> usize {
         if self.runs.is_empty() || size_of::<S>() != 1 {
             return self.dispatch.lcp(text, p, q, max_ctx);
         }
-        let mut i = 0usize;
+
+        let probe = max_ctx.min(RUN_PROBE);
+        let got = self.dispatch.lcp(text, p, q, probe);
+        if got < probe || probe == max_ctx {
+            // Either a real mismatch, or the caller's bound was reached. No
+            // run can extend this, so the table is never touched.
+            return got;
+        }
+
+        let mut i = got;
         while i < max_ctx {
             let jump = self.runs.skip(p + i, q + i);
             if jump > 0 {

@@ -245,11 +245,17 @@ impl Packer {
 /// Computed once per build and handed to [`seed_subarray`], which would
 /// otherwise re-scan the whole text for every subarray.
 pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
-    if size_of::<S>() != 1 {
+    // Exactly `u8`, not merely one byte wide. `Symbol` is implemented for
+    // `i8` too, and a packed key orders its fields as unsigned: `-1` has byte
+    // `0xFF` and would sort above `1`, inverting the text's real order. The
+    // in-memory doubling guard already required exact `u8`; the packed-key
+    // paths must match it.
+    if std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>() {
         return None;
     }
-    // SAFETY: `S` is one byte wide, so a byte view over the same memory is
-    // valid for reads of the same length.
+    // SAFETY: `S` is `u8` (just checked by `TypeId`, and `Symbol: 'static` so
+    // the comparison is exact), so a byte view over the same memory is valid
+    // for reads of the same length.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
     Some(Packer::new(bytes))
@@ -301,7 +307,7 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
         }
         return true;
     }
-    // SAFETY: `params` is `Some` only when `S` is one byte wide.
+    // SAFETY: `packer` is `Some` only when `S` is exactly `u8`.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
 
@@ -782,6 +788,21 @@ mod tests {
     fn check(text: &[u8]) {
         let got: Vec<u32> = build_sa(text);
         assert_eq!(got, brute(text), "mismatch on {text:?}");
+    }
+
+    /// `Symbol` is implemented for `i8`, and a one-byte-wide check alone lets a
+    /// signed text through a packer that orders bytes as unsigned. `-1` has
+    /// byte `0xFF`, so it would sort above `1`, inverting the true order.
+    #[test]
+    fn signed_symbols_are_not_eligible_for_packing() {
+        let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
+        assert!(
+            seed_params(&text).is_none(),
+            "i8 texts must not get a packed key"
+        );
+        // u8 of the same width still qualifies.
+        let bytes: Vec<u8> = vec![1, 0, 1, 2, 3, 0];
+        assert!(seed_params(&bytes).is_some());
     }
 
     #[test]

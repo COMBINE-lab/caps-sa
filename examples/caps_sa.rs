@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
 
-use caps_sa::{ExtMemOpts, build_ext_mem, build_in_memory, build_in_memory_sample_sort, verify_sa};
+use caps_sa::{
+    ExtMemOpts, build_ext_mem, build_ext_mem_for_filter, build_in_memory,
+    build_in_memory_sample_sort, verify_sa,
+};
 
 struct Args {
     input: PathBuf,
@@ -28,6 +31,7 @@ struct Args {
     subproblem_count: usize,
     threads: Option<usize>,
     verify: bool,
+    filter_acgt: bool,
 }
 
 fn parse_args() -> Args {
@@ -38,6 +42,7 @@ fn parse_args() -> Args {
     let mut subproblem_count: usize = 0;
     let mut threads: Option<usize> = None;
     let mut verify = false;
+    let mut filter_acgt = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -51,6 +56,13 @@ fn parse_args() -> Args {
             }
             "--verify" => {
                 verify = true;
+                i += 1;
+            }
+            // Sort only suffixes starting at a symbol below 4, the shape a
+            // STAR-style genome index uses: A/C/G/T participate, N and
+            // spacers do not.
+            "--filter-acgt" => {
+                filter_acgt = true;
                 i += 1;
             }
             "--subproblem-count" => {
@@ -95,6 +107,7 @@ fn parse_args() -> Args {
         subproblem_count,
         threads,
         verify,
+        filter_acgt,
     }
 }
 
@@ -174,7 +187,18 @@ fn main() -> std::io::Result<()> {
         let mut count = 0usize;
         let mode_label = if args.ext_mem { "ext-mem" } else { "in-mem-ss" };
         let build_start = Instant::now();
-        if args.ext_mem {
+        if args.ext_mem && args.filter_acgt {
+            build_ext_mem_for_filter(
+                &text,
+                |p| text[p as usize] < 4,
+                &opts,
+                |pos| {
+                    count += 1;
+                    writer.borrow_mut().write_all(&pos.to_le_bytes())?;
+                    Ok(())
+                },
+            )?;
+        } else if args.ext_mem {
             build_ext_mem(&text, &opts, |pos| {
                 count += 1;
                 writer.borrow_mut().write_all(&pos.to_le_bytes())?;

@@ -225,8 +225,11 @@ stop at a run's start rather than traversing it.
 
 Detecting only single-symbol runs would miss the case that actually
 occurs: in wrapped FASTA an `N` block is 60 `N`s followed by a newline,
-which is period 61, not period 1. Periods up to 64 are considered, which
-also covers satellite arrays.
+which is period 61, not period 1. Periods up to 64 are considered.
+Measured on synthetic periodic inputs, periods 1, 2, 61 and 64 sort
+5.8-6.9x faster, while periods 65 and 171 are not detected and run at
+parity, so alpha-satellite arrays (canonical monomer 171 bases) fall
+outside the detector.
 
 Detection is two-stage so texts without repeats pay almost nothing: a
 sampling pass collects the periods that occur at all, and the full scan

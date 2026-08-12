@@ -505,7 +505,16 @@ where
     let p = effective_subproblem_count(n, opts.subproblem_count);
     let runs = crate::runs::detect_for(text);
     let cmp = Cmp::new(LcpDispatch::detect(), &runs);
-    let seed_packer = crate::radix::seed_params(text);
+    // Only build the alphabet map once every eligibility condition holds.
+    // `Packer::new` may materialise a ranked copy of the whole text, and on a
+    // segmented or context-bounded build that copy could never be used: the
+    // packed-key paths all decline those. Constructing it first cost real
+    // resident memory for nothing.
+    let seed_packer = if opts.max_context == usize::MAX && lp.plain_lex_len() == Some(text.len()) {
+        crate::radix::seed_params(text)
+    } else {
+        None
+    };
     let seed_params = seed_packer.as_ref();
     let work_dir = opts.work_dir.clone();
 
@@ -630,7 +639,16 @@ where
     let p = effective_subproblem_count(n, opts.subproblem_count);
     let runs = crate::runs::detect_for(text);
     let cmp = Cmp::new(LcpDispatch::detect(), &runs);
-    let seed_packer = crate::radix::seed_params(text);
+    // Only build the alphabet map once every eligibility condition holds.
+    // `Packer::new` may materialise a ranked copy of the whole text, and on a
+    // segmented or context-bounded build that copy could never be used: the
+    // packed-key paths all decline those. Constructing it first cost real
+    // resident memory for nothing.
+    let seed_packer = if opts.max_context == usize::MAX && lp.plain_lex_len() == Some(text.len()) {
+        crate::radix::seed_params(text)
+    } else {
+        None
+    };
     let seed_params = seed_packer.as_ref();
 
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
@@ -2023,6 +2041,77 @@ mod tests {
     use super::*;
     use crate::build_in_memory;
     use tempfile::tempdir;
+
+    /// Build with the external-memory path over an arbitrary `Symbol`.
+    fn ext_mem_sa_of<S: Symbol>(text: &[S], p: usize) -> Vec<u64> {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: p,
+            work_dir: dir.path().to_path_buf(),
+            ..ExtMemOpts::default()
+        };
+        let mut out: Vec<u64> = Vec::with_capacity(text.len());
+        build_ext_mem(text, &opts, |pos| {
+            out.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// Reference order: sort suffixes with the slice comparator, which uses
+    /// `S`'s own `Ord`.
+    fn direct_sa<S: Symbol>(text: &[S]) -> Vec<u64> {
+        let mut sa: Vec<u64> = (0..text.len() as u64).collect();
+        sa.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        sa
+    }
+
+    /// `Symbol` is implemented for `i8`, and a packed key orders its fields as
+    /// unsigned, so `-1` (byte `0xFF`) would sort above `1`. The packed-key
+    /// paths must decline signed symbols; these cover the two entry points
+    /// that reach them.
+    #[test]
+    fn ext_mem_signed_i8_matches_direct_order() {
+        let fixtures: Vec<Vec<i8>> = vec![
+            vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0],
+            vec![i8::MIN, 0, i8::MAX, -1, 1, i8::MIN, i8::MAX, 0],
+            (0..200).map(|i: i32| (i % 7 - 3) as i8).collect(),
+        ];
+        for text in fixtures {
+            for p in [1usize, 3, 8] {
+                assert_eq!(
+                    ext_mem_sa_of(&text, p),
+                    direct_sa(&text),
+                    "ext-mem p={p} disagrees on {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn in_memory_sample_sort_signed_i8_matches_direct_order() {
+        let fixtures: Vec<Vec<i8>> = vec![
+            vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0],
+            (0..300).map(|i: i32| (i % 5 - 2) as i8).collect(),
+        ];
+        for text in fixtures {
+            let mut out: Vec<u64> = Vec::new();
+            build_in_memory_sample_sort(&text, &ExtMemOpts::default(), |pos| {
+                out.push(pos);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(out, direct_sa(&text), "sample sort disagrees on {text:?}");
+        }
+    }
+
+    #[test]
+    fn in_memory_signed_i8_matches_direct_order() {
+        let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
+        let got: Vec<u64> = crate::build_in_memory(&text);
+        assert_eq!(got, direct_sa(&text));
+    }
 
     fn ext_mem_sa(text: &[u8], p: usize) -> Vec<u64> {
         let dir = tempdir().unwrap();
