@@ -340,6 +340,7 @@ where
         &mut sa_w,
         &mut lcp_arr,
         &mut lcp_w,
+        0,
         opts.max_context,
         cmp,
     );
@@ -367,6 +368,7 @@ pub(crate) fn merge_sort<S, I, L>(
     sa_w: &mut [I],
     lcp_arr: &mut [I],
     lcp_w: &mut [I],
+    base: usize,
     max_ctx: usize,
     cmp: Cmp<'_>,
 ) where
@@ -381,7 +383,7 @@ pub(crate) fn merge_sort<S, I, L>(
 
     if n <= 1 {
         if n == 1 {
-            lcp_arr[0] = I::zero();
+            lcp_arr[0] = I::from_usize(base);
         }
         return;
     }
@@ -393,15 +395,15 @@ pub(crate) fn merge_sort<S, I, L>(
     let (lcp_w_l, lcp_w_r) = lcp_w.split_at_mut(mid);
 
     join(
-        || merge_sort(text, lp, sa_l, sa_w_l, lcp_l, lcp_w_l, max_ctx, cmp),
-        || merge_sort(text, lp, sa_r, sa_w_r, lcp_r, lcp_w_r, max_ctx, cmp),
+        || merge_sort(text, lp, sa_l, sa_w_l, lcp_l, lcp_w_l, base, max_ctx, cmp),
+        || merge_sort(text, lp, sa_r, sa_w_r, lcp_r, lcp_w_r, base, max_ctx, cmp),
     );
 
     // Merge the two sorted halves (still living in `sa`) into the workspace,
     // then copy the workspace back into the destination so the caller's
     // postcondition holds on `sa` / `lcp_arr`.
-    merge(
-        text, lp, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, max_ctx, cmp,
+    merge_from(
+        text, lp, sa_l, sa_r, lcp_l, lcp_r, sa_w, lcp_w, base, max_ctx, cmp,
     );
     sa.copy_from_slice(sa_w);
     lcp_arr.copy_from_slice(lcp_w);
@@ -425,6 +427,43 @@ pub(crate) fn merge<S, I, L>(
     lcp_y: &[I],
     z: &mut [I],
     lcp_z: &mut [I],
+    max_ctx: usize,
+    cmp: Cmp<'_>,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    merge_from(text, lp, x, y, lcp_x, lcp_y, z, lcp_z, 0, max_ctx, cmp)
+}
+
+/// [`merge`], but told that every element of both runs already shares `base`
+/// symbols.
+///
+/// This is the LCP-reuse the key sort makes available and the merge otherwise
+/// throws away: a tied group coming out of a packed-key sort agrees on at
+/// least `k` symbols by construction, yet every comparison inside it used to
+/// rescan them from zero.
+///
+/// It costs one substitution in the existing invariant. The three-case rule is
+/// stated against the last-output element `z_last`, initialised to the empty
+/// string; here it is initialised to the length-`base` prefix `B` that every
+/// element shares. `lcp(B, s) = base` for every `s` in either run, so `m`
+/// starts at `base`; `B` is a prefix of every element, so it still precedes
+/// them all; and `lcp_x[0] = base` is exactly what the first iteration reads.
+/// The loop body is untouched, because every case in it is an argument about
+/// *relative* offsets and none of them mentions zero.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_from<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    base: usize,
     max_ctx: usize,
     cmp: Cmp<'_>,
 ) where
@@ -462,7 +501,7 @@ pub(crate) fn merge<S, I, L>(
     let mut len_b = len_y;
     let mut i_a: usize = 0;
     let mut i_b: usize = 0;
-    let mut m: usize = 0;
+    let mut m: usize = base;
     let mut k: usize = 0;
     let mut lim_a_cache: Option<(usize, usize)> = None;
     let mut lim_b_cache: Option<(usize, usize)> = None;
@@ -635,6 +674,7 @@ mod tests {
             &mut sa_w,
             &mut lcp_arr,
             &mut lcp_w,
+            0,
             max_ctx,
             Cmp::new(LcpDispatch::detect(), &crate::runs::RunTable::empty()),
         );

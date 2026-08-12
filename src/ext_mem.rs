@@ -1294,6 +1294,7 @@ where
                     &mut sa_w,
                     &mut lcp_arr,
                     &mut lcp_w,
+                    0,
                     opts.max_context,
                     cmp,
                 );
@@ -1380,6 +1381,7 @@ where
         &mut sa_w,
         &mut lcp,
         &mut lcp_w,
+        0,
         max_ctx,
         cmp,
     );

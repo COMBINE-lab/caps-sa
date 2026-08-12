@@ -412,6 +412,14 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
             j += 1;
         }
         if j - i > 1 {
+            // Everything in this group agreed through the whole key, so the
+            // merge can start its scans there instead of at zero. For a plain
+            // text the key covers `k` symbols unless the suffix ran out first,
+            // which the visible-length component records.
+            let base = match seg_rank {
+                None if keyed[i].1 as usize == k => k,
+                _ => 0,
+            };
             sample_sort::merge_sort(
                 text,
                 lp,
@@ -419,6 +427,7 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
                 &mut sa_w[i..j],
                 &mut lcp[i..j],
                 &mut lcp_w[i..j],
+                base,
                 max_ctx,
                 cmp,
             );
