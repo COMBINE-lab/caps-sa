@@ -25,6 +25,27 @@
 //! `--plain` swaps the segmented provider for `PlainText`, which is the
 //! comparison worth having: it shows what the same positions cost when the
 //! segmented comparator is not required.
+//!
+//! ## Measured, and the trade-off it exposes
+//!
+//! Apple M4 Max, 12 threads, chr21 plus a 698,597-junction library
+//! (372,858,766 symbols, 1,397,196 segments, 320,856,244 retained ACGT-start
+//! positions) — the same segment count as a GENCODE v50 primary-assembly
+//! fixture:
+//!
+//! ```text
+//!                          segmented keys off    segmented keys on
+//!   phase 1                      9.544 s              3.313 s
+//!   phase 4                     11.616 s             11.421 s
+//!   total                       22.718 s             16.256 s   -28%
+//!   peak RSS                     3.45 GB              5.33 GB   +54%
+//! ```
+//!
+//! Phase 1 is cut by 65%, but peak memory rises by half: the ranked text copy
+//! and the per-subarray key vectors are both proportional to the input. For a
+//! constructor whose argument against the alternatives is memory, that is not
+//! a trade to make unconditionally, which is why this wants a memory budget
+//! rather than a default. Recording it here so the number is not lost.
 
 use std::cmp::Ordering;
 use std::env;
