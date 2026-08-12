@@ -510,11 +510,16 @@ where
     // segmented or context-bounded build that copy could never be used: the
     // packed-key paths all decline those. Constructing it first cost real
     // resident memory for nothing.
-    let seed_packer = if opts.max_context == usize::MAX && lp.plain_lex_len() == Some(text.len()) {
-        crate::radix::seed_params(text)
-    } else {
-        None
-    };
+    let plain_text = lp.plain_lex_len() == Some(text.len());
+    let seed_packer =
+        if opts.max_context == usize::MAX && (plain_text || lp.boundary_rank().is_some()) {
+            // A segmented build needs one spare code for the boundary sentinel;
+            // a plain one must not pay for it, since widening the field halves
+            // the symbols a key carries.
+            crate::radix::seed_params(text, !plain_text)
+        } else {
+            None
+        };
     let seed_params = seed_packer.as_ref();
     let work_dir = opts.work_dir.clone();
 
@@ -644,11 +649,16 @@ where
     // segmented or context-bounded build that copy could never be used: the
     // packed-key paths all decline those. Constructing it first cost real
     // resident memory for nothing.
-    let seed_packer = if opts.max_context == usize::MAX && lp.plain_lex_len() == Some(text.len()) {
-        crate::radix::seed_params(text)
-    } else {
-        None
-    };
+    let plain_text = lp.plain_lex_len() == Some(text.len());
+    let seed_packer =
+        if opts.max_context == usize::MAX && (plain_text || lp.boundary_rank().is_some()) {
+            // A segmented build needs one spare code for the boundary sentinel;
+            // a plain one must not pay for it, since widening the field halves
+            // the symbols a key carries.
+            crate::radix::seed_params(text, !plain_text)
+        } else {
+            None
+        };
     let seed_params = seed_packer.as_ref();
 
     let factory = |_i: usize| InMemBucket::<SaLcp<I>>::new();
@@ -2040,6 +2050,7 @@ impl<I: Index> CascadeWorkspace<I> {
 mod tests {
     use super::*;
     use crate::build_in_memory;
+    use crate::limits::SegmentedText;
     use tempfile::tempdir;
 
     /// Build with the external-memory path over an arbitrary `Symbol`.
@@ -2111,6 +2122,154 @@ mod tests {
         let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
         let got: Vec<u64> = crate::build_in_memory(&text);
         assert_eq!(got, direct_sa(&text));
+    }
+
+    /// A `LimitProvider` with STAR's spacer-as-largest convention: the suffix
+    /// that reaches its boundary first is *larger*, with an ascending-position
+    /// tie-break. This is the comparator a splice-junction index uses.
+    struct StarConvention {
+        inner: SegmentedText,
+    }
+
+    impl LimitProvider for StarConvention {
+        fn lim_at(&self, p: usize) -> usize {
+            self.inner.lim_at(p)
+        }
+        fn boundary_order(
+            &self,
+            p_a: usize,
+            lim_a: usize,
+            p_b: usize,
+            lim_b: usize,
+        ) -> std::cmp::Ordering {
+            lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))
+        }
+        fn boundary_rank(&self) -> Option<crate::limits::BoundaryRank> {
+            Some(crate::limits::BoundaryRank::LongerFirst)
+        }
+    }
+
+    /// The provider's own comparator, spelled out.
+    fn direct_cmp<L: LimitProvider>(text: &[u8], lp: &L, a: u64, b: u64) -> std::cmp::Ordering {
+        let (pa, pb) = (a as usize, b as usize);
+        let (la, lb) = (lp.lim_at(pa), lp.lim_at(pb));
+        for i in 0..la.min(lb) {
+            if text[pa + i] != text[pb + i] {
+                return text[pa + i].cmp(&text[pb + i]);
+            }
+        }
+        lp.boundary_order(pa, la, pb, lb)
+    }
+
+    /// Assert `got` is a valid sort of `positions` under `lp`'s comparator.
+    ///
+    /// Checked as a property rather than against a canonical permutation:
+    /// `SegmentedText`'s default `boundary_order` returns `Equal` for suffixes
+    /// that end together with equal content, so their relative order is free
+    /// and no single answer is "the" right one. The merge kernel is not a
+    /// stable sort either.
+    fn assert_sorted_under<L: LimitProvider>(
+        text: &[u8],
+        lp: &L,
+        positions: &[u64],
+        got: &[u64],
+        what: &str,
+    ) {
+        let mut want = positions.to_vec();
+        want.sort_unstable();
+        let mut have = got.to_vec();
+        have.sort_unstable();
+        assert_eq!(have, want, "{what}: not a permutation of the input");
+        for w in got.windows(2) {
+            assert_ne!(
+                direct_cmp(text, lp, w[0], w[1]),
+                std::cmp::Ordering::Greater,
+                "{what}: {} precedes {} but compares greater",
+                w[0],
+                w[1],
+            );
+        }
+    }
+
+    fn ext_mem_sa_with<L: LimitProvider>(
+        text: &[u8],
+        lp: &L,
+        p: usize,
+        positions: Vec<u64>,
+    ) -> Vec<u64> {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: p,
+            work_dir: dir.path().to_path_buf(),
+            ..ExtMemOpts::default()
+        };
+        let mut out: Vec<u64> = Vec::with_capacity(positions.len());
+        build_ext_mem_for_positions_with(text, positions, lp, &opts, |pos| {
+            out.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// Segmented texts now get packed keys too: the key stops at the segment
+    /// boundary and pads with a reserved sentinel on the side the provider's
+    /// `boundary_order` demands. These check both conventions, and the
+    /// ACGT-start filter a splice-junction index applies, against the direct
+    /// comparator.
+    #[test]
+    fn ext_mem_segmented_matches_direct_comparator() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5D1CE);
+        for trial in 0..12 {
+            let n_seg = rng.random_range(2..8usize);
+            let lengths: Vec<usize> = (0..n_seg).map(|_| rng.random_range(4..60usize)).collect();
+            let n: usize = lengths.iter().sum();
+            // A/C/G/T/N plus a spacer code, the ruSTAR alphabet.
+            let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..6u8)).collect();
+            let seg = SegmentedText::from_lengths(n, &lengths);
+            let all: Vec<u64> = (0..n as u64).collect();
+            let acgt: Vec<u64> = all
+                .iter()
+                .copied()
+                .filter(|&p| text[p as usize] < 4)
+                .collect();
+
+            for p in [1usize, 2, 5] {
+                assert_sorted_under(
+                    &text,
+                    &seg,
+                    &all,
+                    &ext_mem_sa_with(&text, &seg, p, all.clone()),
+                    &format!("shorter-first, all positions, trial {trial} p={p}"),
+                );
+                assert_sorted_under(
+                    &text,
+                    &seg,
+                    &acgt,
+                    &ext_mem_sa_with(&text, &seg, p, acgt.clone()),
+                    &format!("shorter-first, ACGT filter, trial {trial} p={p}"),
+                );
+
+                let star = StarConvention {
+                    inner: SegmentedText::from_lengths(n, &lengths),
+                };
+                assert_sorted_under(
+                    &text,
+                    &star,
+                    &all,
+                    &ext_mem_sa_with(&text, &star, p, all.clone()),
+                    &format!("longer-first, all positions, trial {trial} p={p}"),
+                );
+                assert_sorted_under(
+                    &text,
+                    &star,
+                    &acgt,
+                    &ext_mem_sa_with(&text, &star, p, acgt.clone()),
+                    &format!("longer-first, ACGT filter, trial {trial} p={p}"),
+                );
+            }
+        }
     }
 
     fn ext_mem_sa(text: &[u8], p: usize) -> Vec<u64> {

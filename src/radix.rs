@@ -60,7 +60,7 @@
 use crate::Index;
 use crate::ext_mem::profile_log;
 use crate::lcp::Symbol;
-use crate::limits::LimitProvider;
+use crate::limits::{BoundaryRank, LimitProvider};
 use crate::runs::Cmp;
 use crate::sample_sort;
 use rayon::prelude::*;
@@ -93,11 +93,14 @@ pub(crate) struct Packer {
     bits: u32,
     /// Symbols per `u64` key.
     k: usize,
+    /// Number of distinct codes in use. Codes are `0..alphabet`; `alphabet`
+    /// itself is free for use as a boundary sentinel when it fits the field.
+    alphabet: u32,
 }
 
 impl Packer {
     /// Build the map for `text`.
-    fn new(text: &[u8]) -> Self {
+    fn new(text: &[u8], need_sentinel: bool) -> Self {
         // Which bytes occur? One parallel pass, folded into a 256-entry set.
         let present = text
             .par_chunks(1 << 16)
@@ -128,7 +131,16 @@ impl Packer {
                 next += 1;
             }
         }
-        let bits: u32 = match next.saturating_sub(1) {
+        // A segmented key needs one code above the alphabet for its boundary
+        // sentinel, so the field must hold `alphabet`, not `alphabet - 1`.
+        // Plain builds do not pay for that: widening the field would halve the
+        // symbols per key, which is the whole point of packing.
+        let widest = if need_sentinel {
+            next
+        } else {
+            next.saturating_sub(1)
+        };
+        let bits: u32 = match widest {
             0..=1 => 1,
             2..=3 => 2,
             4..=15 => 4,
@@ -153,6 +165,7 @@ impl Packer {
             ranked,
             bits,
             k: 64 / bits as usize,
+            alphabet: next as u32,
         }
     }
 
@@ -197,6 +210,54 @@ impl Packer {
             }
             _ => v,
         }
+    }
+
+    /// Whether a boundary sentinel fits alongside the alphabet in one field.
+    ///
+    /// With 8-bit fields and 256 distinct symbols there is no spare code, so
+    /// segmented keys are unavailable and the caller must fall back.
+    #[inline]
+    pub(crate) fn has_sentinel(&self) -> bool {
+        (self.alphabet as u64) < (1u64 << self.bits)
+    }
+
+    /// Pack the `min(k, lim)` symbols at `text[p..]`, padding the rest with a
+    /// boundary sentinel placed according to `rank`.
+    ///
+    /// This is the segmented counterpart to [`Self::key_at`]. It never reads
+    /// past `p + lim`, so a key cannot see into the next segment, and the
+    /// sentinel falls below every real code under
+    /// [`BoundaryRank::ShorterFirst`] and above every real code under
+    /// [`BoundaryRank::LongerFirst`]. That is what makes key order agree with
+    /// the provider's `boundary_order` whenever the key decides at all.
+    ///
+    /// Under `ShorterFirst` the sentinel is code `0` and every real code is
+    /// shifted up by one, so a padded field is strictly below any real symbol.
+    /// Under `LongerFirst` the sentinel is `alphabet`, strictly above every
+    /// real code, and no shift is needed.
+    #[inline]
+    pub(crate) fn key_at_bounded(
+        &self,
+        text: &[u8],
+        p: usize,
+        lim: usize,
+        rank: BoundaryRank,
+    ) -> u64 {
+        debug_assert!(self.has_sentinel());
+        let src = self.ranked.as_deref().unwrap_or(text);
+        let take = self.k.min(lim).min(src.len() - p);
+        let (bias, pad) = match rank {
+            BoundaryRank::ShorterFirst => (1u64, 0u64),
+            BoundaryRank::LongerFirst => (0u64, self.alphabet as u64),
+        };
+        let mut key = 0u64;
+        for &c in &src[p..p + take] {
+            key = (key << self.bits) | (c as u64 + bias);
+        }
+        for _ in take..self.k {
+            key = (key << self.bits) | pad;
+        }
+        key
     }
 
     /// Pack the `k` symbols at `text[p..]` into one order-preserving `u64`,
@@ -244,7 +305,7 @@ impl Packer {
 ///
 /// Computed once per build and handed to [`seed_subarray`], which would
 /// otherwise re-scan the whole text for every subarray.
-pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
+pub(crate) fn seed_params<S: Symbol>(text: &[S], need_sentinel: bool) -> Option<Packer> {
     // Exactly `u8`, not merely one byte wide. `Symbol` is implemented for
     // `i8` too, and a packed key orders its fields as unsigned: `-1` has byte
     // `0xFF` and would sort above `1`, inverting the text's real order. The
@@ -258,7 +319,7 @@ pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
     // for reads of the same length.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-    Some(Packer::new(bytes))
+    Some(Packer::new(bytes, need_sentinel))
 }
 
 /// Sort `sa` into suffix order and fill `lcp`, using a packed fixed-depth key
@@ -297,9 +358,20 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
         return false;
     };
     let (bits, k) = (packer.bits(), packer.k());
-    if max_ctx != usize::MAX || lp.plain_lex_len() != Some(text.len()) {
+    if max_ctx != usize::MAX {
         return false;
     }
+    // Plain text keys pad past end-of-text and need the visible-length
+    // tie-break, because a real `0` symbol is indistinguishable from padding.
+    // A segmented text instead stops the key at `lim_at(p)` and pads with a
+    // reserved sentinel placed on the side the provider's `boundary_order`
+    // demands, which encodes the boundary directly and needs no tie-break.
+    let plain = lp.plain_lex_len() == Some(text.len());
+    let seg_rank = match (plain, lp.boundary_rank()) {
+        (true, _) => None,
+        (false, Some(r)) if packer.has_sentinel() => Some(r),
+        _ => return false,
+    };
     let len = sa.len();
     if len < 2 {
         if len == 1 {
@@ -320,7 +392,10 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
         .iter()
         .map(|&p| {
             let p = p.to_usize();
-            (packer.key_at(bytes, p), visible(p) as u32, p_as(p))
+            match seg_rank {
+                None => (packer.key_at(bytes, p), visible(p) as u32, p_as(p)),
+                Some(r) => (packer.key_at_bounded(bytes, p, lp.lim_at(p), r), 0, p_as(p)),
+            }
         })
         .collect();
     keyed.sort_unstable();
@@ -524,7 +599,7 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     }
 
     let t0 = Instant::now();
-    let packer = Packer::new(text);
+    let packer = Packer::new(text, false);
     let k = packer.k();
 
     // ---- Seed: sort by the first `k` symbols, then by visible length. ----
@@ -797,12 +872,12 @@ mod tests {
     fn signed_symbols_are_not_eligible_for_packing() {
         let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
         assert!(
-            seed_params(&text).is_none(),
+            seed_params(&text, false).is_none(),
             "i8 texts must not get a packed key"
         );
         // u8 of the same width still qualifies.
         let bytes: Vec<u8> = vec![1, 0, 1, 2, 3, 0];
-        assert!(seed_params(&bytes).is_some());
+        assert!(seed_params(&bytes, false).is_some());
     }
 
     #[test]
@@ -820,18 +895,18 @@ mod tests {
     /// fitting only 8 symbols per key instead of 16.
     #[test]
     fn packer_width_follows_alphabet_size_not_byte_value() {
-        let two = Packer::new(b"abababab");
+        let two = Packer::new(b"abababab", false);
         assert_eq!((two.bits(), two.k()), (1, 64));
-        let four = Packer::new(&[0u8, 1, 2, 3, 3, 2, 1, 0]);
+        let four = Packer::new(&[0u8, 1, 2, 3, 3, 2, 1, 0], false);
         assert_eq!((four.bits(), four.k()), (2, 32));
 
         let mut fasta: Vec<u8> = b"ACGTN".to_vec();
         fasta.push(b'\n');
-        let f = Packer::new(&fasta);
+        let f = Packer::new(&fasta, false);
         assert_eq!((f.bits(), f.k()), (4, 16), "6 symbols should pack 4 bits");
 
         let dense: Vec<u8> = (0..=255u8).collect();
-        let d = Packer::new(&dense);
+        let d = Packer::new(&dense, false);
         assert_eq!((d.bits(), d.k()), (8, 8));
     }
 
@@ -851,7 +926,7 @@ mod tests {
             let mut ascending: Vec<u8> = text.clone();
             ascending.sort_unstable();
             ascending.dedup();
-            let p = Packer::new(&ascending);
+            let p = Packer::new(&ascending, false);
             let keys: Vec<u64> = (0..ascending.len())
                 .map(|i| p.key_at(&ascending, i))
                 .collect();
@@ -876,7 +951,7 @@ mod tests {
         for &sigma in &[2u8, 4, 16, 200] {
             for &n in &[1usize, 7, 8, 9, 31, 32, 33, 63, 64, 65, 200] {
                 let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
-                let p = Packer::new(&text);
+                let p = Packer::new(&text, false);
                 let (bits, k) = (p.bits(), p.k());
                 let ranked = p.ranked.as_deref().unwrap_or(&text);
                 for pos in 0..n {
