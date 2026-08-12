@@ -462,6 +462,49 @@ rank-only, so they cost a sort over a shrinking residual rather than a
 text scan, which is why the pathology disappears rather than merely
 shrinking.
 
+### Where the external-memory path's remaining time is
+
+Per-phase thread scaling on chr21 forward ++ revcomp (80 MB), 1 to 12
+threads:
+
+```
+  threads      phase 1     phase 3     phase 4     total
+        1       2.088 s     0.756 s     6.413 s    9.288 s
+        6       0.393 s     0.413 s     1.359 s    2.192 s
+       12       0.289 s     0.361 s     0.954 s    1.640 s
+  speedup         7.2x        2.1x        6.7x       5.7x
+```
+
+Phases 1 and 4 scale acceptably. **Phase 3 does not**: it saturates by
+six threads and gains 14% going from six to twelve. It is 22% of the
+wall at twelve threads and would be a larger share on any wider machine.
+
+Two hypotheses for it were tested and both are wrong:
+
+- *Physical file contention.* The `p` logical buckets share
+  `n_phys` physical files, defaulting to the thread count, so every
+  write might be queueing behind twelve descriptors. Raising it does not
+  help and mildly hurts: phase 3 measures 0.356 / 0.379 / 0.396 / 0.404 /
+  0.420 s at `CAPS_SA_N_PHYS` of 12 / 24 / 48 / 96 / 192.
+- *Search cost.* Galloping cut the pivot comparisons roughly eightfold
+  and bought 8%; an earlier attempt to accelerate the same searches with
+  packed keys measured nothing at all.
+
+What is left is the write path itself. Phase 3 reads every record back
+and writes every record out again — about 1.3 GB of traffic at this
+input size — and those are file writes through the page cache, which
+does not parallelise with threads. 0.36 s for that traffic is roughly
+3.5 GB/s, far below what this machine's DRAM sustains, which is
+consistent with the kernel path rather than memory being the limit.
+
+So the fix is not to make phase 3 faster but to **not run it**: fuse it
+into phase 1. That needs the pivots before phase 1 rather than after,
+which a cheap pre-sampling pass over the raw positions can supply.
+Correctness does not depend on the pivots being good — any splitters
+give a correct sample sort, and only the balance changes — so the
+restructuring is safer than it looks. It would remove one full
+write-and-read round trip of every record.
+
 ### Measuring the external-memory path reliably
 
 Wall times on the external-memory path drift by 30% or more between
