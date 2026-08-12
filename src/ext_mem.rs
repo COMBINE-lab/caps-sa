@@ -533,7 +533,8 @@ where
     // local-disk wall time is neutral or marginally improved. See
     // `bench/README.md` for the empirical sizing.
     let n_phys = effective_physical_file_count(opts.physical_file_count);
-    let phase1_pool = BucketPool::new(n_phys, &work_dir)?;
+    // One pool now, not two: the fused phase 1 writes partition buckets
+    // directly, so there are no subarray buckets to hold.
     let phase3_pool = BucketPool::new(n_phys, &work_dir)?;
 
     profile_log(&format!(
@@ -541,22 +542,29 @@ where
         std::mem::size_of::<I>() * 8
     ));
 
-    let sub_factory = |i: usize| phase1_pool.new_bucket::<SaLcp<I>>(i);
     let part_factory = |j: usize| phase3_pool.new_bucket::<SaLcp<I>>(j);
 
     let t = Instant::now();
-    let (mut subarray_buckets, samples) = phase1_sort_sample_spill::<S, I, L, _, _>(
+    let pivots = phase0_presample_pivots::<S, I, L>(text, lp, &source, p, opts, cmp);
+    profile_log(&format!(
+        "phase0 (presample pivots)  {:.3}s",
+        t.elapsed().as_secs_f64()
+    ));
+
+    let t = Instant::now();
+    let mut partition_buckets = phase1_sort_and_distribute::<S, I, L, _, _>(
         text,
         lp,
         &source,
+        &pivots,
         p,
         opts,
         cmp,
         seed_params,
-        sub_factory,
+        part_factory,
     )?;
     profile_log(&format!(
-        "phase1 (sort+sample+spill) {:.3}s",
+        "phase1 (sort+distribute)   {:.3}s",
         t.elapsed().as_secs_f64()
     ));
 
@@ -565,34 +573,8 @@ where
     // the caller's `Vec<u64>` (e.g. ~47 GB on a human-scale
     // _for_positions build); for `PositionSource::Filtered` it
     // frees the bitmap + cumsum (~770 MB); for `Identity` it's a
-    // no-op. The text and the spilled `subarray_buckets` are all
-    // phase 2+ needs.
+    // no-op. Phase 4 needs only the text and the partition buckets.
     drop(source);
-
-    let t = Instant::now();
-    let pivots = phase2_select_pivots::<S, I, L>(text, lp, samples, p, opts.max_context, cmp);
-    profile_log(&format!(
-        "phase2 (select pivots)      {:.3}s",
-        t.elapsed().as_secs_f64()
-    ));
-
-    let t = Instant::now();
-    let mut partition_buckets = phase3_distribute::<S, I, L, _, _>(
-        text,
-        lp,
-        &mut subarray_buckets,
-        &pivots,
-        p,
-        opts,
-        cmp,
-        part_factory,
-    )?;
-    profile_log(&format!(
-        "phase3 (distribute)          {:.3}s",
-        t.elapsed().as_secs_f64()
-    ));
-
-    drop(subarray_buckets);
 
     let t = Instant::now();
     let result = phase4_merge_and_emit::<S, I, L, _, E, F>(
@@ -1465,6 +1447,185 @@ where
 
     // Unwrap the Mutexes — at this point only this thread holds
     // references, so the locks are uncontended.
+    Ok(partition_buckets
+        .into_iter()
+        .map(|m| m.into_inner().expect("partition mutex poisoned"))
+        .collect())
+}
+
+/// Phase 0: choose the `p - 1` pivots *before* sorting anything.
+///
+/// The old flow sampled from the already-sorted subarrays, which forced an
+/// ordering: sort everything and spill it, pick pivots, then read all of it
+/// back to distribute. That round trip is the single worst-scaling part of the
+/// build — phase 3 gained 14% going from six threads to twelve, because it is
+/// bound by the page-cache write path rather than by anything threads help
+/// with.
+///
+/// Pivots do not have to come from sorted data. **Any** splitters produce a
+/// correct sample sort; only the balance of the partitions changes. So a cheap
+/// pre-pass over the raw positions can supply them, and phase 1 can then sort
+/// and distribute in one go, never materialising the subarrays at all.
+///
+/// Sampling is by strided blocks rather than strided singletons: a
+/// [`PositionSource`] fills a contiguous run cheaply but pays per call, and
+/// the `Filtered` variant especially so. Blocks give the same coverage of the
+/// position space for a fraction of the calls, and splitter quality is not
+/// sensitive to the difference.
+fn phase0_presample_pivots<S, I, L>(
+    text: &[S],
+    lp: &L,
+    source: &PositionSource<'_>,
+    p: usize,
+    opts: &ExtMemOpts,
+    cmp: Cmp<'_>,
+) -> Vec<I>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = source.len();
+    if p <= 1 || n == 0 {
+        return Vec::new();
+    }
+    const BLOCK: usize = 64;
+    let target = sample_target_total(n, p).min(n);
+    let n_blocks = target.div_ceil(BLOCK).max(1);
+    let stride = (n / n_blocks).max(1);
+
+    let mut sample: Vec<I> = Vec::with_capacity(n_blocks * BLOCK);
+    let mut start = 0usize;
+    while start < n && sample.len() < target {
+        let len = BLOCK.min(n - start);
+        let base = sample.len();
+        sample.resize(base + len, I::zero());
+        source.fill_chunk(start, &mut sample[base..]);
+        start += stride;
+    }
+    if sample.is_empty() {
+        return Vec::new();
+    }
+
+    let m = sample.len();
+    let mut sa_w = vec![I::zero(); m];
+    let mut lcp = vec![I::zero(); m];
+    let mut lcp_w = vec![I::zero(); m];
+    sample_sort::merge_sort(
+        text,
+        lp,
+        &mut sample,
+        &mut sa_w,
+        &mut lcp,
+        &mut lcp_w,
+        0,
+        opts.max_context,
+        cmp,
+    );
+    (1..p).map(|i| sample[(i * m / p).min(m - 1)]).collect()
+}
+
+/// Phase 1, fused with the old phase 3: sort each subarray and write its
+/// pieces straight into the partition buckets.
+///
+/// Because [`phase0_presample_pivots`] has already chosen the splitters, a
+/// subarray never has to be spilled and read back. That removes one complete
+/// write-and-read round trip of every record from the build.
+#[allow(clippy::too_many_arguments)]
+fn phase1_sort_and_distribute<S, I, L, B, MkB>(
+    text: &[S],
+    lp: &L,
+    source: &PositionSource<'_>,
+    pivots: &[I],
+    p: usize,
+    opts: &ExtMemOpts,
+    cmp: Cmp<'_>,
+    seed_params: Option<&crate::radix::Packer>,
+    mk_bucket: MkB,
+) -> io::Result<Vec<B>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+    SaLcp<I>: BucketRecord,
+    B: SaLcpBucketStore<I> + Send,
+    MkB: Fn(usize) -> B + Send + Sync,
+{
+    let n = source.len();
+    let chunk_size = n.div_ceil(p);
+    let partition_buckets: Vec<Mutex<B>> = (0..p).map(|j| Mutex::new(mk_bucket(j))).collect();
+
+    (0..p).into_par_iter().try_for_each(|i| -> io::Result<()> {
+        let start = (i * chunk_size).min(n);
+        let end = ((i + 1) * chunk_size).min(n);
+        let len = end - start;
+        if len == 0 {
+            return Ok(());
+        }
+
+        let mut sa: Vec<I> = vec![I::zero(); len];
+        source.fill_chunk(start, &mut sa);
+        let mut sa_w = vec![I::zero(); len];
+        let mut lcp_arr = vec![I::zero(); len];
+        let mut lcp_w = vec![I::zero(); len];
+        if !crate::radix::seed_subarray(
+            text,
+            lp,
+            seed_params,
+            &mut sa,
+            &mut lcp_arr,
+            &mut sa_w,
+            &mut lcp_w,
+            opts.max_context,
+            cmp,
+        ) {
+            sample_sort::merge_sort(
+                text,
+                lp,
+                &mut sa,
+                &mut sa_w,
+                &mut lcp_arr,
+                &mut lcp_w,
+                0,
+                opts.max_context,
+                cmp,
+            );
+        }
+        drop(sa_w);
+        drop(lcp_w);
+
+        // Split the sorted subarray at the pivots and hand each piece to its
+        // partition. Splits are non-decreasing, so each search gallops from
+        // the previous one.
+        let records: Vec<SaLcp<I>> = sa
+            .iter()
+            .zip(lcp_arr.iter())
+            .map(|(&pos, &lcp)| SaLcp { pos, lcp })
+            .collect();
+        drop(sa);
+        drop(lcp_arr);
+
+        let mut splits = Vec::with_capacity(p + 1);
+        splits.push(0usize);
+        let mut from = 0usize;
+        for &pivot in pivots {
+            from = upper_bound_from(&records, from, pivot, text, lp, opts.max_context, cmp);
+            splits.push(from);
+        }
+        splits.push(records.len());
+
+        for j in 0..p {
+            let (lo, hi) = (splits[j], splits[j + 1]);
+            if lo >= hi {
+                continue;
+            }
+            let mut bucket = partition_buckets[j].lock().unwrap();
+            bucket.add_slice_reset_first_lcp(&records[lo..hi])?;
+            bucket.mark_boundary();
+        }
+        Ok(())
+    })?;
+
     Ok(partition_buckets
         .into_iter()
         .map(|m| m.into_inner().expect("partition mutex poisoned"))
