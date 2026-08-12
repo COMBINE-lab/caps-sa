@@ -171,7 +171,8 @@ the same 32 pinned physical cores:
 
 That is 24.985 seconds or 8.47% less wall time, 5.44% less user CPU, and 6.7%
 lower observed peak RSS. Temporary-file output was unchanged. The identical
-count and hash establish output equality for the complete fixture.
+count and 128-bit streaming hash strongly corroborate output equality for the
+complete fixture; the focused fixture was compared position-for-position.
 
 An instrumented full run found all 8,192 tables activated. It performed 78.45
 million successor lookups, retained 14.24 million intervals (maximum 3,196 in
