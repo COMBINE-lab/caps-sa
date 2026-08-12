@@ -300,6 +300,48 @@ impl Packer {
     }
 }
 
+/// The LCP array of `sa`, computed from the suffix array itself in `O(n)`.
+///
+/// Kasai's algorithm. `lcp[i]` is the number of symbols
+/// `text[sa[i - 1]..]` and `text[sa[i]..]` share, and `lcp[0]` is `0`.
+///
+/// This exists because prefix doubling answers comparisons from ranks and so
+/// never produces the LCP array the merge kernel yields as a byproduct, which
+/// is the structural reason the external-memory path could not be routed
+/// through it. Deriving it afterwards costs one linear pass.
+///
+/// The pass is sequential and looks random-access, but it is not quadratic:
+/// `h` falls by at most one per position and rises only while matching, so the
+/// total number of symbol comparisons is at most `2n`. That bound holds
+/// regardless of how repetitive the text is, which is the property the
+/// scanning merge lacks.
+pub(crate) fn kasai_lcp<I: Index>(text: &[u8], sa: &[I]) -> Vec<I> {
+    let n = sa.len();
+    let mut lcp = vec![I::zero(); n];
+    if n == 0 {
+        return lcp;
+    }
+    let mut rank = vec![0usize; n];
+    for (i, entry) in sa.iter().enumerate() {
+        rank[entry.to_usize()] = i;
+    }
+    let mut h = 0usize;
+    for p in 0..n {
+        let i = rank[p];
+        if i == 0 {
+            h = 0;
+            continue;
+        }
+        let q = sa[i - 1].to_usize();
+        while p + h < n && q + h < n && text[p + h] == text[q + h] {
+            h += 1;
+        }
+        lcp[i] = I::from_usize(h);
+        h = h.saturating_sub(1);
+    }
+    lcp
+}
+
 /// The alphabet map for `text`, or `None` when a packed key cannot represent
 /// this text's order.
 ///
@@ -887,6 +929,46 @@ mod tests {
         // u8 of the same width still qualifies.
         let bytes: Vec<u8> = vec![1, 0, 1, 2, 3, 0];
         assert!(seed_params(&bytes, false).is_some());
+    }
+
+    /// Kasai's output must match a naive per-pair scan, on the inputs that
+    /// make the naive version expensive: long runs and periodic text.
+    #[test]
+    fn kasai_matches_naive() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCA5A1);
+        let mut fixtures: Vec<Vec<u8>> = vec![
+            b"banana".to_vec(),
+            b"mississippi".to_vec(),
+            vec![7u8; 500],
+            (0..500).map(|i| (i % 3) as u8).collect(),
+            (0..500).map(|i| (i % 61) as u8).collect(),
+            Vec::new(),
+            vec![1],
+        ];
+        for &sigma in &[2u8, 4, 200] {
+            for &n in &[7usize, 64, 1000] {
+                fixtures.push((0..n).map(|_| rng.random_range(0..sigma)).collect());
+            }
+        }
+        for text in fixtures {
+            let sa: Vec<u32> = build_sa(&text);
+            let lcp = kasai_lcp(&text, &sa);
+            assert_eq!(lcp.len(), sa.len());
+            if sa.is_empty() {
+                continue;
+            }
+            assert_eq!(lcp[0], 0, "lcp[0] must be 0");
+            for i in 1..sa.len() {
+                let (a, b) = (sa[i - 1] as usize, sa[i] as usize);
+                let want = (0..)
+                    .take_while(|&j| {
+                        a + j < text.len() && b + j < text.len() && text[a + j] == text[b + j]
+                    })
+                    .count();
+                assert_eq!(lcp[i] as usize, want, "lcp[{i}] on {text:?}");
+            }
+        }
     }
 
     #[test]

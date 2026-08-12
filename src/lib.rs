@@ -109,6 +109,38 @@ where
     Ok(())
 }
 
+/// The LCP array of a byte text's suffix array, in `O(n)`.
+///
+/// `lcp[i]` is the number of symbols `text[sa[i - 1]..]` and `text[sa[i]..]`
+/// share; `lcp[0]` is `0`. `sa` must be the suffix array of `text` — check it
+/// with [`verify_sa`] first if it came from elsewhere.
+///
+/// The merge kernel produces an LCP array as a byproduct, but nothing exposed
+/// it, and the fast path does not produce one at all: prefix doubling answers
+/// comparisons from ranks and never computes an LCP. This derives one from the
+/// suffix array instead, by Kasai's algorithm, in a single linear pass.
+///
+/// The bound is worth stating because it is exactly what the scanning merge
+/// lacks: `h` falls by at most one per position and rises only while matching,
+/// so the total symbol comparisons are at most `2n` no matter how repetitive
+/// the text is.
+///
+/// ```
+/// let text = b"banana";
+/// let sa: Vec<u32> = caps_sa::build_in_memory(text);
+/// let lcp = caps_sa::lcp_array(text, &sa);
+/// // sa is [5, 3, 1, 0, 4, 2] = a, ana, anana, banana, na, nana
+/// assert_eq!(lcp, vec![0u32, 1, 3, 0, 0, 2]);
+/// ```
+pub fn lcp_array<I: Index>(text: &[u8], sa: &[I]) -> Vec<I> {
+    assert_eq!(
+        sa.len(),
+        text.len(),
+        "lcp_array: sa must be the suffix array of the whole text",
+    );
+    radix::kasai_lcp(text, sa)
+}
+
 /// Trait implemented by integer types usable as suffix array indices.
 ///
 /// Provided for `u32`, `u64`, and `usize`. Callers pick the narrowest type
