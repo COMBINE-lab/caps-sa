@@ -41,6 +41,7 @@ use crate::ext_bucket::{
     BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp, SaLcpBucketStore,
 };
 use crate::lcp::{LcpDispatch, Symbol};
+use crate::lcp_memo::{GeometricMemo, MemoConfig, MemoStats};
 use crate::limits::{LimitProvider, PlainText};
 use crate::sample_sort;
 
@@ -1658,6 +1659,8 @@ where
     let profile = std::env::var_os("CAPS_SA_PROFILE").is_some();
     let load_us = AtomicU64::new(0);
     let merge_us = AtomicU64::new(0);
+    let memo_config = MemoConfig::from_env();
+    let memo_stats = Mutex::new(MemoStats::default());
     let mut emit_secs: f64 = 0.0;
 
     let mut start = 0;
@@ -1672,6 +1675,8 @@ where
                 max_ctx,
                 emit,
                 dispatch,
+                memo_config,
+                &memo_stats,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1685,6 +1690,8 @@ where
                 max_ctx,
                 emit,
                 dispatch,
+                memo_config,
+                &memo_stats,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1700,6 +1707,32 @@ where
             merge_us.load(AtomicOrdering::Relaxed) as f64 * 1e-6,
             emit_secs,
         ));
+        if let Some(config) = memo_config {
+            let stats = *memo_stats.lock().expect("memo profile mutex poisoned");
+            profile_log(&format!(
+                "geometric memo probe={} min_lcp={} cap={} activate_entries={} stats={} tables={} calls={} training_direct={} probe_resolved={} lookups={} direct_hits={} gap_hits={} misses={} inserts={} extensions={} cap_rejects={} final_entries={} max_entries={} scanned_matches={} skipped_matches={}",
+                config.probe,
+                config.min_lcp,
+                config.capacity,
+                config.activate_entries,
+                config.collect_stats,
+                stats.tables,
+                stats.calls,
+                stats.cold_direct,
+                stats.probe_resolved,
+                stats.lookups,
+                stats.direct_hits,
+                stats.gap_hits,
+                stats.misses,
+                stats.inserts,
+                stats.extensions,
+                stats.capacity_rejects,
+                stats.final_entries,
+                stats.max_entries,
+                stats.scanned_matches,
+                stats.skipped_matches,
+            ));
+        }
     }
     Ok(())
 }
@@ -1712,6 +1745,8 @@ fn phase4_merge_chunk_collect_emit<S, I, L, B, E, F>(
     max_ctx: usize,
     emit: &mut F,
     dispatch: LcpDispatch,
+    memo_config: Option<MemoConfig>,
+    memo_stats: &Mutex<MemoStats>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1731,7 +1766,16 @@ where
         .par_iter_mut()
         .map(|bucket| -> io::Result<Vec<I>> {
             merge_one_partition(
-                text, lp, bucket, max_ctx, dispatch, profile, load_us, merge_us,
+                text,
+                lp,
+                bucket,
+                max_ctx,
+                dispatch,
+                memo_config,
+                memo_stats,
+                profile,
+                load_us,
+                merge_us,
             )
         })
         .collect::<Result<Vec<_>, io::Error>>()?;
@@ -1756,6 +1800,8 @@ fn phase4_merge_chunk_ordered_emit<S, I, L, B, E, F>(
     max_ctx: usize,
     emit: &mut F,
     dispatch: LcpDispatch,
+    memo_config: Option<MemoConfig>,
+    memo_stats: &Mutex<MemoStats>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1785,7 +1831,16 @@ where
                 .enumerate()
                 .for_each_with(tx, |tx, (local_idx, bucket)| {
                     let result = merge_one_partition(
-                        text, lp, bucket, max_ctx, dispatch, profile, load_us, merge_us,
+                        text,
+                        lp,
+                        bucket,
+                        max_ctx,
+                        dispatch,
+                        memo_config,
+                        memo_stats,
+                        profile,
+                        load_us,
+                        merge_us,
                     );
                     let _ = tx.send((local_idx, result));
                 });
@@ -1843,6 +1898,8 @@ fn merge_one_partition<S, I, L, B>(
     bucket: &mut B,
     max_ctx: usize,
     dispatch: LcpDispatch,
+    memo_config: Option<MemoConfig>,
+    memo_stats: &Mutex<MemoStats>,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1868,7 +1925,27 @@ where
 
     let t = Instant::now();
     let workspace = CascadeWorkspace::<I>::new();
-    let result = workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch);
+    let result = if let Some(config) = memo_config {
+        let mut memo = GeometricMemo::new(config);
+        let result = workspace.cascade_merge_memoized(
+            text,
+            lp,
+            &records,
+            &boundaries,
+            max_ctx,
+            dispatch,
+            &mut memo,
+        );
+        if profile {
+            memo_stats
+                .lock()
+                .expect("memo profile mutex poisoned")
+                .add_assign(memo.finish());
+        }
+        result
+    } else {
+        workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch)
+    };
     if profile {
         merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
     }
@@ -1919,6 +1996,41 @@ impl<I: Index> CascadeWorkspace<I> {
     /// would otherwise sit briefly alongside all four workspace buffers
     /// at peak.
     fn cascade_merge<S, L>(
+        self,
+        text: &[S],
+        lp: &L,
+        records: &[SaLcp<I>],
+        boundaries: &[usize],
+        max_ctx: usize,
+        dispatch: LcpDispatch,
+    ) -> Vec<I>
+    where
+        S: Symbol,
+        L: LimitProvider,
+    {
+        self.cascade_merge_impl(text, lp, records, boundaries, max_ctx, dispatch, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cascade_merge_memoized<S, L>(
+        self,
+        text: &[S],
+        lp: &L,
+        records: &[SaLcp<I>],
+        boundaries: &[usize],
+        max_ctx: usize,
+        dispatch: LcpDispatch,
+        memo: &mut GeometricMemo,
+    ) -> Vec<I>
+    where
+        S: Symbol,
+        L: LimitProvider,
+    {
+        self.cascade_merge_impl(text, lp, records, boundaries, max_ctx, dispatch, Some(memo))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cascade_merge_impl<S, L>(
         mut self,
         text: &[S],
         lp: &L,
@@ -1926,6 +2038,7 @@ impl<I: Index> CascadeWorkspace<I> {
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
+        mut memo: Option<&mut GeometricMemo>,
     ) -> Vec<I>
     where
         S: Symbol,
@@ -1953,7 +2066,15 @@ impl<I: Index> CascadeWorkspace<I> {
 
         let mut src_is_a = true;
         while run_lens.len() > 1 {
-            run_lens = self.merge_one_level(src_is_a, &run_lens, text, lp, max_ctx, dispatch);
+            run_lens = self.merge_one_level(
+                src_is_a,
+                &run_lens,
+                text,
+                lp,
+                max_ctx,
+                dispatch,
+                memo.as_deref_mut(),
+            );
             src_is_a = !src_is_a;
         }
 
@@ -1970,6 +2091,7 @@ impl<I: Index> CascadeWorkspace<I> {
     /// `src_is_a`-selected buffer side into the other. Returns the new
     /// run-length list (each entry is the sum of the two it replaced, or
     /// the carry-over for an odd tail).
+    #[allow(clippy::too_many_arguments)]
     fn merge_one_level<S, L>(
         &mut self,
         src_is_a: bool,
@@ -1978,6 +2100,7 @@ impl<I: Index> CascadeWorkspace<I> {
         lp: &L,
         max_ctx: usize,
         dispatch: LcpDispatch,
+        mut memo: Option<&mut GeometricMemo>,
     ) -> Vec<usize>
     where
         S: Symbol,
@@ -2018,18 +2141,34 @@ impl<I: Index> CascadeWorkspace<I> {
                 let x_end = src_off + l1;
                 let xy_end = x_end + l2;
                 let dst_end = dst_off + l1 + l2;
-                sample_sort::merge(
-                    text,
-                    lp,
-                    &src_sa[src_off..x_end],
-                    &src_sa[x_end..xy_end],
-                    &src_lcp[src_off..x_end],
-                    &src_lcp[x_end..xy_end],
-                    &mut dst_sa[dst_off..dst_end],
-                    &mut dst_lcp[dst_off..dst_end],
-                    max_ctx,
-                    dispatch,
-                );
+                if let Some(memo) = memo.as_deref_mut() {
+                    sample_sort::merge_memoized(
+                        text,
+                        lp,
+                        &src_sa[src_off..x_end],
+                        &src_sa[x_end..xy_end],
+                        &src_lcp[src_off..x_end],
+                        &src_lcp[x_end..xy_end],
+                        &mut dst_sa[dst_off..dst_end],
+                        &mut dst_lcp[dst_off..dst_end],
+                        max_ctx,
+                        dispatch,
+                        memo,
+                    );
+                } else {
+                    sample_sort::merge(
+                        text,
+                        lp,
+                        &src_sa[src_off..x_end],
+                        &src_sa[x_end..xy_end],
+                        &src_lcp[src_off..x_end],
+                        &src_lcp[x_end..xy_end],
+                        &mut dst_sa[dst_off..dst_end],
+                        &mut dst_lcp[dst_off..dst_end],
+                        max_ctx,
+                        dispatch,
+                    );
+                }
                 new_lens.push(l1 + l2);
                 src_off = xy_end;
                 dst_off = dst_end;

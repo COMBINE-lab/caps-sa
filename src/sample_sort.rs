@@ -32,6 +32,7 @@
 
 use crate::Index;
 use crate::lcp::{LcpDispatch, Symbol};
+use crate::lcp_memo::GeometricMemo;
 use crate::limits::{LimitProvider, PlainText};
 use rayon::join;
 
@@ -272,6 +273,121 @@ pub(crate) fn merge_sort<S, I, L>(
 ///
 /// Visible to the rest of the crate so the external-memory path can cascade
 /// 2-way merges across each partition's sub-subarrays during Phase 4.
+macro_rules! merge_extension {
+    (direct, $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {
+        $dispatch.lcp($text, $p + $known, $q + $known, $max_ext)
+    };
+    ((memo $memo:ident), $text:expr, $dispatch:expr, $p:expr, $q:expr, $known:expr, $max_ext:expr) => {
+        $memo.lcp($text, $dispatch, $p, $q, $known, $max_ext)
+    };
+}
+
+// Keep the direct and memoized kernels as separate monomorphized functions.
+// A trait/wrapper abstraction measurably perturbed code generation in the
+// original hot loop even when memoization was disabled.  This macro retains a
+// single source of truth while changing only the LCP-extension expression.
+macro_rules! merge_body {
+    ($lookup:tt; $text:ident, $lp:ident, $x:ident, $y:ident, $lcp_x:ident, $lcp_y:ident, $z:ident, $lcp_z:ident, $max_ctx:ident, $dispatch:ident) => {{
+        let len_x = $x.len();
+        let len_y = $y.len();
+        debug_assert_eq!($z.len(), len_x + len_y);
+        debug_assert_eq!($lcp_z.len(), len_x + len_y);
+
+        if len_x == 0 {
+            $z.copy_from_slice($y);
+            $lcp_z.copy_from_slice($lcp_y);
+            return;
+        }
+        if len_y == 0 {
+            $z.copy_from_slice($x);
+            $lcp_z.copy_from_slice($lcp_x);
+            return;
+        }
+
+        // The "swap-on-output-from-B" trick from upstream CaPS-SA: we always
+        // label the stream we last output from as `A`, and the other as `B`.
+        let mut arr_a: &[I] = $x;
+        let mut arr_b: &[I] = $y;
+        let mut lcp_a: &[I] = $lcp_x;
+        let mut lcp_b: &[I] = $lcp_y;
+        let mut len_a = len_x;
+        let mut len_b = len_y;
+        let mut i_a: usize = 0;
+        let mut i_b: usize = 0;
+        let mut m: usize = 0;
+        let mut k: usize = 0;
+        let mut lim_a_cache: Option<(usize, usize)> = None;
+        let mut lim_b_cache: Option<(usize, usize)> = None;
+
+        while i_a < len_a && i_b < len_b {
+            if i_a + PREFETCH_DISTANCE < len_a {
+                prefetch_symbol($text, arr_a[i_a + PREFETCH_DISTANCE].to_usize() + m);
+            }
+            if i_b + PREFETCH_DISTANCE < len_b {
+                prefetch_symbol($text, arr_b[i_b + PREFETCH_DISTANCE].to_usize() + m);
+            }
+
+            let l_a = lcp_a[i_a].to_usize();
+            let (output_a, lcp_for_output, new_m) = if l_a > m {
+                (true, l_a, m)
+            } else if l_a < m {
+                (false, m, l_a)
+            } else {
+                let p_a = arr_a[i_a].to_usize();
+                let p_b = arr_b[i_b].to_usize();
+                let lim_a = match lim_a_cache {
+                    Some((idx, lim)) if idx == i_a => lim,
+                    _ => {
+                        let lim = $lp.lim_at(p_a);
+                        lim_a_cache = Some((i_a, lim));
+                        lim
+                    }
+                };
+                let lim_b = match lim_b_cache {
+                    Some((idx, lim)) if idx == i_b => lim,
+                    _ => {
+                        let lim = $lp.lim_at(p_b);
+                        lim_b_cache = Some((i_b, lim));
+                        lim
+                    }
+                };
+                let cap = lim_a.min(lim_b).min($max_ctx);
+                let remaining_ctx = cap.saturating_sub(m);
+                let ext = merge_extension!($lookup, $text, $dispatch, p_a, p_b, m, remaining_ctx);
+                let total = m + ext;
+                let a_smaller = if total < lim_a && total < lim_b {
+                    $text[p_a + total] < $text[p_b + total]
+                } else {
+                    $lp.boundary_order(p_a, lim_a, p_b, lim_b).is_lt()
+                };
+                (a_smaller, m, total)
+            };
+
+            if output_a {
+                $z[k] = arr_a[i_a];
+                $lcp_z[k] = I::from_usize(lcp_for_output);
+                i_a += 1;
+                lim_a_cache = None;
+            } else {
+                $z[k] = arr_b[i_b];
+                $lcp_z[k] = I::from_usize(lcp_for_output);
+                i_b += 1;
+                lim_b_cache = None;
+                std::mem::swap(&mut arr_a, &mut arr_b);
+                std::mem::swap(&mut lcp_a, &mut lcp_b);
+                std::mem::swap(&mut len_a, &mut len_b);
+                std::mem::swap(&mut i_a, &mut i_b);
+                std::mem::swap(&mut lim_a_cache, &mut lim_b_cache);
+            }
+            m = new_m;
+            k += 1;
+        }
+
+        drain(arr_a, lcp_a, i_a, len_a, $z, $lcp_z, &mut k, m);
+        drain(arr_b, lcp_b, i_b, len_b, $z, $lcp_z, &mut k, m);
+    }};
+}
+
 #[allow(clippy::too_many_arguments)] // CaPS-SA's merge takes 5 buffers + text + lp + ctx + dispatch
 pub(crate) fn merge<S, I, L>(
     text: &[S],
@@ -289,144 +405,30 @@ pub(crate) fn merge<S, I, L>(
     I: Index,
     L: LimitProvider,
 {
-    let len_x = x.len();
-    let len_y = y.len();
-    debug_assert_eq!(z.len(), len_x + len_y);
-    debug_assert_eq!(lcp_z.len(), len_x + len_y);
+    merge_body!(direct; text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
+}
 
-    if len_x == 0 {
-        z.copy_from_slice(y);
-        lcp_z.copy_from_slice(lcp_y);
-        return;
-    }
-    if len_y == 0 {
-        z.copy_from_slice(x);
-        lcp_z.copy_from_slice(lcp_x);
-        return;
-    }
-
-    // The "swap-on-output-from-B" trick from upstream CaPS-SA: we always
-    // label the stream we last output from as `A`, and the other as `B`. On
-    // entry no output has been produced yet, but the convention is consistent
-    // because both LCP arrays satisfy `lcp_*[0] == 0` and `m` starts at 0 —
-    // the first iteration falls into the `l_a == m` branch and computes the
-    // first comparison from scratch.
-    let mut arr_a: &[I] = x;
-    let mut arr_b: &[I] = y;
-    let mut lcp_a: &[I] = lcp_x;
-    let mut lcp_b: &[I] = lcp_y;
-    let mut len_a = len_x;
-    let mut len_b = len_y;
-    let mut i_a: usize = 0;
-    let mut i_b: usize = 0;
-    let mut m: usize = 0;
-    let mut k: usize = 0;
-    let mut lim_a_cache: Option<(usize, usize)> = None;
-    let mut lim_b_cache: Option<(usize, usize)> = None;
-
-    while i_a < len_a && i_b < len_b {
-        // The tied branch below dereferences the text at two *random*
-        // addresses, and the address for step `i + 1` is not known until step
-        // `i` retires, so there is no memory-level parallelism to exploit and
-        // the hardware prefetcher cannot see the pattern either. But the
-        // candidate positions themselves live in `arr_a` / `arr_b`, which are
-        // sequential and already in cache, so the addresses a few steps ahead
-        // *are* known. Issue them now.
-        //
-        // This is not the prefetch that was tried and reverted in `lcp.rs`:
-        // that one sat inside the strided scan loop, which the hardware
-        // prefetcher already covers. Here the access is random, which is the
-        // case hardware cannot predict. `m` is the current boundary LCP and a
-        // good estimate of where the next scans will start.
-        if i_a + PREFETCH_DISTANCE < len_a {
-            prefetch_symbol(text, arr_a[i_a + PREFETCH_DISTANCE].to_usize() + m);
-        }
-        if i_b + PREFETCH_DISTANCE < len_b {
-            prefetch_symbol(text, arr_b[i_b + PREFETCH_DISTANCE].to_usize() + m);
-        }
-
-        let l_a = lcp_a[i_a].to_usize();
-
-        // (output_a, lcp_for_output, new_m)
-        let (output_a, lcp_for_output, new_m) = if l_a > m {
-            (true, l_a, m)
-        } else if l_a < m {
-            (false, m, l_a)
-        } else {
-            // Tied — extend by an actual symbol scan from offset m.
-            let p_a = arr_a[i_a].to_usize();
-            let p_b = arr_b[i_b].to_usize();
-            // `lim_a` / `lim_b` are the per-suffix logical lengths from
-            // the `LimitProvider`. With `PlainText` these fold to
-            // `n_text - p` (the same expression the pre-LimitProvider
-            // code computed inline); with `SegmentedText` they cap at
-            // the next segment boundary so the LCP scan stops there.
-            let lim_a = match lim_a_cache {
-                Some((idx, lim)) if idx == i_a => lim,
-                _ => {
-                    let lim = lp.lim_at(p_a);
-                    lim_a_cache = Some((i_a, lim));
-                    lim
-                }
-            };
-            let lim_b = match lim_b_cache {
-                Some((idx, lim)) if idx == i_b => lim,
-                _ => {
-                    let lim = lp.lim_at(p_b);
-                    lim_b_cache = Some((i_b, lim));
-                    lim
-                }
-            };
-            // Pass an already-segmentation-aware cap to the SIMD LCP so
-            // it doesn't have to scan past the boundary. For PlainText
-            // this is equivalent to the LCP function's own `n - p`
-            // intersection — no extra work.
-            let cap = lim_a.min(lim_b).min(max_ctx);
-            let remaining_ctx = cap.saturating_sub(m);
-            let ext = dispatch.lcp(text, p_a + m, p_b + m, remaining_ctx);
-            let total = m + ext;
-            let a_smaller = if total < lim_a && total < lim_b {
-                text[p_a + total] < text[p_b + total]
-            } else {
-                // One or both suffixes ran off the end of their
-                // segment (or hit `max_ctx`). Defer to the
-                // [`LimitProvider`]'s boundary-ordering convention —
-                // for [`PlainText`] / standard `SegmentedText` this
-                // is `lim_a.cmp(&lim_b)` (shorter-is-smaller, the
-                // generalised-SA convention); custom impls can flip
-                // it (e.g. STAR's `spacer-as-largest`).
-                lp.boundary_order(p_a, lim_a, p_b, lim_b).is_lt()
-            };
-            (a_smaller, m, total)
-        };
-
-        if output_a {
-            z[k] = arr_a[i_a];
-            lcp_z[k] = I::from_usize(lcp_for_output);
-            i_a += 1;
-            lim_a_cache = None;
-        } else {
-            z[k] = arr_b[i_b];
-            lcp_z[k] = I::from_usize(lcp_for_output);
-            i_b += 1;
-            lim_b_cache = None;
-            // Outputting from B: swap labels so the next iteration's
-            // "last-output stream" is what was B.
-            std::mem::swap(&mut arr_a, &mut arr_b);
-            std::mem::swap(&mut lcp_a, &mut lcp_b);
-            std::mem::swap(&mut len_a, &mut len_b);
-            std::mem::swap(&mut i_a, &mut i_b);
-            std::mem::swap(&mut lim_a_cache, &mut lim_b_cache);
-        }
-        m = new_m;
-        k += 1;
-    }
-
-    // Drain the surviving stream. The first drained element carries the
-    // boundary LCP (`m`) connecting it to the last cross-stream output;
-    // subsequent drained elements use the source LCP array unchanged.
-    drain(arr_a, lcp_a, i_a, len_a, z, lcp_z, &mut k, m);
-    drain(arr_b, lcp_b, i_b, len_b, z, lcp_z, &mut k, m);
+/// Phase-4 variant of [`merge`] that reuses exact LCP intervals discovered by
+/// earlier levels of the same partition cascade.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_memoized<S, I, L>(
+    text: &[S],
+    lp: &L,
+    x: &[I],
+    y: &[I],
+    lcp_x: &[I],
+    lcp_y: &[I],
+    z: &mut [I],
+    lcp_z: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+    memo: &mut GeometricMemo,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    merge_body!((memo memo); text, lp, x, y, lcp_x, lcp_y, z, lcp_z, max_ctx, dispatch);
 }
 
 #[inline]

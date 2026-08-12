@@ -19,6 +19,7 @@
 mod ext_bucket;
 mod ext_mem;
 mod lcp;
+mod lcp_memo;
 mod limits;
 mod sample_sort;
 
