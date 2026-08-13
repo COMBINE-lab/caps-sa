@@ -906,6 +906,21 @@ mod tests {
         }
     }
 
+    /// `Symbol` is implemented for `i8`, and a one-byte-wide check alone would
+    /// let a signed text through a packer that orders its fields as unsigned:
+    /// `-1` has byte `0xFF`, so it would sort above `1`, inverting the text's
+    /// real order. The fast-path guard demands exactly `u8`, so a signed text
+    /// stays on the merge kernel and keeps signed order.
+    #[test]
+    fn signed_symbol_texts_keep_signed_order() {
+        let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
+        let got: Vec<u32> = build_in_memory(&text);
+        let dispatch = LcpDispatch::detect();
+        let mut want: Vec<u32> = (0..text.len() as u32).collect();
+        want.sort_by(|&a, &b| dispatch.suffix_cmp(&text, a as usize, b as usize, usize::MAX));
+        assert_eq!(got, want, "an i8 text must sort by signed order");
+    }
+
     #[test]
     fn suffix_array_respects_finite_max_context() {
         use rand::{RngExt, SeedableRng};
@@ -917,6 +932,7 @@ mod tests {
                 let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
                 let opts = Opts {
                     max_context: max_ctx,
+                    ..Opts::default()
                 };
                 let got: Vec<u32> = build_in_memory_with_opts(&text, &opts);
                 let mut want: Vec<u32> = (0..n as u32).collect();
