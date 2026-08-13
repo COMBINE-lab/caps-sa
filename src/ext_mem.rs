@@ -3,30 +3,22 @@
 //! Implements upstream CaPS-SA's *sample-sort + LCP-enhanced merge*
 //! external-memory algorithm:
 //!
-//! 1. **Sort + sample + spill.** Split positions `0..n` into `p` subarrays
-//!    of size `n / p`. In parallel, sort each with the in-memory
-//!    merge-sort kernel (`sample_sort::merge_sort`), sample ~`c · ln n`
-//!    positions uniformly from each sorted subarray, and spill the sorted
-//!    `(position, lcp)` records to a per-subarray
-//!    [`ExtMemBucket`][crate::ext_bucket::ExtMemBucket].
-//! 2. **Select pivots.** Globally sort the pooled samples and pick
-//!    `p − 1` pivots at evenly-spaced ranks, splitting the suffix order
-//!    into `p` partitions.
-//! 3. **Distribute.** For each sorted subarray, binary-search the pivots
-//!    to find its `p` sub-subarray split points; append each sub-subarray
-//!    to the corresponding *partition* bucket, marking a boundary after
-//!    each contribution.
-//! 4. **Per-partition merge.** Load each partition's bucket into RAM
+//! 1. **Presample pivots.** Sort a small deterministic sample and pick
+//!    `p − 1` pivots at evenly-spaced ranks, splitting the suffix order into
+//!    `p` partitions.
+//! 2. **Sort + distribute.** Split the selected positions into `p` subarrays.
+//!    In parallel, sort each with a task-local LCP merge-sort, split it by the
+//!    pivots, and write each sorted slice directly to its final partition
+//!    bucket. The complete intermediate subarray spill is avoided.
+//! 3. **Per-partition merge.** Load each partition's bucket into RAM
 //!    (≈ `n / p` records); cascade 2-way LCP-enhanced merges across the
 //!    `p` sub-subarrays to produce that partition's globally-sorted slice.
-//! 5. **Stream output.** Iterate partitions in order and emit each
+//! 4. **Stream output.** Iterate partitions in order and emit each
 //!    position via the caller's closure.
 //!
-//! Peak RAM ≈ `text` + `O(n / p)` per active worker (one partition's
-//! merge working set). With `p = 4 × rayon::current_num_threads()` and
-//! `num_threads = 8`, that's a few hundred MB on a `n = 6e9` (human-scale)
-//! input — well below in-memory's `~4 × n × 8 = ~200 GB`. The full SA is
-//! never materialized in RAM.
+//! Peak RAM is the text plus bounded per-worker phase-1 scratch and in-flight
+//! `O(n / p)` partition merge buffers. The full suffix array is never
+//! materialized in RAM.
 
 use std::cmp::Ordering;
 use std::io;
@@ -38,9 +30,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::Index;
-use crate::ext_bucket::{
-    BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp, SaLcpBucketStore,
-};
+use crate::ext_bucket::{BucketPool, BucketRecord, InMemBucket, SaLcp, SaLcpBucketStore};
 use crate::lcp::{LcpDispatch, Symbol};
 use crate::lcp_memo::{
     GeometricMemo, GeometricMemoizationConfig, LcpMemoizationPolicy, MemoConfig, MemoStats,
@@ -60,24 +50,31 @@ fn profile_log(message: &str) {
 }
 
 /// Tunable options for [`build_ext_mem`].
+///
+/// This structure is non-exhaustive so future releases can add options
+/// without repeatedly breaking callers that use struct literals. Start from
+/// [`Self::default`] or [`Self::from_env`] and use the builder methods.
+#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ExtMemOpts {
-    /// Bound on LCP-extension comparisons inside merges. `usize::MAX`
-    /// (default) is unbounded.
+    /// Bound on suffix-comparison context. Comparisons equal through this many
+    /// symbols are resolved by [`LimitProvider::boundary_order`], so
+    /// `usize::MAX` (the default) is required for ordinary full lexicographic
+    /// ordering unless the caller deliberately wants truncated contexts.
     pub max_context: usize,
-    /// Number of subarrays (`p` in upstream CaPS-SA). `0` (default) picks
-    /// `4 × rayon::current_num_threads()`, clamped to `[1, n]`.
+    /// Number of subarrays (`p` in upstream CaPS-SA). `0` (default) targets
+    /// roughly 65,536 selected positions per subarray, clamped to at least one
+    /// subarray per Rayon worker and at most 8,192 (and never above `n`).
     pub subproblem_count: usize,
     /// Directory for temp files. Defaults to [`std::env::temp_dir`].
     pub work_dir: PathBuf,
-    /// Number of physical files in the bucket pool (one pool for the
-    /// phase-1 subarray buckets and a second for the phase-3 partition
-    /// buckets). `0` (default) picks `rayon::current_num_threads()` —
+    /// Number of physical files backing the final partition buckets. `0`
+    /// (default) picks `rayon::current_num_threads()` —
     /// the right answer in practice: one writable inode per worker
     /// keeps kernel-level write contention bounded.
     ///
-    /// The `2 × p` logical buckets (typically thousands at genome
-    /// scale) collapse onto this pool of anonymous tempfiles via
+    /// The `p` logical buckets (typically thousands at genome scale) collapse
+    /// onto this pool of anonymous tempfiles via
     /// `bucket_id % physical_file_count`. Larger values lower kernel
     /// write contention; smaller values are kinder to networked
     /// filesystems with high metadata cost. The `CAPS_SA_N_PHYS` env
@@ -93,10 +90,10 @@ pub struct ExtMemOpts {
     /// merges. Disabled by default; callers with long repeated contexts can
     /// opt into [`LcpMemoizationPolicy::Geometric`].
     pub lcp_memoization: LcpMemoizationPolicy,
-    /// Collect detailed geometric-memoization counters while phase profiling
-    /// is enabled. This is diagnostic instrumentation, separate from the
-    /// production memoization policy, and is disabled by default.
-    pub collect_lcp_memoization_stats: bool,
+    // Diagnostic-only implementation detail selected by `from_env()`. It is
+    // intentionally not public API: counters are emitted to the profiling log
+    // rather than returned to callers, and their shape may evolve freely.
+    collect_lcp_memoization_stats: bool,
 }
 
 impl Default for ExtMemOpts {
@@ -138,9 +135,9 @@ impl ExtMemOpts {
     /// - `CAPS_SA_MEMO_CAPACITY`: maximum entries per partition table
     /// - `CAPS_SA_MEMO_STATS=1|true|yes|on`: detailed memoization counters
     ///
-    /// Invalid numeric values and zero memoization values are ignored,
-    /// preserving the corresponding defaults. Memoization tuning variables
-    /// take effect only when `CAPS_SA_GEOMETRIC_MEMO` enables the policy.
+    /// Invalid and zero-valued numeric overrides are ignored, preserving the
+    /// corresponding defaults. Memoization tuning variables take effect only
+    /// when `CAPS_SA_GEOMETRIC_MEMO` enables the policy.
     pub fn from_env() -> Self {
         let mut opts = Self::default();
         if let Some(dir) =
@@ -163,16 +160,16 @@ impl ExtMemOpts {
         if read_env_bool("CAPS_SA_GEOMETRIC_MEMO") {
             let mut config = GeometricMemoizationConfig::default();
             if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_PROBE") {
-                config.probe_symbols = v;
+                config = config.with_probe_symbols(v);
             }
             if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_MIN_LCP") {
-                config.min_lcp_symbols = v;
+                config = config.with_min_lcp_symbols(v);
             }
             if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_ACTIVATE_ENTRIES") {
-                config.activate_after_entries = v;
+                config = config.with_activate_after_entries(v);
             }
             if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_CAPACITY") {
-                config.max_entries_per_partition = v;
+                config = config.with_max_entries_per_partition(v);
             }
             opts.lcp_memoization = LcpMemoizationPolicy::Geometric(config);
         }
@@ -211,14 +208,8 @@ impl ExtMemOpts {
     }
 
     /// Builder-style setter for [`Self::lcp_memoization`].
-    pub fn lcp_memoization(mut self, lcp_memoization: LcpMemoizationPolicy) -> Self {
-        self.lcp_memoization = lcp_memoization;
-        self
-    }
-
-    /// Builder-style setter for [`Self::collect_lcp_memoization_stats`].
-    pub fn collect_lcp_memoization_stats(mut self, collect: bool) -> Self {
-        self.collect_lcp_memoization_stats = collect;
+    pub fn lcp_memoization(mut self, lcp_memoization: impl Into<LcpMemoizationPolicy>) -> Self {
+        self.lcp_memoization = lcp_memoization.into();
         self
     }
 }
@@ -1112,16 +1103,12 @@ impl<'a> PositionSource<'a> {
 
 /// Target subarray size used by [`effective_subproblem_count`] when
 /// auto-picking `p`. Smaller means more (smaller) subarrays — lower
-/// per-task phase-1 scratch, at the cost of more phase-3 distribute
-/// work (which scales as `O(p² · log(n/p))`, sequentially) and a
-/// higher temp-file count.
+/// per-task phase-1 scratch, at the cost of more pivot splits and logical
+/// partition pieces.
 const PHASE1_TARGET_CHUNK: usize = 65_536;
 /// Hard cap on the number of subarrays. Matches upstream CaPS-SA's
-/// default of 8192 — phase 3 is now parallelised across rayon
-/// workers (each subarray distributes independently into per-partition
-/// `Mutex<ExtMemBucket>` slots), so the `O(p²)` sequential distribute
-/// of the original design no longer constrains us. The cap is still
-/// finite to keep the temp-file count bounded.
+/// default of 8192. The cap keeps pivot splitting, logical partition metadata,
+/// and the number of lock acquisitions bounded.
 const PHASE1_MAX_PARTITIONS: usize = 8192;
 
 /// Resolve [`ExtMemOpts::physical_file_count`] for the current build.
@@ -1153,8 +1140,8 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
         let nthreads = rayon::current_num_threads().max(1);
         let p_from_size = n.div_ceil(PHASE1_TARGET_CHUNK);
         // At least one chunk per thread (otherwise we leave cores idle),
-        // at most `PHASE1_MAX_PARTITIONS` (so phase 3's sequential
-        // `O(p²)` sweep and the temp-file count stay manageable). For
+        // at most `PHASE1_MAX_PARTITIONS` (so pivot splitting and partition
+        // metadata stay manageable). For
         // small inputs `p_from_size` is well below the cap, so the
         // formula degrades gracefully to roughly "one chunk per thread";
         // for human-scale inputs the cap binds and per-task scratch
@@ -1169,12 +1156,13 @@ fn effective_subproblem_count(n: usize, requested: usize) -> usize {
 /// Phase 1: sort each subarray in parallel, sample from it, and spill
 /// `(position, lcp)` records to its own [`ExtMemBucket`].
 ///
-/// One rayon task per subarray; rayon's work-stealing scheduler keeps
-/// all worker threads busy and lets `merge_sort`'s inner
-/// [`rayon::join`] recursion steal idle slots. With the auto-picked
-/// `p` (target chunk ~ 64 K records), per-task scratch is ~18 MiB on
-/// human-scale inputs, so the `num_threads × per_task_scratch` peak
-/// stays bounded even though we don't reuse buffers across iterations.
+/// One Rayon task per subarray. When `p` provides at least one outer task per
+/// worker (including every auto-picked build), the sort recursion stays local
+/// to that task, avoiding nested scheduler work and preventing a worker from
+/// retaining one subarray's scratch while stealing another outer task. An
+/// explicit smaller `p` retains recursive parallelism. With auto `p` (target
+/// chunk ~64 K records until the 8,192 cap binds), peak scratch is bounded by
+/// the number of workers rather than the number of subarrays.
 #[allow(clippy::too_many_arguments)]
 fn phase1_sort_sample_spill<S, I, L, B, MkB>(
     text: &[S],
@@ -1196,6 +1184,7 @@ where
     let n = source.len();
     let chunk_size = n.div_ceil(p);
     let samples_target_total = sample_target_total(n, p);
+    let task_local_sort = p >= rayon::current_num_threads().max(1);
 
     let per_subarray: Vec<(B, Vec<I>)> = (0..p)
         .into_par_iter()
@@ -1215,16 +1204,29 @@ where
             let mut sa_w = vec![I::zero(); len];
             let mut lcp_arr = vec![I::zero(); len];
             let mut lcp_w = vec![I::zero(); len];
-            sample_sort::merge_sort(
-                text,
-                lp,
-                &mut sa,
-                &mut sa_w,
-                &mut lcp_arr,
-                &mut lcp_w,
-                opts.max_context,
-                dispatch,
-            );
+            if task_local_sort {
+                sample_sort::merge_sort_task_local(
+                    text,
+                    lp,
+                    &mut sa,
+                    &mut sa_w,
+                    &mut lcp_arr,
+                    &mut lcp_w,
+                    opts.max_context,
+                    dispatch,
+                );
+            } else {
+                sample_sort::merge_sort(
+                    text,
+                    lp,
+                    &mut sa,
+                    &mut sa_w,
+                    &mut lcp_arr,
+                    &mut lcp_w,
+                    opts.max_context,
+                    dispatch,
+                );
+            }
 
             // Pull `samples_per_subarray` evenly-spaced positions out of
             // the now-sorted subarray. Deterministic — no RNG needed for
@@ -1494,6 +1496,7 @@ where
     let n = source.len();
     let chunk_size = n.div_ceil(p);
     let partition_buckets: Vec<Mutex<B>> = (0..p).map(|j| Mutex::new(mk_bucket(j))).collect();
+    let task_local_sort = p >= rayon::current_num_threads().max(1);
 
     (0..p).into_par_iter().try_for_each(|i| -> io::Result<()> {
         let start = (i * chunk_size).min(n);
@@ -1508,26 +1511,31 @@ where
         let mut sa_w = vec![I::zero(); len];
         let mut lcp_arr = vec![I::zero(); len];
         let mut lcp_w = vec![I::zero(); len];
-        sample_sort::merge_sort(
-            text,
-            lp,
-            &mut sa,
-            &mut sa_w,
-            &mut lcp_arr,
-            &mut lcp_w,
-            opts.max_context,
-            dispatch,
-        );
+        if task_local_sort {
+            sample_sort::merge_sort_task_local(
+                text,
+                lp,
+                &mut sa,
+                &mut sa_w,
+                &mut lcp_arr,
+                &mut lcp_w,
+                opts.max_context,
+                dispatch,
+            );
+        } else {
+            sample_sort::merge_sort(
+                text,
+                lp,
+                &mut sa,
+                &mut sa_w,
+                &mut lcp_arr,
+                &mut lcp_w,
+                opts.max_context,
+                dispatch,
+            );
+        }
         drop(sa_w);
         drop(lcp_w);
-
-        let records: Vec<SaLcp<I>> = sa
-            .iter()
-            .zip(lcp_arr.iter())
-            .map(|(&pos, &lcp)| SaLcp { pos, lcp })
-            .collect();
-        drop(sa);
-        drop(lcp_arr);
 
         // Consecutive pivots have non-decreasing upper bounds. Galloping from
         // the previous split avoids restarting a full binary search p times.
@@ -1535,10 +1543,11 @@ where
         splits.push(0usize);
         let mut from = 0usize;
         for &pivot in pivots {
-            from = upper_bound_from(&records, from, pivot, text, lp, opts.max_context, dispatch);
+            from =
+                upper_bound_positions_from(&sa, from, pivot, text, lp, opts.max_context, dispatch);
             splits.push(from);
         }
-        splits.push(records.len());
+        splits.push(sa.len());
 
         for j in 0..p {
             let (lo, hi) = (splits[j], splits[j + 1]);
@@ -1546,7 +1555,7 @@ where
                 continue;
             }
             let mut bucket = partition_buckets[j].lock().unwrap();
-            bucket.add_slice_reset_first_lcp(&records[lo..hi])?;
+            bucket.add_soa_reset_first_lcp(&sa[lo..hi], &lcp_arr[lo..hi])?;
             bucket.mark_boundary();
         }
         Ok(())
@@ -1560,8 +1569,8 @@ where
 
 /// Upper bound of `pivot` in `records`, searched forward from the previous
 /// pivot's split. Pivots are sorted, so upper bounds never move backward.
-fn upper_bound_from<S, I, L>(
-    records: &[SaLcp<I>],
+fn upper_bound_positions_from<S, I, L>(
+    positions: &[I],
     from: usize,
     pivot: I,
     text: &[S],
@@ -1574,15 +1583,10 @@ where
     I: Index,
     L: LimitProvider,
 {
-    let n = records.len();
+    let n = positions.len();
     let greater = |i: usize| -> bool {
-        dispatch.suffix_cmp_with(
-            text,
-            lp,
-            records[i].pos.to_usize(),
-            pivot.to_usize(),
-            max_ctx,
-        ) == Ordering::Greater
+        dispatch.suffix_cmp_with(text, lp, positions[i].to_usize(), pivot.to_usize(), max_ctx)
+            == Ordering::Greater
     };
 
     if from >= n {
@@ -1664,19 +1668,11 @@ where
 /// Phase 4 + 5: parallel-merge partitions in chunks of `num_threads`,
 /// emitting each chunk's results in lex order before starting the next.
 ///
-/// Each worker thread holds its own [`CascadeWorkspace`] for the duration
-/// of one partition merge. Within a chunk, all `T` workspaces live in
-/// parallel; between chunks, they are dropped (so peak workspace memory
-/// scales with `T`, not with the number of partitions). The merged result
-/// for each partition is then drained sequentially via `emit` to preserve
-/// streaming-output order without ever holding the full SA in RAM.
-///
-/// Peak transient RAM ≈ `T × max_partition_size × 16 bytes` for the
-/// merged-result buffers, plus the workspaces themselves (~`2 × T ×
-/// max_partition_size × 16` bytes). On a typical run with `p = 4 × T`
-/// subarrays the per-partition size is `≈ n / p`, so this stays
-/// proportional to `n / 4 = 0.25 n` even at the peak — well below the
-/// in-memory path's `~4 n` working set.
+/// Up to `4 × T` partitions are dispatched per chunk so workers can steal
+/// around partition-size skew. Each active merge holds two position/LCP sides;
+/// completed position results are drained sequentially via `emit`. Between
+/// chunks all merge storage is dropped, so residency scales with the bounded
+/// in-flight chunk rather than the total suffix-array length.
 #[allow(clippy::too_many_arguments)]
 fn phase4_merge_and_emit<S, I, L, B, E, F>(
     text: &[S],
@@ -1694,7 +1690,7 @@ where
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>> + Send,
+    B: SaLcpBucketStore<I> + Send,
     F: FnMut(u64) -> Result<(), E>,
 {
     let n_partitions = partition_buckets.len();
@@ -1841,7 +1837,7 @@ where
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>> + Send,
+    B: SaLcpBucketStore<I> + Send,
     F: FnMut(u64) -> Result<(), E>,
 {
     // Default fast path: let rayon merge the whole chunk with minimal
@@ -1898,7 +1894,7 @@ where
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>> + Send,
+    B: SaLcpBucketStore<I> + Send,
     F: FnMut(u64) -> Result<(), E>,
 {
     let n_jobs = chunk.len();
@@ -1997,7 +1993,7 @@ where
     I: Index,
     L: LimitProvider,
     SaLcp<I>: BucketRecord,
-    B: BucketStore<SaLcp<I>>,
+    B: SaLcpBucketStore<I>,
 {
     use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -2005,36 +2001,27 @@ where
         return Ok(Vec::new());
     }
     let t = Instant::now();
-    let records = bucket.load_all()?;
+    let (positions, lcps) = bucket.load_all_soa()?;
     let boundaries: Vec<usize> = bucket.boundaries().to_vec();
     if profile {
         load_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
     }
 
     let t = Instant::now();
-    let workspace = CascadeWorkspace::<I>::new();
+    let workspace = CascadeWorkspace::<I>::from_soa(positions, lcps);
     let result = if let Some(config) = memo_config {
         let mut memo = GeometricMemo::new(config);
         let result = if memo_profiled {
             workspace.cascade_merge_memoized_profiled(
                 text,
                 lp,
-                &records,
                 &boundaries,
                 max_ctx,
                 dispatch,
                 &mut memo,
             )
         } else {
-            workspace.cascade_merge_memoized(
-                text,
-                lp,
-                &records,
-                &boundaries,
-                max_ctx,
-                dispatch,
-                &mut memo,
-            )
+            workspace.cascade_merge_memoized(text, lp, &boundaries, max_ctx, dispatch, &mut memo)
         };
         if memo_profiled {
             memo_stats
@@ -2044,7 +2031,7 @@ where
         }
         result
     } else {
-        workspace.cascade_merge(text, lp, &records, &boundaries, max_ctx, dispatch)
+        workspace.cascade_merge(text, lp, &boundaries, max_ctx, dispatch)
     };
     if profile {
         merge_us.fetch_add(t.elapsed().as_micros() as u64, AtomicOrdering::Relaxed);
@@ -2067,30 +2054,21 @@ struct CascadeWorkspace<I> {
 }
 
 impl<I: Index> CascadeWorkspace<I> {
-    fn new() -> Self {
+    fn from_soa(a_sa: Vec<I>, a_lcp: Vec<I>) -> Self {
+        assert_eq!(a_sa.len(), a_lcp.len());
+        let n = a_sa.len();
         Self {
-            a_sa: Vec::new(),
-            a_lcp: Vec::new(),
-            b_sa: Vec::new(),
-            b_lcp: Vec::new(),
-        }
-    }
-
-    /// Grow all four buffers to at least `n` elements. The contents past
-    /// the cascade's actual run lengths are don't-care.
-    fn ensure_capacity(&mut self, n: usize) {
-        if self.a_sa.len() < n {
-            self.a_sa.resize(n, I::zero());
-            self.a_lcp.resize(n, I::zero());
-            self.b_sa.resize(n, I::zero());
-            self.b_lcp.resize(n, I::zero());
+            a_sa,
+            a_lcp,
+            b_sa: vec![I::zero(); n],
+            b_lcp: vec![I::zero(); n],
         }
     }
 
     /// Cascade 2-way LCP-enhanced merges across the sub-subarrays of one
     /// partition (delimited by `boundaries`) until a single sorted run
     /// remains. **Consumes the workspace** and returns the result side
-    /// as a `Vec<u64>`; the other three buffers (`a_lcp`, the opposing
+    /// as a `Vec<I>`; the other three buffers (`a_lcp`, the opposing
     /// `*_sa`, the opposing `*_lcp`) drop immediately. This shape lets
     /// the caller skip the per-partition `to_vec()` round-trip that
     /// would otherwise sit briefly alongside all four workspace buffers
@@ -2099,7 +2077,6 @@ impl<I: Index> CascadeWorkspace<I> {
         self,
         text: &[S],
         lp: &L,
-        records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
@@ -2108,9 +2085,7 @@ impl<I: Index> CascadeWorkspace<I> {
         S: Symbol,
         L: LimitProvider,
     {
-        self.cascade_merge_impl(
-            text, lp, records, boundaries, max_ctx, dispatch, None, false,
-        )
+        self.cascade_merge_impl(text, lp, boundaries, max_ctx, dispatch, None, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2118,7 +2093,6 @@ impl<I: Index> CascadeWorkspace<I> {
         self,
         text: &[S],
         lp: &L,
-        records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
@@ -2128,16 +2102,7 @@ impl<I: Index> CascadeWorkspace<I> {
         S: Symbol,
         L: LimitProvider,
     {
-        self.cascade_merge_impl(
-            text,
-            lp,
-            records,
-            boundaries,
-            max_ctx,
-            dispatch,
-            Some(memo),
-            false,
-        )
+        self.cascade_merge_impl(text, lp, boundaries, max_ctx, dispatch, Some(memo), false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2145,7 +2110,6 @@ impl<I: Index> CascadeWorkspace<I> {
         self,
         text: &[S],
         lp: &L,
-        records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
@@ -2155,16 +2119,7 @@ impl<I: Index> CascadeWorkspace<I> {
         S: Symbol,
         L: LimitProvider,
     {
-        self.cascade_merge_impl(
-            text,
-            lp,
-            records,
-            boundaries,
-            max_ctx,
-            dispatch,
-            Some(memo),
-            true,
-        )
+        self.cascade_merge_impl(text, lp, boundaries, max_ctx, dispatch, Some(memo), true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2172,7 +2127,6 @@ impl<I: Index> CascadeWorkspace<I> {
         mut self,
         text: &[S],
         lp: &L,
-        records: &[SaLcp<I>],
         boundaries: &[usize],
         max_ctx: usize,
         dispatch: LcpDispatch,
@@ -2183,14 +2137,13 @@ impl<I: Index> CascadeWorkspace<I> {
         S: Symbol,
         L: LimitProvider,
     {
-        let n = records.len();
+        let n = self.a_sa.len();
         if n == 0 {
             return Vec::new();
         }
-        self.ensure_capacity(n);
 
-        // Initialize side A in SOA form from the AOS `records`, and
-        // collect the lengths of the non-empty sub-subarrays.
+        // Side A was decoded directly from the bucket in SOA form. Collect the
+        // lengths of the non-empty sub-subarrays.
         let mut run_lens: Vec<usize> = boundaries
             .windows(2)
             .filter_map(|w| {
@@ -2198,11 +2151,6 @@ impl<I: Index> CascadeWorkspace<I> {
                 if l > 0 { Some(l) } else { None }
             })
             .collect();
-        for (i, r) in records.iter().enumerate() {
-            self.a_sa[i] = r.pos;
-            self.a_lcp[i] = r.lcp;
-        }
-
         let mut src_is_a = true;
         while run_lens.len() > 1 {
             run_lens = self.merge_one_level(
@@ -2462,10 +2410,14 @@ mod tests {
         assert!(!opts.collect_lcp_memoization_stats);
 
         let config = GeometricMemoizationConfig::default();
-        assert_eq!(config.probe_symbols.get(), 256);
-        assert_eq!(config.min_lcp_symbols.get(), 1_024);
-        assert_eq!(config.activate_after_entries.get(), 64);
-        assert_eq!(config.max_entries_per_partition.get(), 4_096);
+        assert_eq!(config.probe_symbols(), 256);
+        assert_eq!(config.min_lcp_symbols(), 1_024);
+        assert_eq!(config.activate_after_entries(), 64);
+        assert_eq!(config.max_entries_per_partition(), 4_096);
+        assert_eq!(
+            LcpMemoizationPolicy::geometric(),
+            LcpMemoizationPolicy::Geometric(config)
+        );
     }
 
     #[test]
@@ -2478,12 +2430,11 @@ mod tests {
         text.push(200);
 
         let direct = ext_mem_sa_with_policy(&text, 16, LcpMemoizationPolicy::Disabled);
-        let config = GeometricMemoizationConfig {
-            probe_symbols: NonZeroUsize::new(8).unwrap(),
-            min_lcp_symbols: NonZeroUsize::new(16).unwrap(),
-            activate_after_entries: NonZeroUsize::new(1).unwrap(),
-            max_entries_per_partition: NonZeroUsize::new(128).unwrap(),
-        };
+        let config = GeometricMemoizationConfig::default()
+            .with_probe_symbols(NonZeroUsize::new(8).unwrap())
+            .with_min_lcp_symbols(NonZeroUsize::new(16).unwrap())
+            .with_activate_after_entries(NonZeroUsize::new(1).unwrap())
+            .with_max_entries_per_partition(NonZeroUsize::new(128).unwrap());
         let memoized = ext_mem_sa_with_policy(&text, 16, LcpMemoizationPolicy::Geometric(config));
         assert_eq!(memoized, direct);
     }
@@ -2511,10 +2462,10 @@ mod tests {
         let LcpMemoizationPolicy::Geometric(config) = opts.lcp_memoization else {
             panic!("environment should enable geometric memoization");
         };
-        assert_eq!(config.probe_symbols.get(), 32);
-        assert_eq!(config.min_lcp_symbols.get(), 256);
-        assert_eq!(config.activate_after_entries.get(), 8);
-        assert_eq!(config.max_entries_per_partition.get(), 512);
+        assert_eq!(config.probe_symbols(), 32);
+        assert_eq!(config.min_lcp_symbols(), 256);
+        assert_eq!(config.activate_after_entries(), 8);
+        assert_eq!(config.max_entries_per_partition(), 512);
         assert!(opts.collect_lcp_memoization_stats);
 
         env.set("CAPS_SA_MEMO_PROBE", "0");

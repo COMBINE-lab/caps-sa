@@ -28,7 +28,7 @@ The output is `u32[]` when the in-memory path runs on an input ≤ 4 GiB, and `u
 | --- | --- | --- |
 | `--ext-mem` | off | Use the **external-memory** sample-sort: working buckets spill to disk, the SA streams to `<output>`, peak RAM stays bounded. Best for genome-scale inputs. |
 | `--in-mem-ss` | off | Use the **in-memory sample-sort**: same streaming shape as `--ext-mem`, but buckets stay in RAM. Useful when disk is the bottleneck and you have the memory. |
-| `--subproblem-count N` | `0` (auto) | Number of subproblems `p` for the sample-sort paths. `0` picks `4 × threads`, clamped to `[1, n]`. Only meaningful with `--ext-mem` / `--in-mem-ss`. |
+| `--subproblem-count N` | `0` (auto) | Number of subproblems `p` for the sample-sort paths. `0` targets ~65,536 positions per subarray, bounded by the worker count and 8,192. Only meaningful with `--ext-mem` / `--in-mem-ss`. |
 | `--threads N` | all cores | Size of the Rayon worker pool. Omit to use every logical CPU. |
 | `-h`, `--help` | — | Print usage and exit. |
 

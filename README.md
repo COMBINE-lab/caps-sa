@@ -75,11 +75,10 @@ Inputs with many repeated long contexts can opt into bounded geometric LCP
 memoization during the final partition merges:
 
 ```rust
-use caps_sa::{GeometricMemoizationConfig, LcpMemoizationPolicy};
+use caps_sa::LcpMemoizationPolicy;
 
-let opts = ExtMemOpts::default().lcp_memoization(
-    LcpMemoizationPolicy::Geometric(GeometricMemoizationConfig::default()),
-);
+let opts = ExtMemOpts::default()
+    .lcp_memoization(LcpMemoizationPolicy::geometric());
 ```
 
 The direct path remains the default. See

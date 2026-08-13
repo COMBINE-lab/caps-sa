@@ -130,7 +130,9 @@ pub trait BucketStore<T>: Send {
 /// buffers just to match the generic [`BucketStore::add_slice`] shape.
 pub trait SaLcpBucketStore<I: Index>: BucketStore<SaLcp<I>> {
     fn add_soa(&mut self, positions: &[I], lcps: &[I]) -> io::Result<()>;
+    fn add_soa_reset_first_lcp(&mut self, positions: &[I], lcps: &[I]) -> io::Result<()>;
     fn add_slice_reset_first_lcp(&mut self, rs: &[SaLcp<I>]) -> io::Result<()>;
+    fn load_all_soa(&mut self) -> io::Result<(Vec<I>, Vec<I>)>;
 }
 
 /// Pure-RAM analogue of [`ExtMemBucket`] for the in-memory sample-sort
@@ -198,6 +200,23 @@ impl<I: Index> SaLcpBucketStore<I> for InMemBucket<SaLcp<I>> {
         Ok(())
     }
 
+    fn add_soa_reset_first_lcp(&mut self, positions: &[I], lcps: &[I]) -> io::Result<()> {
+        debug_assert_eq!(positions.len(), lcps.len());
+        self.records.reserve(positions.len());
+        self.records
+            .extend(
+                positions
+                    .iter()
+                    .zip(lcps.iter())
+                    .enumerate()
+                    .map(|(i, (&pos, &lcp))| SaLcp {
+                        pos,
+                        lcp: if i == 0 { I::zero() } else { lcp },
+                    }),
+            );
+        Ok(())
+    }
+
     fn add_slice_reset_first_lcp(&mut self, rs: &[SaLcp<I>]) -> io::Result<()> {
         if rs.is_empty() {
             return Ok(());
@@ -206,6 +225,17 @@ impl<I: Index> SaLcpBucketStore<I> for InMemBucket<SaLcp<I>> {
         self.records.extend_from_slice(rs);
         self.records[start].lcp = I::zero();
         Ok(())
+    }
+
+    fn load_all_soa(&mut self) -> io::Result<(Vec<I>, Vec<I>)> {
+        let records = std::mem::take(&mut self.records);
+        let mut positions = Vec::with_capacity(records.len());
+        let mut lcps = Vec::with_capacity(records.len());
+        for record in records {
+            positions.push(record.pos);
+            lcps.push(record.lcp);
+        }
+        Ok((positions, lcps))
     }
 }
 
@@ -248,6 +278,33 @@ where
         Ok(())
     }
 
+    fn add_soa_reset_first_lcp(&mut self, positions: &[I], lcps: &[I]) -> io::Result<()> {
+        debug_assert_eq!(positions.len(), lcps.len());
+        if positions.is_empty() {
+            return Ok(());
+        }
+        if self.buf.len() + positions.len() <= self.buffer_records {
+            self.buf
+                .extend(
+                    positions
+                        .iter()
+                        .zip(lcps.iter())
+                        .enumerate()
+                        .map(|(i, (&pos, &lcp))| SaLcp {
+                            pos,
+                            lcp: if i == 0 { I::zero() } else { lcp },
+                        }),
+                );
+            return Ok(());
+        }
+        self.flush()?;
+        self.ensure_file()?;
+        let writer = self.writer.as_mut().unwrap();
+        write_sa_lcp_records_reset_first(writer, positions, lcps)?;
+        self.on_disk += positions.len();
+        Ok(())
+    }
+
     fn add_slice_reset_first_lcp(&mut self, rs: &[SaLcp<I>]) -> io::Result<()> {
         if rs.is_empty() {
             return Ok(());
@@ -264,6 +321,22 @@ where
         write_records_reset_first_lcp(writer, rs)?;
         self.on_disk += rs.len();
         Ok(())
+    }
+
+    fn load_all_soa(&mut self) -> io::Result<(Vec<I>, Vec<I>)> {
+        self.flush()?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.flush()?;
+        }
+        let total = self.total_records();
+        let mut positions = Vec::with_capacity(total);
+        let mut lcps = Vec::with_capacity(total);
+        if let Some(file) = self.file.as_ref() {
+            let mut reader = BufReader::new(file.reopen()?);
+            reader.seek(SeekFrom::Start(0))?;
+            read_sa_lcp_soa(&mut reader, total, &mut positions, &mut lcps)?;
+        }
+        Ok((positions, lcps))
     }
 }
 
@@ -664,6 +737,29 @@ where
         Ok(())
     }
 
+    fn write_extent_soa_reset_first(&mut self, positions: &[I], lcps: &[I]) -> io::Result<()> {
+        debug_assert_eq!(positions.len(), lcps.len());
+        let n_records = positions.len();
+        if n_records == 0 {
+            return Ok(());
+        }
+        let n_bytes = n_records * SaLcp::<I>::SIZE;
+        debug_assert!(
+            n_bytes <= u32::MAX as usize,
+            "single extent exceeds 4 GiB (n_bytes={n_bytes})",
+        );
+        let mut scratch = vec![0u8; n_bytes];
+        write_sa_lcp_records_reset_first_to_slice(&mut scratch, positions, lcps);
+        let offset = self
+            .phys
+            .cursor
+            .fetch_add(n_bytes as u64, Ordering::Relaxed);
+        pwrite_all(&self.phys.file, &scratch, offset)?;
+        self.extents.push((offset, n_bytes as u32));
+        self.on_disk += n_records;
+        Ok(())
+    }
+
     fn write_extent_reset_first_lcp(&mut self, rs: &[SaLcp<I>]) -> io::Result<()> {
         let n_records = rs.len();
         if n_records == 0 {
@@ -757,6 +853,29 @@ where
         self.write_extent_soa(positions, lcps)
     }
 
+    fn add_soa_reset_first_lcp(&mut self, positions: &[I], lcps: &[I]) -> io::Result<()> {
+        debug_assert_eq!(positions.len(), lcps.len());
+        if positions.is_empty() {
+            return Ok(());
+        }
+        if self.buf.len() + positions.len() <= self.buffer_records {
+            self.buf
+                .extend(
+                    positions
+                        .iter()
+                        .zip(lcps.iter())
+                        .enumerate()
+                        .map(|(i, (&pos, &lcp))| SaLcp {
+                            pos,
+                            lcp: if i == 0 { I::zero() } else { lcp },
+                        }),
+                );
+            return Ok(());
+        }
+        self.flush()?;
+        self.write_extent_soa_reset_first(positions, lcps)
+    }
+
     fn add_slice_reset_first_lcp(&mut self, rs: &[SaLcp<I>]) -> io::Result<()> {
         if rs.is_empty() {
             return Ok(());
@@ -769,6 +888,23 @@ where
         }
         self.flush()?;
         self.write_extent_reset_first_lcp(rs)
+    }
+
+    fn load_all_soa(&mut self) -> io::Result<(Vec<I>, Vec<I>)> {
+        self.flush()?;
+        let total = self.total_records();
+        let mut positions = Vec::with_capacity(total);
+        let mut lcps = Vec::with_capacity(total);
+        let mut scratch = Vec::new();
+        for &(offset, byte_len) in &self.extents {
+            let byte_len = byte_len as usize;
+            if scratch.len() < byte_len {
+                scratch.resize(byte_len, 0);
+            }
+            pread_all(&self.phys.file, &mut scratch[..byte_len], offset)?;
+            read_sa_lcp_soa_from_slice(&scratch[..byte_len], &mut positions, &mut lcps);
+        }
+        Ok((positions, lcps))
     }
 }
 
@@ -886,6 +1022,34 @@ where
     Ok(())
 }
 
+fn write_sa_lcp_records_reset_first<I, W>(w: &mut W, positions: &[I], lcps: &[I]) -> io::Result<()>
+where
+    I: Index,
+    SaLcp<I>: BucketRecord,
+    W: Write,
+{
+    const CHUNK_RECORDS: usize = 1024;
+    debug_assert_eq!(positions.len(), lcps.len());
+    let mut scratch = vec![0u8; CHUNK_RECORDS * SaLcp::<I>::SIZE];
+    for (chunk_index, (pos_chunk, lcp_chunk)) in positions
+        .chunks(CHUNK_RECORDS)
+        .zip(lcps.chunks(CHUNK_RECORDS))
+        .enumerate()
+    {
+        let bytes = pos_chunk.len() * SaLcp::<I>::SIZE;
+        write_sa_lcp_records_to_slice(&mut scratch[..bytes], pos_chunk, lcp_chunk);
+        if chunk_index == 0 {
+            SaLcp {
+                pos: pos_chunk[0],
+                lcp: I::zero(),
+            }
+            .write_to(&mut scratch[..SaLcp::<I>::SIZE]);
+        }
+        w.write_all(&scratch[..bytes])?;
+    }
+    Ok(())
+}
+
 fn write_sa_lcp_records_to_slice<I>(out: &mut [u8], positions: &[I], lcps: &[I])
 where
     I: Index,
@@ -895,6 +1059,21 @@ where
     debug_assert_eq!(out.len(), positions.len() * SaLcp::<I>::SIZE);
     for (i, (&pos, &lcp)) in positions.iter().zip(lcps.iter()).enumerate() {
         SaLcp { pos, lcp }.write_to(&mut out[i * SaLcp::<I>::SIZE..(i + 1) * SaLcp::<I>::SIZE]);
+    }
+}
+
+fn write_sa_lcp_records_reset_first_to_slice<I>(out: &mut [u8], positions: &[I], lcps: &[I])
+where
+    I: Index,
+    SaLcp<I>: BucketRecord,
+{
+    write_sa_lcp_records_to_slice(out, positions, lcps);
+    if let Some(&pos) = positions.first() {
+        SaLcp {
+            pos,
+            lcp: I::zero(),
+        }
+        .write_to(&mut out[..SaLcp::<I>::SIZE]);
     }
 }
 
@@ -956,10 +1135,85 @@ fn read_records<T: BucketRecord, R: Read>(
     Ok(())
 }
 
+fn read_sa_lcp_soa<I, R>(
+    reader: &mut R,
+    count: usize,
+    positions: &mut Vec<I>,
+    lcps: &mut Vec<I>,
+) -> io::Result<()>
+where
+    I: Index,
+    SaLcp<I>: BucketRecord,
+    R: Read,
+{
+    const CHUNK_RECORDS: usize = 1024;
+    let mut scratch = vec![0u8; CHUNK_RECORDS * SaLcp::<I>::SIZE];
+    let mut remaining = count;
+    while remaining > 0 {
+        let take = remaining.min(CHUNK_RECORDS);
+        let bytes = take * SaLcp::<I>::SIZE;
+        reader.read_exact(&mut scratch[..bytes])?;
+        read_sa_lcp_soa_from_slice(&scratch[..bytes], positions, lcps);
+        remaining -= take;
+    }
+    Ok(())
+}
+
+fn read_sa_lcp_soa_from_slice<I>(bytes: &[u8], positions: &mut Vec<I>, lcps: &mut Vec<I>)
+where
+    I: Index,
+    SaLcp<I>: BucketRecord,
+{
+    debug_assert_eq!(bytes.len() % SaLcp::<I>::SIZE, 0);
+    for record_bytes in bytes.chunks_exact(SaLcp::<I>::SIZE) {
+        let record = SaLcp::<I>::read_from(record_bytes);
+        positions.push(record.pos);
+        lcps.push(record.lcp);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn assert_soa_round_trip<B: SaLcpBucketStore<u64>>(mut bucket: B) {
+        let positions: Vec<u64> = (0..5_000).collect();
+        let lcps: Vec<u64> = (0..5_000).map(|i| i + 10).collect();
+        bucket
+            .add_soa_reset_first_lcp(&positions[..3], &lcps[..3])
+            .unwrap();
+        bucket.mark_boundary();
+        bucket
+            .add_soa_reset_first_lcp(&positions[3..], &lcps[3..])
+            .unwrap();
+        bucket.mark_boundary();
+
+        assert_eq!(bucket.boundaries(), &[0, 3, 5_000]);
+        let (loaded_positions, mut loaded_lcps) = bucket.load_all_soa().unwrap();
+        assert_eq!(loaded_positions, positions);
+        loaded_lcps[0] = lcps[0];
+        loaded_lcps[3] = lcps[3];
+        assert_eq!(loaded_lcps, lcps);
+    }
+
+    #[test]
+    fn soa_round_trip_in_memory() {
+        assert_soa_round_trip(InMemBucket::<SaLcp<u64>>::new());
+    }
+
+    #[test]
+    fn soa_round_trip_external() {
+        let dir = tempdir().unwrap();
+        assert_soa_round_trip(ExtMemBucket::<SaLcp<u64>>::new(dir.path(), "soa"));
+    }
+
+    #[test]
+    fn soa_round_trip_pooled() {
+        let dir = tempdir().unwrap();
+        let pool = BucketPool::new(1, dir.path()).unwrap();
+        assert_soa_round_trip(pool.new_bucket::<SaLcp<u64>>(0));
+    }
 
     #[test]
     fn round_trip_below_buffer() {

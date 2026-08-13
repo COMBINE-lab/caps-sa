@@ -142,10 +142,7 @@ fn main() -> std::io::Result<()> {
         // output file. Both sample-sort paths share this streaming
         // shape; the only difference is whether the working buckets
         // are disk-backed (ext-mem) or RAM-only (in-mem-ss).
-        let opts = ExtMemOpts {
-            subproblem_count: args.subproblem_count,
-            ..ExtMemOpts::default()
-        };
+        let opts = ExtMemOpts::default().subproblem_count(args.subproblem_count);
         let writer = std::cell::RefCell::new(BufWriter::new(fs::File::create(&args.output)?));
         let mut count = 0usize;
         let mode_label = if args.ext_mem { "ext-mem" } else { "in-mem-ss" };

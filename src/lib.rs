@@ -7,9 +7,10 @@
 //! The crate is generic over the symbol type (`u8`, `u16`, …; any `Ord + Copy`)
 //! and the index type (`u32`, `u64`; via the [`Index`] trait). It produces a
 //! standard lexicographic suffix array. Callers who need a *generalized* suffix
-//! array (multiple strings, sentinel-terminated) should rewrite their text with
-//! distinct sentinels before invoking — the resulting standard SA over the
-//! transformed text is then the generalized SA they want.
+//! array can supply a [`LimitProvider`] (for example [`SegmentedText`]) to stop
+//! comparisons at string boundaries and define their boundary ordering. This
+//! avoids enlarging the symbol alphabet with one distinct sentinel per input
+//! string.
 //!
 //! Phase 1 of the port provides the **in-memory** algorithm; the external-memory
 //! variant (disk-spilling buckets) is layered on top in a later phase.

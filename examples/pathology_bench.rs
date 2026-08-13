@@ -53,10 +53,7 @@ fn run_one(chr_len: usize, padded_chr_len: usize) {
         100.0 * n_skipped as f64 / n as f64,
     );
 
-    let opts = ExtMemOpts {
-        work_dir: std::env::temp_dir(),
-        ..Default::default()
-    };
+    let opts = ExtMemOpts::with_work_dir(std::env::temp_dir());
 
     // OLD API: sort the entire text. caps-sa has no choice — every
     // spacer-starting suffix is in the queue and they all share a

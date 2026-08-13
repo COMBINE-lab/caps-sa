@@ -75,11 +75,15 @@ Sample-sort / external-memory tuning. `Default::default()` is tuned for genome-s
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `max_context` | `usize::MAX` | Bound on LCP-extension comparisons inside merges. `MAX` is unbounded. |
-| `subproblem_count` | `0` → auto | Number of subarrays `p`. `0` picks `4 × rayon::current_num_threads()`, clamped to `[1, n]`. |
+| `max_context` | `usize::MAX` | Suffix-comparison context cap. Equal prefixes that exhaust it use `boundary_order`; `MAX` gives full ordering. |
+| `subproblem_count` | `0` → auto | Number of subarrays `p`. `0` targets ~65,536 selected positions per subarray, clamped to `[rayon workers, 8,192]` and never above `n`. |
 | `work_dir` | `std::env::temp_dir()` | Directory for the temporary bucket files. |
-| `physical_file_count` | `0` → auto | Physical temp files in the bucket pool. `0` picks one per worker; the `2 × p` logical buckets collapse onto this pool. |
+| `physical_file_count` | `0` → auto | Physical temp files in the bucket pool. `0` picks one per worker; the `p` logical partition buckets collapse onto this pool. |
 | `ordered_phase4_emit` | `false` | Opt into the bounded ordered emitter (lower transient residency on skewed inputs, slightly slower on balanced ones). |
+| `lcp_memoization` | `Disabled` | Optional exact long-LCP reuse. `LcpMemoizationPolicy::geometric()` selects the GRCh38-tuned defaults. |
+
+`ExtMemOpts` is non-exhaustive. Construct it with `default()` or `from_env()`
+and use its builder methods rather than an external struct literal.
 
 The `CAPS_SA_N_PHYS` environment variable overrides `physical_file_count` for one-off runs.
 
@@ -119,12 +123,16 @@ use caps_sa::{SegmentedText, build_ext_mem_with};
 // boundaries from per-sequence lengths …
 let seg = SegmentedText::from_lengths(text.len(), &[100, 50, 220]);
 // … or from cumulative ends (e.g. STAR's chr_start table)
-let seg = SegmentedText::from_ends(vec![100, 150, 370]);
+let seg = SegmentedText::from_ends(text.len(), vec![100, 150, 370]);
 
 build_ext_mem_with(text, &seg, &opts, |sa_pos| { Ok(()) })?;
 ```
 
-`PlainText` (the default `LimitProvider`) imposes no boundaries and monomorphizes to the same code as the un-segmented path, so there is no cost when you don't need segments.
+For large segment collections, `SegmentedText` automatically builds a bounded
+coarse directory so each lookup searches only a local range of cumulative
+ends. `PlainText` (the default `LimitProvider`) imposes no boundaries and
+monomorphizes to the same code as the un-segmented path, so there is no cost
+when you don't need segments.
 
 ## Errors
 

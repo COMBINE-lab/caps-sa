@@ -35,8 +35,12 @@ A single byte-level SIMD compare serves every symbol width through a byte-view d
 
 ## Tuning notes
 
-- **`subproblem_count`** (`p`) defaults to `4 × threads`. More subproblems mean smaller per-partition merges (lower peak residency) at the cost of more bucket bookkeeping.
+- **`subproblem_count`** (`p`) auto-targets ~65,536 selected positions per subarray, bounded below by the worker count and above by 8,192. More subproblems mean smaller per-partition merges (lower peak residency) at the cost of more bucket bookkeeping.
 - **`physical_file_count`** defaults to one temp file per worker. Raise it to reduce kernel write contention on fast local disks; lower it on networked filesystems with high metadata cost (or set `CAPS_SA_N_PHYS`).
 - **`work_dir`** should point at the fastest local scratch available for the external-memory path.
+- **`SegmentedText`** automatically adds a bounded coarse boundary directory
+  for at least 256 segments. There is no tuning knob; the measured layout is
+  capped at 8 MiB and avoids global boundary searches on generalized SAs with
+  hundreds of thousands of short strings.
 
 See [`ExtMemOpts`](/caps-sa/reference/api/#extmemopts) for the full set of knobs.

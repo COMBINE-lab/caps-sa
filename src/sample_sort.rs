@@ -265,6 +265,88 @@ pub(crate) fn merge_sort<S, I, L>(
     lcp_arr.copy_from_slice(lcp_w);
 }
 
+/// Sort one subarray that is already owned by an outer Rayon task.
+///
+/// Spawning recursive Rayon joins here oversubscribes phase 1's thousands of
+/// independent tasks and performs scheduler bookkeeping at every merge-tree
+/// node. Keeping the recursion local still leaves ample outer parallelism.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_sort_task_local<S, I, L>(
+    text: &[S],
+    lp: &L,
+    sa: &mut [I],
+    sa_w: &mut [I],
+    lcp_arr: &mut [I],
+    lcp_w: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    debug_assert_eq!(sa.len(), sa_w.len());
+    debug_assert_eq!(sa.len(), lcp_arr.len());
+    debug_assert_eq!(sa.len(), lcp_w.len());
+    if sa.is_empty() {
+        return;
+    }
+
+    // Both sides begin with the same unsorted positions. Recursive calls swap
+    // source and destination roles, so every merge level writes directly into
+    // the side consumed by its parent and no level needs a copy-back pass.
+    sa_w.copy_from_slice(sa);
+    merge_sort_ping_pong(text, lp, sa_w, lcp_w, sa, lcp_arr, max_ctx, dispatch);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_sort_ping_pong<S, I, L>(
+    text: &[S],
+    lp: &L,
+    src_sa: &mut [I],
+    src_lcp: &mut [I],
+    dst_sa: &mut [I],
+    dst_lcp: &mut [I],
+    max_ctx: usize,
+    dispatch: LcpDispatch,
+) where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = src_sa.len();
+    debug_assert_eq!(src_lcp.len(), n);
+    debug_assert_eq!(dst_sa.len(), n);
+    debug_assert_eq!(dst_lcp.len(), n);
+    if n <= 1 {
+        if n == 1 {
+            dst_sa[0] = src_sa[0];
+            dst_lcp[0] = I::zero();
+        }
+        return;
+    }
+
+    let mid = n / 2;
+    {
+        let (src_sa_l, src_sa_r) = src_sa.split_at_mut(mid);
+        let (src_lcp_l, src_lcp_r) = src_lcp.split_at_mut(mid);
+        let (dst_sa_l, dst_sa_r) = dst_sa.split_at_mut(mid);
+        let (dst_lcp_l, dst_lcp_r) = dst_lcp.split_at_mut(mid);
+        merge_sort_ping_pong(
+            text, lp, dst_sa_l, dst_lcp_l, src_sa_l, src_lcp_l, max_ctx, dispatch,
+        );
+        merge_sort_ping_pong(
+            text, lp, dst_sa_r, dst_lcp_r, src_sa_r, src_lcp_r, max_ctx, dispatch,
+        );
+    }
+
+    let (src_sa_l, src_sa_r) = src_sa.split_at(mid);
+    let (src_lcp_l, src_lcp_r) = src_lcp.split_at(mid);
+    merge(
+        text, lp, src_sa_l, src_sa_r, src_lcp_l, src_lcp_r, dst_sa, dst_lcp, max_ctx, dispatch,
+    );
+}
+
 /// LCP-enhanced two-way merge of two sorted suffix arrays.
 ///
 /// `x` / `lcp_x` and `y` / `lcp_y` must each be sorted with `lcp_*[0] == 0`
@@ -381,7 +463,12 @@ macro_rules! merge_body {
                 let remaining_ctx = cap.saturating_sub(m);
                 let ext = merge_extension!($lookup, $text, $dispatch, p_a, p_b, m, remaining_ctx);
                 let total = m + ext;
-                let a_smaller = if total < lim_a && total < lim_b {
+                // `cap` includes max_ctx as well as both suffix limits.  If
+                // the scan exhausts max_ctx, comparison is deliberately
+                // truncated and must use the configured boundary tie-break;
+                // reading one more symbol here would disagree with
+                // LcpDispatch::suffix_cmp_with and phase-2 pivot ordering.
+                let a_smaller = if total < cap {
                     $text[p_a + total] < $text[p_b + total]
                 } else {
                     $lp.boundary_order(p_a, lim_a, p_b, lim_b).is_lt()
@@ -674,6 +761,29 @@ mod tests {
                         "lcp[{i}] wrong with max_ctx={max_ctx}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn suffix_array_respects_finite_max_context() {
+        use rand::{RngExt, SeedableRng};
+
+        let dispatch = LcpDispatch::detect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0F11_7EC7);
+        for &max_ctx in &[0usize, 1, 2, 4, 16] {
+            for &n in &[2usize, 3, 7, 64, 500] {
+                let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
+                let opts = Opts {
+                    max_context: max_ctx,
+                };
+                let got: Vec<u32> = build_in_memory_with_opts(&text, &opts);
+                let mut want: Vec<u32> = (0..n as u32).collect();
+                want.sort_by(|&a, &b| dispatch.suffix_cmp(&text, a as usize, b as usize, max_ctx));
+                assert_eq!(
+                    got, want,
+                    "finite-context SA mismatch (n={n}, max_ctx={max_ctx})"
+                );
             }
         }
     }

@@ -79,16 +79,15 @@ Memoization is selected per construction through `ExtMemOpts` and remains
 disabled by default:
 
 ```rust
-let opts = caps_sa::ExtMemOpts::default().lcp_memoization(
-    caps_sa::LcpMemoizationPolicy::Geometric(
-        caps_sa::GeometricMemoizationConfig::default(),
-    ),
-);
+let opts = caps_sa::ExtMemOpts::default()
+    .lcp_memoization(caps_sa::LcpMemoizationPolicy::geometric());
 ```
 
-The four configuration fields use `NonZeroUsize`, so invalid zero-valued
-policies cannot be constructed. Callers can start from `default()` and replace
-individual public fields. The measured defaults are:
+The configuration is opaque and non-exhaustive. Its getters expose symbol
+probe, exact-LCP admission, lazy-activation, and per-partition entry limits;
+`with_*` methods take `NonZeroUsize` values and tune them without tying callers
+to the struct layout or admitting zero-valued, ineffective configurations. The
+measured defaults deliberately keep short comparisons on the direct path:
 
 | Parameter | Default | `ExtMemOpts::from_env()` override |
 |---|---:|---|
@@ -102,11 +101,10 @@ variables are parsed only by that explicit constructor; `ExtMemOpts::default()`
 and the build itself never consult them for memoization policy. Invalid and
 zero-valued numeric overrides retain the defaults.
 
-Detailed per-call instrumentation is a separate
-`ExtMemOpts::collect_lcp_memoization_stats` switch (or
-`CAPS_SA_MEMO_STATS=1` through `from_env()`). Counters are collected only when
-phase profiling is also enabled, preventing diagnostic branches from
-contaminating ordinary memoized runs.
+Detailed per-call instrumentation is an intentionally unstable diagnostic,
+enabled with `CAPS_SA_MEMO_STATS=1` through `ExtMemOpts::from_env()`. Counters
+are collected only when phase profiling is also enabled, preventing diagnostic
+branches from contaminating ordinary memoized runs.
 
 When full, the first prototype still extends an existing endpoint but rejects
 new endpoints. Profiling records capacity rejections. If saturation is common,

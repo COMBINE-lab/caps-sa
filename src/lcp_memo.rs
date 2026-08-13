@@ -27,49 +27,124 @@ pub enum LcpMemoizationPolicy {
     Geometric(GeometricMemoizationConfig),
 }
 
+impl LcpMemoizationPolicy {
+    /// Enable geometric memoization with the GRCh38-tuned defaults.
+    ///
+    /// This is equivalent to
+    /// `LcpMemoizationPolicy::Geometric(GeometricMemoizationConfig::default())`
+    /// without requiring callers to name the configuration type.
+    pub const fn geometric() -> Self {
+        Self::Geometric(GeometricMemoizationConfig::DEFAULT)
+    }
+}
+
+impl From<GeometricMemoizationConfig> for LcpMemoizationPolicy {
+    fn from(config: GeometricMemoizationConfig) -> Self {
+        Self::Geometric(config)
+    }
+}
+
 /// Tuning controls for [`LcpMemoizationPolicy::Geometric`].
 ///
-/// Every field is non-zero by construction. The defaults were selected on a
-/// complete ruSTAR-shaped GRCh38 plus GENCODE workload. Tables are local to a
-/// single phase-4 partition cascade and are dropped when that partition is
-/// emitted.
+/// The defaults were selected on a complete ruSTAR-shaped GRCh38 plus GENCODE
+/// workload. Tables are local to a single phase-4 partition cascade and are
+/// dropped when that partition is emitted.
 ///
 /// ```
 /// use caps_sa::{GeometricMemoizationConfig, LcpMemoizationPolicy};
 /// use std::num::NonZeroUsize;
 ///
-/// let mut config = GeometricMemoizationConfig::default();
-/// config.probe_symbols = NonZeroUsize::new(512).unwrap();
-/// let policy = LcpMemoizationPolicy::Geometric(config);
+/// let config = GeometricMemoizationConfig::default()
+///     .with_probe_symbols(NonZeroUsize::new(512).unwrap());
+/// let policy = LcpMemoizationPolicy::from(config);
 /// # let _ = policy;
 /// ```
 #[non_exhaustive]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GeometricMemoizationConfig {
-    /// Compare this many symbols normally before consulting the table.
-    pub probe_symbols: NonZeroUsize,
-    /// Admit only exact LCPs at least this long, including any known prefix.
-    pub min_lcp_symbols: NonZeroUsize,
-    /// Begin table lookups only after learning this many entries.
-    pub activate_after_entries: NonZeroUsize,
-    /// Hard entry bound for each phase-4 partition table.
-    pub max_entries_per_partition: NonZeroUsize,
+    probe_symbols: NonZeroUsize,
+    min_lcp_symbols: NonZeroUsize,
+    activate_after_entries: NonZeroUsize,
+    max_entries_per_partition: NonZeroUsize,
+}
+
+impl GeometricMemoizationConfig {
+    /// The default configuration measured on ruSTAR-shaped GRCh38 plus
+    /// GENCODE input.
+    pub const DEFAULT: Self = Self {
+        probe_symbols: NonZeroUsize::new(DEFAULT_PROBE).unwrap(),
+        min_lcp_symbols: NonZeroUsize::new(DEFAULT_MIN_LCP).unwrap(),
+        activate_after_entries: NonZeroUsize::new(DEFAULT_ACTIVATE_ENTRIES).unwrap(),
+        max_entries_per_partition: NonZeroUsize::new(DEFAULT_CAPACITY).unwrap(),
+    };
+
+    /// Number of symbols compared normally before an active-table lookup.
+    pub const fn probe_symbols(&self) -> usize {
+        self.probe_symbols.get()
+    }
+
+    /// Return this configuration with a new ordinary-comparison probe length.
+    ///
+    /// Production callers should normally retain the measured default so
+    /// short comparisons stay on the direct path.
+    pub const fn with_probe_symbols(mut self, probe_symbols: NonZeroUsize) -> Self {
+        self.probe_symbols = probe_symbols;
+        self
+    }
+
+    /// Minimum exact LCP length, including any prefix already known by the
+    /// merge, that is eligible for admission.
+    pub const fn min_lcp_symbols(&self) -> usize {
+        self.min_lcp_symbols.get()
+    }
+
+    /// Return this configuration with a new exact-LCP admission threshold.
+    pub const fn with_min_lcp_symbols(mut self, min_lcp_symbols: NonZeroUsize) -> Self {
+        self.min_lcp_symbols = min_lcp_symbols;
+        self
+    }
+
+    /// Number of learned entries required before a partition starts looking
+    /// entries up.
+    pub const fn activate_after_entries(&self) -> usize {
+        self.activate_after_entries.get()
+    }
+
+    /// Return this configuration with a new lazy-activation threshold.
+    ///
+    /// If this exceeds [`Self::max_entries_per_partition`], that partition
+    /// remains in the training kernel for its entire lifetime.
+    pub const fn with_activate_after_entries(
+        mut self,
+        activate_after_entries: NonZeroUsize,
+    ) -> Self {
+        self.activate_after_entries = activate_after_entries;
+        self
+    }
+
+    /// Hard entry bound for one phase-4 partition table.
+    pub const fn max_entries_per_partition(&self) -> usize {
+        self.max_entries_per_partition.get()
+    }
+
+    /// Return this configuration with a new per-partition entry bound.
+    ///
+    pub const fn with_max_entries_per_partition(
+        mut self,
+        max_entries_per_partition: NonZeroUsize,
+    ) -> Self {
+        self.max_entries_per_partition = max_entries_per_partition;
+        self
+    }
 }
 
 impl Default for GeometricMemoizationConfig {
     fn default() -> Self {
-        // These constants are all statically non-zero.
-        Self {
-            probe_symbols: NonZeroUsize::new(DEFAULT_PROBE).unwrap(),
-            min_lcp_symbols: NonZeroUsize::new(DEFAULT_MIN_LCP).unwrap(),
-            activate_after_entries: NonZeroUsize::new(DEFAULT_ACTIVATE_ENTRIES).unwrap(),
-            max_entries_per_partition: NonZeroUsize::new(DEFAULT_CAPACITY).unwrap(),
-        }
+        Self::DEFAULT
     }
 }
 
-/// Internal representation used by the hot path after public options have
-/// been validated by their `NonZeroUsize` types.
+/// Compact internal representation copied into the hot path once per build.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoConfig {
     pub(crate) probe: usize,

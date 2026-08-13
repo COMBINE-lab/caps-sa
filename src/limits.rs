@@ -102,18 +102,18 @@ impl LimitProvider for PlainText {
 }
 
 /// Provider for texts partitioned into segments at known cumulative
-/// end positions. `lim_at(p)` binary-searches the sorted ends list
-/// and returns the distance from `p` to the next boundary.
+/// end positions. `lim_at(p)` returns the distance from `p` to the next
+/// boundary. Large collections automatically add a compact coarse directory,
+/// reducing the binary search to the boundaries inside one position block.
 ///
-/// Storage cost is `8 × n_segments` bytes (the cumulative-ends
-/// `Vec<u64>`). For a 50 K-junction SA index on a 6 GB genome that
-/// is **400 KB total** — vs the 750 MB a packed bitmap would need,
-/// and the 6 GB an extra-byte-per-symbol u16 text would need.
+/// Base storage is `8 × n_segments` bytes for the cumulative ends. For at
+/// least 256 segments, the optional `u32` directory adds at most 8 MiB and at
+/// most another `8 × n_segments` bytes. This remains much smaller than a
+/// per-symbol boundary bitmap or a widened text alphabet at genome scale.
 ///
-/// Lookup is `O(log n_segments)` — a few cycles for typical
-/// segment counts. The merge can cache `lim_p`/`lim_q` across LCP
-/// calls so the cost amortises to ~one binary search per output
-/// record.
+/// Lookup is `O(log n_segments)` in the fallback and `O(log b)` with the
+/// directory, where `b` is the number of boundaries in one coarse block. The
+/// merge also caches `lim_p`/`lim_q` while a suffix remains at a run front.
 ///
 /// Two constructors:
 /// - [`from_lengths`][Self::from_lengths] takes per-segment lengths
@@ -133,6 +133,52 @@ pub struct SegmentedText {
     /// After segment 1 of length 50 (positions 100..150),
     /// `ends[1] = 150`. The last entry equals the total text length.
     ends: Vec<u64>,
+    /// Coarse position-to-boundary index for large segment collections.
+    directory: Option<BoundaryDirectory>,
+}
+
+#[derive(Clone, Debug)]
+struct BoundaryDirectory {
+    block_shift: u32,
+    /// Number of segment ends at or before each power-of-two block start.
+    first_after_block_start: Vec<u32>,
+}
+
+impl BoundaryDirectory {
+    /// Small segment collections already fit comfortably in cache and do not
+    /// repay an extra directory lookup. Large collections get at most two
+    /// million coarse blocks and roughly two blocks per end when text length
+    /// permits it. The directory therefore occupies at most 8 MiB and at most
+    /// eight additional bytes per segment.
+    const MIN_ENDS: usize = 256;
+    const MAX_BLOCKS: usize = 2_000_000;
+
+    fn build(n: usize, ends: &[u64]) -> Option<Self> {
+        if ends.len() < Self::MIN_ENDS || ends.len() > u32::MAX as usize || n == 0 {
+            return None;
+        }
+
+        let target_blocks = ends.len().saturating_mul(2).clamp(1, Self::MAX_BLOCKS);
+        let min_block_size = n.div_ceil(target_blocks);
+        let block_size = min_block_size
+            .checked_next_power_of_two()
+            .unwrap_or(1usize << (usize::BITS - 1));
+        let block_shift = block_size.trailing_zeros();
+        let n_blocks = n.div_ceil(block_size);
+        let mut first_after_block_start = Vec::with_capacity(n_blocks + 1);
+        let mut end_index = 0usize;
+        for block in 0..=n_blocks {
+            let block_start = block.saturating_mul(block_size).min(n) as u64;
+            while end_index < ends.len() && ends[end_index] <= block_start {
+                end_index += 1;
+            }
+            first_after_block_start.push(end_index as u32);
+        }
+        Some(Self {
+            block_shift,
+            first_after_block_start,
+        })
+    }
 }
 
 impl SegmentedText {
@@ -148,7 +194,12 @@ impl SegmentedText {
             cum as usize, text_len,
             "SegmentedText::from_lengths: per-segment lengths sum to {cum} but text_len is {text_len}",
         );
-        Self { n: text_len, ends }
+        let directory = BoundaryDirectory::build(text_len, &ends);
+        Self {
+            n: text_len,
+            ends,
+            directory,
+        }
     }
 
     /// Build from sorted, strictly-increasing cumulative end positions.
@@ -168,7 +219,12 @@ impl SegmentedText {
                 "SegmentedText::from_ends: empty ends but text_len ({text_len}) != 0",
             ),
         }
-        Self { n: text_len, ends }
+        let directory = BoundaryDirectory::build(text_len, &ends);
+        Self {
+            n: text_len,
+            ends,
+            directory,
+        }
     }
 
     /// Total text length in symbols.
@@ -195,6 +251,18 @@ impl SegmentedText {
 impl LimitProvider for SegmentedText {
     #[inline]
     fn lim_at(&self, p: usize) -> usize {
+        if let Some(directory) = &self.directory
+            && p < self.n
+        {
+            let block = p >> directory.block_shift;
+            let lo = directory.first_after_block_start[block] as usize;
+            let mut hi = directory.first_after_block_start[block + 1] as usize;
+            // If the block has no boundary, include the first boundary from a
+            // later block so the local search still contains its answer.
+            hi = hi.max(lo + 1).min(self.ends.len());
+            let i = lo + self.ends[lo..hi].partition_point(|&b| b <= p as u64);
+            return self.ends[i] as usize - p;
+        }
         // First boundary strictly greater than p.
         let i = self.ends.partition_point(|&b| b <= p as u64);
         if i < self.ends.len() {
@@ -255,6 +323,24 @@ mod tests {
         assert_eq!(lp.lim_at(0), 10);
         assert_eq!(lp.lim_at(5), 5);
         assert_eq!(lp.lim_at(10), 0);
+    }
+
+    #[test]
+    fn segmented_directory_matches_binary_search() {
+        let lengths: Vec<usize> = (0..2_000).map(|i| 1 + i % 97).collect();
+        let n = lengths.iter().sum();
+        let indexed = SegmentedText::from_lengths(n, &lengths);
+        assert!(indexed.directory.is_some());
+
+        for p in 0..=n {
+            let i = indexed.ends.partition_point(|&b| b <= p as u64);
+            let want = if i < indexed.ends.len() {
+                indexed.ends[i] as usize - p
+            } else {
+                n - p
+            };
+            assert_eq!(indexed.lim_at(p), want, "p={p}");
+        }
     }
 
     #[test]

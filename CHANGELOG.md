@@ -9,11 +9,16 @@ Release notes for the [`caps-sa`](https://crates.io/crates/caps-sa) crate.
 - Opt-in geometric LCP memoization for the external-memory phase-4 merge.
   `LcpMemoizationPolicy::Geometric` reuses exact long-LCP intervals through
   bounded, partition-local tables; short comparisons run directly and tables
-  activate lazily. The public `GeometricMemoizationConfig` exposes the probe,
-  admission, activation, and per-partition capacity thresholds. Memoization is
-  disabled by default.
-- Environment and builder controls for selecting and profiling memoization,
-  including `CAPS_SA_GEOMETRIC_MEMO` and the `CAPS_SA_MEMO_*` tunables.
+  activate lazily. The opaque, non-exhaustive
+  `GeometricMemoizationConfig` exposes the probe, admission, activation, and
+  per-partition capacity thresholds through getters and builder methods.
+  Memoization is disabled by default.
+- `LcpMemoizationPolicy::geometric()` selects the measured defaults directly;
+  `GeometricMemoizationConfig` can also be passed to
+  `ExtMemOpts::lcp_memoization` through its `From` conversion.
+- Builder and environment controls for selecting memoization, plus unstable
+  environment-only profiling diagnostics, including
+  `CAPS_SA_GEOMETRIC_MEMO` and the `CAPS_SA_MEMO_*` tunables.
 - Cross-platform CI for debug/release tests, documentation, Clippy, formatting,
   and Rust 1.89 MSRV coverage.
 
@@ -21,13 +26,36 @@ Release notes for the [`caps-sa`](https://crates.io/crates/caps-sa) crate.
 
 - Phase 1 of the external-memory path now fuses subarray sorting and partition
   distribution, reducing intermediate work and temporary storage.
+- External buckets now decode directly into the position/LCP arrays consumed
+  by phase 4, and phase 1 routes slices from those same separate arrays. This
+  removes transient array-of-struct conversions without changing the disk
+  format.
+- When phase 1 already has at least one outer task per worker, each subarray
+  uses a task-local ping-pong merge sort. This avoids nested Rayon scheduling,
+  prevents stacked per-task scratch during work stealing, and removes
+  per-level copy-back passes. Explicit low-subproblem builds retain recursive
+  parallelism.
+- `SegmentedText` now builds a bounded coarse boundary directory for large
+  segment collections. On the 6.56-billion-symbol ruSTAR GRCh38 plus GENCODE
+  fixture (1.40 million segments), this reduced the complete memoized build
+  from 260.338 s to 172.953 s with 33 MiB additional peak RSS and identical
+  output.
 - Merge kernels prefetch upcoming text positions on supported targets.
 - Debug and test builds validate complete LCP arrays at construction boundaries.
+- Finite-`max_context` merges now stop at the same comparison cap as pivot
+  selection and the public suffix comparator, rather than reading one extra
+  symbol before applying `boundary_order`.
 
 ### Compatibility
 
-This release adds public fields to `ExtMemOpts`, which can break struct-literal
-construction without `..Default::default()`. Version bumps `0.6.1 → 0.7.0`.
+`ExtMemOpts` is now non-exhaustive; construct it with `default()` or
+`from_env()` and its builder methods. This one-time 0.x API break prevents
+future option additions from repeatedly breaking struct literals. Version
+bumps `0.6.1 → 0.7.0`.
+
+Detailed memoization counters remain available through the environment-backed
+profiling path but are no longer a public `ExtMemOpts` field; their internal
+shape can evolve without becoming a stable API commitment.
 
 ## [v0.6.1](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.6.1) — 2026-06-01
 
