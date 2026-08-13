@@ -60,6 +60,7 @@
 use crate::Index;
 use crate::ext_mem::profile_log;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// An order-preserving remap of the bytes that actually occur in a text onto
@@ -251,7 +252,13 @@ const RADIX_BITS: u32 = 11;
 const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
 
 /// Sort every suffix position by `(packed key, visible length)`, returning the
-/// sorted keys alongside the sorted positions.
+/// sorted positions and a bit per slot marking where a tied group starts.
+///
+/// The key array does not come back. Grouping only needs to know where one
+/// group ends and the next begins, which is one bit per slot rather than the
+/// eight bytes a key costs, and dropping the keys here rather than after the
+/// grouping pass is what keeps the doubling path's peak below the merge
+/// kernel's. See [`build_sa`] for the accounting.
 ///
 /// This is an MSD counting sort rather than a comparison sort, for three
 /// reasons that all matter at genome scale:
@@ -268,7 +275,7 @@ fn seed_sort<I: Index>(
     text: &[u8],
     packer: &Packer,
     visible_len: &(dyn Fn(usize) -> usize + Sync),
-) -> (Vec<u64>, Vec<I>) {
+) -> (Vec<AtomicU64>, Vec<I>) {
     let n = text.len();
     let bucket_of = |key: u64| -> usize { (key >> (64 - RADIX_BITS)) as usize };
 
@@ -310,12 +317,18 @@ fn seed_sort<I: Index>(
         debug_assert_eq!(running, n);
     }
 
-    // Pass 2: scatter. Each chunk owns a disjoint slice of every bucket, so
-    // the writes never collide even though they are not contiguous.
-    let mut keys: Vec<u64> = vec![0; n];
+    // Pass 2: scatter positions into their buckets. Each chunk owns a
+    // disjoint slice of every bucket, so the writes never collide even though
+    // they are not contiguous.
+    //
+    // The key is computed here to pick the bucket and then thrown away. An
+    // `n`-entry key array would be the largest allocation in the whole build,
+    // 8 bytes per position against the 4 that `sa` costs, and it would still
+    // be resident when the doubling rounds need their own arrays. Pass 3
+    // recomputes the keys of one bucket at a time instead, which is one extra
+    // key per position spread across the workers.
     let mut sa: Vec<I> = vec![I::zero(); n];
     {
-        let key_out = Scatter::new(&mut keys);
         let sa_out = Scatter::new(&mut sa);
         bounds
             .par_iter()
@@ -324,50 +337,70 @@ fn seed_sort<I: Index>(
                 let mut cursor: Vec<usize> =
                     offsets[c * RADIX_BUCKETS..(c + 1) * RADIX_BUCKETS].to_vec();
                 for p in start..end {
-                    let key = packer.key_at(text, p);
-                    let slot = &mut cursor[bucket_of(key)];
+                    let slot = &mut cursor[bucket_of(packer.key_at(text, p))];
                     // SAFETY: the prefix sum gives this (chunk, bucket) pair a
                     // range of exactly its own histogram count, and the cursor
                     // never leaves it, so no other thread writes this index.
-                    unsafe {
-                        key_out.set(*slot, key);
-                        sa_out.set(*slot, I::from_usize(p));
-                    }
+                    unsafe { sa_out.set(*slot, I::from_usize(p)) };
                     *slot += 1;
                 }
             });
     }
 
-    // Pass 3: order within each bucket. Buckets share their top `RADIX_BITS`,
-    // so what remains is the low bits of the key and then the visible-length
-    // tie-break. Buckets are contiguous and independent.
-    let mut rest: &mut [u64] = &mut keys;
+    // Pass 3: order within each bucket, and record where tied groups start.
+    //
+    // Buckets share their top `RADIX_BITS`, so what remains is the low bits of
+    // the key and then the visible-length tie-break. Buckets are contiguous
+    // and independent, and two positions in different buckets differ in the
+    // key by construction, so a bucket's first slot always starts a group and
+    // the group-start bits can be filled in here, per bucket, while that
+    // bucket's keys exist.
+    // Atomic words: two buckets can share the word their boundary bits live
+    // in, so the bits are set with relaxed fetch-or. Reads are relaxed loads
+    // and cost nothing once the fill is done.
+    let starts: Vec<AtomicU64> = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
     let mut rest_sa: &mut [I] = &mut sa;
-    let mut slices: Vec<(&mut [u64], &mut [I])> = Vec::with_capacity(RADIX_BUCKETS);
+    let mut slices: Vec<(usize, &mut [I])> = Vec::with_capacity(RADIX_BUCKETS);
     for b in 0..RADIX_BUCKETS {
         let len = bucket_start[b + 1] - bucket_start[b];
-        let (kb, kt) = rest.split_at_mut(len);
         let (sb, st) = rest_sa.split_at_mut(len);
-        slices.push((kb, sb));
-        rest = kt;
+        slices.push((bucket_start[b], sb));
         rest_sa = st;
     }
-    slices.into_par_iter().for_each(|(kb, sb)| {
-        if kb.len() < 2 {
-            return;
-        }
-        let mut pairs: Vec<(u64, I)> = kb.iter().copied().zip(sb.iter().copied()).collect();
-        pairs.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| visible_len(a.1.to_usize()).cmp(&visible_len(b.1.to_usize())))
+    {
+        let start_bits = &starts;
+        let set_bit = |h: usize| {
+            start_bits[h / 64].fetch_or(1 << (h % 64), Ordering::Relaxed);
+        };
+        slices.into_par_iter().for_each(|(base, sb)| {
+            if sb.is_empty() {
+                return;
+            }
+            set_bit(base);
+            if sb.len() > 1 {
+                let mut pairs: Vec<(u64, I)> = sb
+                    .iter()
+                    .map(|&p| (packer.key_at(text, p.to_usize()), p))
+                    .collect();
+                pairs.sort_unstable_by(|a, b| {
+                    a.0.cmp(&b.0)
+                        .then_with(|| visible_len(a.1.to_usize()).cmp(&visible_len(b.1.to_usize())))
+                });
+                for (i, &(_, pos)) in pairs.iter().enumerate() {
+                    sb[i] = pos;
+                }
+                for i in 1..pairs.len() {
+                    let (ka, pa) = pairs[i - 1];
+                    let (kb, pb) = pairs[i];
+                    if ka != kb || visible_len(pa.to_usize()) != visible_len(pb.to_usize()) {
+                        set_bit(base + i);
+                    }
+                }
+            }
         });
-        for (i, &(key, pos)) in pairs.iter().enumerate() {
-            kb[i] = key;
-            sb[i] = pos;
-        }
-    });
+    }
 
-    (keys, sa)
+    (starts, sa)
 }
 
 /// Build the standard lexicographic suffix array of `text` by radix-seeded
@@ -411,17 +444,17 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         t0.elapsed().as_secs_f64()
     ));
     let t1 = Instant::now();
-    let (keys, mut sa) = seed_sort::<I>(text, &packer, &visible_len);
+    let (starts, mut sa) = seed_sort::<I>(text, &packer, &visible_len);
     profile_log(&format!(
         "radix seed sort {:.3}s",
         t1.elapsed().as_secs_f64()
     ));
     let t2 = Instant::now();
 
-    // Two seeded entries tie exactly when key and visible length both match.
-    let seed_eq = |a: usize, b: usize| -> bool {
-        keys[a] == keys[b] && visible_len(sa[a].to_usize()) == visible_len(sa[b].to_usize())
-    };
+    // Slot `h` begins a tied group exactly when the seed marked it, so two
+    // adjacent slots tie exactly when the later one is not a start.
+    let starts_group =
+        |h: usize| -> bool { starts[h / 64].load(Ordering::Relaxed) >> (h % 64) & 1 == 1 };
 
     // `rank[p]` is the index in `sa` of the first element of `p`'s group, so
     // two suffixes tie at the current depth exactly when their ranks match,
@@ -435,14 +468,14 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
     // `0..n`, so the scattered writes never collide. `collect` on an indexed
     // parallel iterator preserves order, so `groups` comes out sorted.
     let ranks = Scatter::new(&mut rank);
-    let groups: Vec<(usize, usize)> = (0..n)
+    let groups: Vec<(I, I)> = (0..n)
         .into_par_iter()
         .filter_map(|h| {
-            if h > 0 && seed_eq(h - 1, h) {
+            if !starts_group(h) {
                 return None;
             }
             let mut e = h + 1;
-            while e < n && seed_eq(e, h) {
+            while e < n && !starts_group(e) {
                 e += 1;
             }
             let g = I::from_usize(h);
@@ -452,11 +485,16 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
                 // no other thread writes.
                 unsafe { ranks.set(entry.to_usize(), g) };
             }
-            (e - h > 1).then_some((h, e))
+            (e - h > 1).then_some((I::from_usize(h), I::from_usize(e)))
         })
         .collect();
     let mut groups = groups;
-    drop(keys);
+    profile_log(&format!(
+        "radix groups    {} groups, {} MB",
+        groups.len(),
+        groups.len() * std::mem::size_of::<(I, I)>() / (1 << 20)
+    ));
+    drop(starts);
     profile_log(&format!(
         "radix grouping  {:.3}s",
         t2.elapsed().as_secs_f64()
@@ -465,9 +503,17 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
 
     // ---- Double: (rank_d(p), rank_d(p + d)) resolves to depth 2d. ----
     let mut depth = k;
-    // Scratch for the new rank of each `sa` slot, so a round's reads of
-    // `rank` never observe that same round's writes.
-    let mut next_rank: Vec<I> = vec![I::zero(); n];
+    // Scratch for the new rank of each *tied* `sa` slot, so a round's reads
+    // of `rank` never observe that same round's writes.
+    //
+    // Sized to the tied population rather than to `n`. Only slots inside a
+    // group are rewritten, and even the first round has far fewer of those
+    // than the text has positions (18% of them on chr21), so a full second
+    // rank array would be mostly untouched pages. Each group gets a
+    // contiguous window at its prefix-sum offset, and the buffer is reused
+    // across rounds, which shrink monotonically.
+    let mut next_rank: Vec<I> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
 
     while !groups.is_empty() {
         let round_t = Instant::now();
@@ -484,17 +530,38 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         // each", which is exactly the property the groups have, so each group
         // takes its own sub-slices directly with no sequential prepass. And a
         // group that fits the stack buffer never touches the allocator.
+        // Window each group takes in the tied-slot buffer.
+        offsets.clear();
+        offsets.reserve(groups.len() + 1);
+        let mut tied = 0usize;
+        for &(start, end) in &groups {
+            offsets.push(tied);
+            tied += end.to_usize() - start.to_usize();
+        }
+        offsets.push(tied);
+        if next_rank.len() < tied {
+            next_rank.resize(tied, I::zero());
+        }
+
         let sa_cell = Scatter::new(&mut sa);
         let nr_cell = Scatter::new(&mut next_rank);
         let rank_ref = &rank;
-        let sub: Vec<(usize, usize)> = groups
+        let offsets_ref = &offsets;
+        let sub: Vec<(I, I)> = groups
             .par_iter()
-            .flat_map_iter(|&(start, end)| {
+            .enumerate()
+            .flat_map_iter(|(gi, &(start, end))| {
+                let (start, end) = (start.to_usize(), end.to_usize());
                 let len = end - start;
                 // SAFETY: `groups` are disjoint, sorted `sa` ranges, so this
-                // group is the sole owner of `start..end` in both arrays.
-                let (sa_g, nr_g) =
-                    unsafe { (sa_cell.slice_mut(start, len), nr_cell.slice_mut(start, len)) };
+                // group is the sole owner of `start..end` in `sa` and of its
+                // own prefix-sum window in the tied-slot buffer.
+                let (sa_g, nr_g) = unsafe {
+                    (
+                        sa_cell.slice_mut(start, len),
+                        nr_cell.slice_mut(offsets_ref[gi], len),
+                    )
+                };
                 let succ = |p: usize| -> u64 {
                     // End-of-text sorts first: the shorter suffix is smaller.
                     match p.checked_add(depth) {
@@ -517,7 +584,7 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
                 };
                 keyed.sort_unstable();
 
-                let mut fresh = Vec::new();
+                let mut fresh: Vec<(I, I)> = Vec::new();
                 let mut i = 0;
                 while i < len {
                     let key = keyed[i].0;
@@ -530,7 +597,7 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
                         *slot = g;
                     }
                     if j - i > 1 {
-                        fresh.push((start + i, start + j));
+                        fresh.push((I::from_usize(start + i), I::from_usize(start + j)));
                     }
                     i = j;
                 }
@@ -545,18 +612,29 @@ pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
         // Groups are disjoint and `sa` is a permutation, so each `rank` slot
         // is written by exactly one group.
         let ranks = Scatter::new(&mut rank);
-        groups.par_iter().for_each(|&(start, end)| {
-            for i in start..end {
-                // SAFETY: `sa[start..end]` are distinct positions owned solely
-                // by this group, and the groups partition their index range.
-                unsafe { ranks.set(sa[i].to_usize(), next_rank[i]) };
-            }
-        });
+        groups
+            .par_iter()
+            .enumerate()
+            .for_each(|(gi, &(start, end))| {
+                let base = offsets[gi];
+                for (i, slot) in (start.to_usize()..end.to_usize()).enumerate() {
+                    // SAFETY: `sa[start..end]` are distinct positions owned
+                    // solely by this group, and the groups partition their
+                    // index range.
+                    unsafe { ranks.set(sa[slot].to_usize(), next_rank[base + i]) };
+                }
+            });
 
-        let before: usize = groups.iter().map(|&(s, e)| e - s).sum();
+        let before: usize = groups
+            .iter()
+            .map(|&(s, e)| e.to_usize() - s.to_usize())
+            .sum();
         let n_groups = groups.len();
         groups = sub;
-        let after: usize = groups.iter().map(|&(s, e)| e - s).sum();
+        let after: usize = groups
+            .iter()
+            .map(|&(s, e)| e.to_usize() - s.to_usize())
+            .sum();
 
         // A doubling round can only ever refine, so `after <= before`. If a
         // round refines nothing at all the text has a run longer than the
