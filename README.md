@@ -71,6 +71,21 @@ build_ext_mem(&text, &opts, |sa_pos| {
 })?;
 ```
 
+Inputs with many repeated long contexts can opt into bounded geometric LCP
+memoization during the final partition merges:
+
+```rust
+use caps_sa::{GeometricMemoizationConfig, LcpMemoizationPolicy};
+
+let opts = ExtMemOpts::default().lcp_memoization(
+    LcpMemoizationPolicy::Geometric(GeometricMemoizationConfig::default()),
+);
+```
+
+The direct path remains the default. See
+[`docs/geometric-memoization.md`](docs/geometric-memoization.md) for the policy
+fields, ownership model, and measured workloads.
+
 For workflows that sort only a subset of positions (e.g. STAR-style
 genome indexing where many positions are filtered out — N's, spacers),
 hand only the positions you want sorted to `*_for_positions`. The

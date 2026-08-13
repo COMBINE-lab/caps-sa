@@ -19,6 +19,7 @@
 mod ext_bucket;
 mod ext_mem;
 mod lcp;
+mod lcp_memo;
 mod limits;
 mod sample_sort;
 
@@ -33,6 +34,7 @@ pub use ext_mem::{
     try_build_in_memory_sample_sort_for_positions_with, try_build_in_memory_sample_sort_with,
 };
 pub use lcp::{LcpDispatch, Symbol, lcp, lcp_scalar, lcp_u8, suffix_cmp};
+pub use lcp_memo::{GeometricMemoizationConfig, LcpMemoizationPolicy};
 pub use limits::{LimitProvider, PlainText, SegmentedText};
 pub use sample_sort::{
     Opts, build_in_memory, build_in_memory_for_positions, build_in_memory_for_positions_with,
