@@ -1497,6 +1497,8 @@ where
     let chunk_size = n.div_ceil(p);
     let partition_buckets: Vec<Mutex<B>> = (0..p).map(|j| Mutex::new(mk_bucket(j))).collect();
     let task_local_sort = p >= rayon::current_num_threads().max(1);
+    // One alphabet scan for the whole build, not one per subarray.
+    let packer = crate::pack::seed_params(text);
 
     (0..p).into_par_iter().try_for_each(|i| -> io::Result<()> {
         let start = (i * chunk_size).min(n);
@@ -1511,7 +1513,21 @@ where
         let mut sa_w = vec![I::zero(); len];
         let mut lcp_arr = vec![I::zero(); len];
         let mut lcp_w = vec![I::zero(); len];
-        if task_local_sort {
+        if crate::pack::seed_subarray(
+            text,
+            lp,
+            packer.as_ref(),
+            &mut sa,
+            &mut lcp_arr,
+            &mut sa_w,
+            &mut lcp_w,
+            opts.max_context,
+            dispatch,
+            task_local_sort,
+        ) {
+            // Sorted by key, with the merge kernel run only inside equal-key
+            // groups.
+        } else if task_local_sort {
             sample_sort::merge_sort_task_local(
                 text,
                 lp,

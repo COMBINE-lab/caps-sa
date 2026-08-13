@@ -73,6 +73,52 @@ pub trait LimitProvider: Sync {
         let _ = (p_a, p_b);
         lim_a.cmp(&lim_b)
     }
+
+    /// Which side of a real symbol this provider's boundary convention puts
+    /// the end of a suffix on, when that convention is expressible.
+    ///
+    /// Answering `Some` lets phase 1 sort its subarrays by a packed
+    /// fixed-depth key instead of comparing suffixes through the text. Such a
+    /// key packs `min(k, lim_at(p))` symbols and pads the rest with a reserved
+    /// sentinel placed according to this answer, so key order agrees with
+    /// [`boundary_order`][Self::boundary_order] whenever the key decides at
+    /// all. Keys that tie still defer to `boundary_order` itself, which is
+    /// what lets a convention with a position tie-break (STAR's
+    /// `lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))`) work: the key never has to
+    /// express the tie-break, only never to contradict it.
+    ///
+    /// The contract is exactly this: for suffixes `a` and `b` whose shared
+    /// prefix ends because one of them reached its limit,
+    /// `boundary_order(a, .., b, ..)` must be `Less` iff `a` is the one that
+    /// ended, under [`BoundaryRank::ShorterFirst`], and `Greater` iff `a` is
+    /// the one that ended, under [`BoundaryRank::LongerFirst`].
+    ///
+    /// The default is `None`, which keeps every existing implementation on the
+    /// comparison path. Answer it only if your `boundary_order` decides purely
+    /// by which suffix ended first, with at most a tie-break between suffixes
+    /// that end at the same offset.
+    #[inline]
+    fn boundary_rank(&self) -> Option<BoundaryRank> {
+        None
+    }
+}
+
+/// How a provider's [`boundary_order`][LimitProvider::boundary_order] ranks a
+/// suffix that ends at its segment boundary against one that keeps going.
+///
+/// This is the one fact a fixed-depth packed key needs in order to represent
+/// a segmented comparator: a key pads a short suffix out to full width, and
+/// the padding symbol has to fall on the correct side of every real symbol.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BoundaryRank {
+    /// The suffix that ends first is smaller, the standard generalized-SA
+    /// convention and the default `boundary_order`. Keys pad with a symbol
+    /// below every real one.
+    ShorterFirst,
+    /// The suffix that ends first is *larger*, equivalently the longer one is
+    /// smaller. STAR's spacer-as-largest ordering. Keys pad with a symbol
+    /// above every real one.
+    LongerFirst,
 }
 
 /// Default provider for non-segmented texts: `lim_at(p) = n - p`.
@@ -98,6 +144,13 @@ impl LimitProvider for PlainText {
     #[inline(always)]
     fn lim_at(&self, p: usize) -> usize {
         self.n - p
+    }
+
+    /// End of text behaves like a boundary the shorter suffix hits first,
+    /// which is the lexicographic convention this provider implements.
+    #[inline]
+    fn boundary_rank(&self) -> Option<BoundaryRank> {
+        Some(BoundaryRank::ShorterFirst)
     }
 }
 
@@ -271,6 +324,13 @@ impl LimitProvider for SegmentedText {
             // p past the last boundary: just text-end.
             self.n - p
         }
+    }
+
+    /// `SegmentedText` keeps the default `boundary_order`, which is
+    /// shorter-is-smaller.
+    #[inline]
+    fn boundary_rank(&self) -> Option<BoundaryRank> {
+        Some(BoundaryRank::ShorterFirst)
     }
 }
 
