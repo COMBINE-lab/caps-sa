@@ -14,15 +14,17 @@ streams the SA out as positions are emitted.
 
 ## Status
 
-Both the in-memory and external-memory paths are implemented, tested,
-and benchmarked. 43 unit tests pass and the SA output is differentially
-verified against a brute-force reference on small and random inputs.
+Both the in-memory and external-memory paths are implemented, tested on
+Linux, macOS, and Windows, and differentially verified against direct suffix
+comparison on small, random, segmented, filtered, and finite-context inputs.
 
-On the human genome (GRCh38, 32 threads on AMD EPYC 9575F), caps-sa is
-**7% faster than upstream CaPS-SA's ext-mem path** and uses **23% less
-RAM**, while beating upstream's in-mem wall time by 3% at 1/10 of the
-RAM. See [`bench/README.md`](bench/README.md) for the full methodology
-and the optimisation ladder that got us there.
+On the complete ruSTAR-shaped GENCODE Human v50 input (6.56 billion text
+symbols, 6.18 billion retained suffixes, and 1.40 million segments), caps-sa
+0.7.0 builds the generalized, filtered suffix array in **172.953 s** at 32
+physical cores with **8.75 GiB peak RSS**. That is 35.4% faster and 12.8% less
+memory than the pre-pass 0.7 baseline, with identical output. See the
+[performance guide](https://combine-lab.github.io/caps-sa/reference/performance/)
+for the production-shaped and upstream-comparison results.
 
 The crate ships four entry points sharing one LCP-enhanced merge
 kernel:
@@ -81,9 +83,12 @@ let opts = ExtMemOpts::default()
     .lcp_memoization(LcpMemoizationPolicy::geometric());
 ```
 
-The direct path remains the default. See
-[`docs/geometric-memoization.md`](docs/geometric-memoization.md) for the policy
-fields, ownership model, and measured workloads.
+The direct path remains the default: memoization pays only when the workload
+contains enough repeated long contexts. See the
+[user guide](https://combine-lab.github.io/caps-sa/concepts/geometric-memoization/)
+for when to enable it and how to tune it, and
+[`docs/geometric-memoization.md`](docs/geometric-memoization.md) for the full
+design and measurement record.
 
 For workflows that sort only a subset of positions (e.g. STAR-style
 genome indexing where many positions are filtered out — N's, spacers),
@@ -111,16 +116,12 @@ analysis is in `src/sample_sort.rs::merge`.
 
 The external-memory path wraps that kernel in a sample-sort:
 
-1. **Sort + sample + spill.** Split positions into `p` subarrays, sort
-   each with the in-memory kernel in parallel, sample `~c·ln n`
-   suffixes uniformly, spill each sorted subarray to a disk-spilling
-   bucket.
-2. **Select pivots.** Sort the pooled samples and pick `p − 1` evenly-
-   spaced pivots, defining `p` partition ranges over the global SA.
-3. **Distribute.** Binary-search each sorted subarray against the
-   pivots and route sub-subarrays into the corresponding partition's
-   bucket.
-4. **Per-partition merge.** Load each partition's bucket into RAM,
+1. **Presample pivots.** Sort a small deterministic position sample and pick
+   `p - 1` evenly-spaced pivots, defining the final partition ranges.
+2. **Sort + distribute.** Split positions into `p` subarrays, sort each in an
+   outer Rayon task, and write its pivot-delimited slices directly to their
+   final disk-spilling partition buckets.
+3. **Per-partition merge.** Load each partition's bucket into RAM,
    cascade 2-way LCP-enhanced merges over its sub-subarrays, emit the
    resulting sorted positions via the caller-supplied closure.
 
@@ -130,7 +131,16 @@ streamed out in lex order.
 
 ## Performance — short version
 
-(See [`bench/README.md`](bench/README.md) for the full numbers.)
+(See the [performance guide](https://combine-lab.github.io/caps-sa/reference/performance/)
+for definitions and the full measurement context.)
+
+Current production-shaped measurement:
+
+| Input | Threads | Wall | Peak RSS | Output |
+| --- | ---:| ---:| ---:| ---:|
+| ruSTAR-shaped GRCh38 + GENCODE v50, `u64`, segmented + ACGT-filtered | 32 physical | **172.953 s** | **8.75 GiB** | 6,176,694,310 suffixes |
+
+Earlier standard, unsegmented suffix-array comparison against upstream C++:
 
 | Input                        | Threads | caps-sa ext-mem | upstream ext-mem |
 | ---------------------------- | ------- | --------------- | ---------------- |

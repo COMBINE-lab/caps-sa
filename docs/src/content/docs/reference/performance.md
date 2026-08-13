@@ -1,11 +1,63 @@
 ---
 title: Performance
-description: How caps-sa compares to the upstream C++ CaPS-SA reference.
+description: Production-shaped caps-sa 0.7 measurements and the standard upstream comparison.
 ---
 
-All numbers below are **suffix-array build time only** (file I/O excluded), measured against the upstream C++ CaPS-SA reference. Full methodology and the optimisation ladder are in [`bench/README.md`](https://github.com/COMBINE-lab/caps-sa/blob/main/bench/README.md).
+Unless stated otherwise, numbers are suffix-array construction time and output
+is streamed to a hash sink. The current production-shaped measurements use 32
+pinned physical cores on an AMD EPYC 9555. Every candidate emitted the same
+position count and output hash.
 
-## External-memory path
+## caps-sa 0.7.0 on the ruSTAR workload
+
+The current integration benchmark preserves the generalized, filtered suffix
+array that ruSTAR actually requests:
+
+- GENCODE Human v50 GRCh38 primary-assembly FASTA and comprehensive
+  primary-assembly GTF;
+- `sjdbOverhang=100` and all 698,597 deduplicated splice junctions;
+- 6,557,611,930 symbols, 1,397,582 segments, and STAR boundary ordering;
+- 6,176,694,310 retained ACGT-starting suffixes;
+- external-memory `u64`, 8,192 partitions, 32 physical cores.
+
+| Implementation | Wall | User CPU | Peak RSS | Phase 1 | Phase 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pre-pass 0.7 baseline | 267.592 s | 7,622.88 s | 10,512,408 KiB | 106.847 s | 155.794 s |
+| caps-sa 0.7.0 | **172.953 s** | **4,731.05 s** | **9,169,892 KiB** | **49.029 s** | **118.743 s** |
+
+The release is **35.4% faster** and uses **12.8% less peak RSS**. The retained
+changes fuse external sorting and distribution, prefetch upcoming text
+positions during merge, avoid transient record conversions, use task-local
+phase-1 ping-pong storage at high outer parallelism, and add a bounded coarse
+directory for large `SegmentedText` boundary sets.
+
+On the focused chromosome-21 backbone plus every GENCODE-derived junction
+flank, stable measurements improved from 11.97–12.00 seconds to 7.77–7.80
+seconds. All 359,616,038 emitted positions matched the reference.
+
+## Geometric memoization
+
+The table above has geometric memoization enabled on both sides; do not add its
+isolated percentage to the 35.4% release improvement. Its separate direct A/B
+on the complete fixture measured:
+
+| Policy | Wall | User CPU | Peak RSS |
+| --- | ---: | ---: | ---: |
+| Disabled | 291.710 s | 8,029.81 s | 10,672,468 KiB |
+| Geometric defaults | **267.128 s** | **7,607.24 s** | **9,696,720 KiB** |
+
+That is an **8.43% wall-time** and **5.26% user-CPU** improvement. Smaller or
+less repetitive inputs were neutral or only slightly positive, so the feature
+is opt-in. See [Geometric LCP memoization](/caps-sa/concepts/geometric-memoization/)
+for selection and tuning guidance.
+
+## Standard unsegmented comparison
+
+The following older dataset compares caps-sa with the upstream C++ CaPS-SA
+reference on standard, unsegmented suffix arrays. It is retained as a generic
+implementation comparison; it is **not** the annotated ruSTAR workload above.
+Full methodology and the optimization ladder are in
+[`bench/README.md`](https://github.com/COMBINE-lab/caps-sa/blob/main/bench/README.md).
 
 | Input | Threads | caps-sa | upstream C++ |
 | --- | --- | --- | --- |
@@ -14,7 +66,8 @@ All numbers below are **suffix-array build time only** (file I/O excluded), meas
 | Human GRCh38 · 3.1 GB | 32 | **10.47 min** | 10.93 min |
 | GRCh38 peak RAM | 32 | **5.03 GB** | 6.46 GB |
 
-On the human genome (GRCh38, 32 threads, AMD EPYC 9575F) caps-sa is **~7% faster** than upstream's external-memory path and uses **~23% less RAM**.
+On that historical GRCh38 input (32 threads, AMD EPYC 9575F), caps-sa was
+**~7% faster** than upstream's external-memory path and used **~23% less RAM**.
 
 ## In-memory sample-sort
 
@@ -42,5 +95,9 @@ A single byte-level SIMD compare serves every symbol width through a byte-view d
   for at least 256 segments. There is no tuning knob; the measured layout is
   capped at 8 MiB and avoids global boundary searches on generalized SAs with
   hundreds of thousands of short strings.
+- **Geometric LCP memoization** is disabled by default. Enable
+  `LcpMemoizationPolicy::geometric()` only after an A/B shows enough reused
+  long contexts to repay table lookups; retain the measured thresholds unless
+  workload-specific profiling supports a change.
 
 See [`ExtMemOpts`](/caps-sa/reference/api/#extmemopts) for the full set of knobs.

@@ -39,17 +39,17 @@ export const installCode = `<span class="comment"># Library · add to your crate
 
 <section class="capssa-section">
   <h2>Genome-scale, on commodity hardware.</h2>
-  <p class="lede">GRCh38 (3.1 GB, ≈ 6 × 10⁹ symbols), 32 threads on an AMD EPYC 9575F. Measured against the upstream C++ CaPS-SA reference.</p>
+  <p class="lede">Complete ruSTAR-shaped GRCh38 + GENCODE Human v50: 6.56 billion symbols, 1.40 million segments, ACGT-start filtering, and STAR boundary ordering. Measured with 32 physical cores on an AMD EPYC 9555.</p>
   <div class="capssa-stats">
     <div class="capssa-stat">
-      <div class="num">5.03 GB</div>
-      <div class="lbl">Peak RAM · whole human genome</div>
-      <div class="sub">Full GRCh38 suffix array in 10.47 min wall — 7% faster than upstream's external-memory path and 23% less RAM.</div>
+      <div class="num">2.88 min</div>
+      <div class="lbl">6.18 billion emitted suffixes</div>
+      <div class="sub">caps-sa 0.7.0 completes the generalized, filtered construction in 172.953 s with 8.75 GiB peak RSS.</div>
     </div>
     <div class="capssa-stat">
-      <div class="num">45×</div>
-      <div class="lbl">LCP SIMD speedup</div>
-      <div class="sub">One AVX-512 byte-compare backs every symbol width, lifting the LCP kernel from ~200 ms scalar to 4–29 ms (7× on <code>u64</code>, 45× on <code>u8</code>).</div>
+      <div class="num">35.4%</div>
+      <div class="lbl">Faster than the pre-pass 0.7 baseline</div>
+      <div class="sub">Task-local phase 1, direct SoA data flow, and indexed segment boundaries also reduce peak RSS by 12.8%.</div>
     </div>
   </div>
 </section>
@@ -105,6 +105,13 @@ export const installCode = `<span class="comment"># Library · add to your crate
         <p>A <code>SegmentedText</code> limit-provider stops LCP scans at segment boundaries — the hook STAR-style genome+junction indexes build on.</p>
       </div>
     </div>
+    <div class="capssa-feat">
+      <div class="n">07</div>
+      <div>
+        <h3>Optional long-LCP reuse</h3>
+        <p>Bounded, partition-local geometric memoization reuses exact long matching intervals without taxing ordinary short comparisons. It remains opt-in and improved the complete ruSTAR-shaped build by 8.4% in isolation.</p>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -138,22 +145,20 @@ export const installCode = `<span class="comment"># Library · add to your crate
 </svg>
 
 <section class="capssa-section">
-  <h2>Side by side with upstream.</h2>
-  <p class="lede">Suffix-array build time (I/O excluded), caps-sa vs the upstream C++ CaPS-SA reference. See the <a href="/caps-sa/reference/performance/">performance page</a> for the full methodology.</p>
+  <h2>The 0.7 production path.</h2>
+  <p class="lede">Complete ruSTAR-shaped GRCh38 + GENCODE v50 construction. All rows emit the same 6,176,694,310 positions and output hash. See the <a href="/caps-sa/reference/performance/">performance page</a> for the workload definition and separate upstream comparison.</p>
   <table class="capssa-compare">
     <thead>
       <tr>
-        <th>Input</th>
-        <th style="text-align:right">Threads</th>
-        <th style="text-align:right">caps-sa</th>
-        <th style="text-align:right">upstream</th>
+        <th>Implementation</th>
+        <th style="text-align:right">Wall</th>
+        <th style="text-align:right">User CPU</th>
+        <th style="text-align:right">Peak RSS</th>
       </tr>
     </thead>
     <tbody>
-      <tr><td class="metric">Yeast · 12 MB</td><td class="num">4</td><td class="num">0.99 s</td><td class="num">3.94 s</td></tr>
-      <tr><td class="metric">Random DNA · 100 MB</td><td class="num">4</td><td class="num">11.39 s</td><td class="num">12.17 s</td></tr>
-      <tr><td class="metric">Human GRCh38 · 3.1 GB</td><td class="num">32</td><td class="num">10.47 min</td><td class="num">10.93 min</td></tr>
-      <tr><td class="metric">GRCh38 peak RAM</td><td class="num">32</td><td class="num">5.03 GB</td><td class="num">6.46 GB</td></tr>
+      <tr><td class="metric">Pre-pass 0.7 baseline</td><td class="num">267.592 s</td><td class="num">7,622.88 s</td><td class="num">10,512,408 KiB</td></tr>
+      <tr><td class="metric">caps-sa 0.7.0</td><td class="num">172.953 s</td><td class="num">4,731.05 s</td><td class="num">9,169,892 KiB</td></tr>
     </tbody>
   </table>
 </section>

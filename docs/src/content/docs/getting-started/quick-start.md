@@ -36,6 +36,26 @@ build_ext_mem(&text, &opts, |sa_pos| {
 })?;
 ```
 
+### Optional: reuse repeated long contexts
+
+For inputs with many long repeated contexts, opt into geometric LCP
+memoization for the final partition merges:
+
+```rust
+use caps_sa::{ExtMemOpts, LcpMemoizationPolicy};
+
+let opts = ExtMemOpts::default()
+    .lcp_memoization(LcpMemoizationPolicy::geometric());
+```
+
+It is intentionally disabled by default. Ordinary short comparisons run
+directly; each partition activates its bounded local table only after learning
+enough exact long-LCP intervals. The complete ruSTAR-shaped GRCh38 + GENCODE
+v50 workload improved by 8.4% in the isolated A/B, while smaller or less
+repetitive inputs can be neutral or slightly slower. See
+[Geometric LCP memoization](/caps-sa/concepts/geometric-memoization/) before
+enabling it broadly.
+
 ## Library: sort only a subset
 
 When many positions should be excluded from the sort (e.g. `N`s or inter-sequence spacers in a genome), hand only the positions you want sorted to a `*_for_positions` entry point. The others never enter the sort:

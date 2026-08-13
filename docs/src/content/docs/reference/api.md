@@ -87,6 +87,45 @@ and use its builder methods rather than an external struct literal.
 
 The `CAPS_SA_N_PHYS` environment variable overrides `physical_file_count` for one-off runs.
 
+#### Geometric LCP memoization
+
+Memoization is opt-in and applies only to phase-4 partition merges:
+
+```rust
+use caps_sa::{ExtMemOpts, LcpMemoizationPolicy};
+
+let opts = ExtMemOpts::default()
+    .lcp_memoization(LcpMemoizationPolicy::geometric());
+```
+
+For explicit tuning, pass a `GeometricMemoizationConfig` directly. The
+configuration is opaque and non-exhaustive; use its getters and `with_*`
+methods rather than relying on its layout:
+
+```rust
+use caps_sa::{ExtMemOpts, GeometricMemoizationConfig};
+use std::num::NonZeroUsize;
+
+let memo = GeometricMemoizationConfig::default()
+    .with_probe_symbols(NonZeroUsize::new(512).unwrap())
+    .with_min_lcp_symbols(NonZeroUsize::new(2048).unwrap());
+let opts = ExtMemOpts::default().lcp_memoization(memo);
+```
+
+| Geometric setting | Default | Meaning |
+| --- | ---: | --- |
+| `probe_symbols` | 256 | Symbols compared normally before an active-table lookup. |
+| `min_lcp_symbols` | 1,024 | Minimum exact LCP admitted to the table. |
+| `activate_after_entries` | 64 | Learned entries required before lookup begins. |
+| `max_entries_per_partition` | 4,096 | Hard bound for one partition-local table. |
+
+`ExtMemOpts::from_env()` additionally recognizes
+`CAPS_SA_GEOMETRIC_MEMO`, `CAPS_SA_MEMO_PROBE`,
+`CAPS_SA_MEMO_MIN_LCP`, `CAPS_SA_MEMO_ACTIVATE_ENTRIES`, and
+`CAPS_SA_MEMO_CAPACITY`. `ExtMemOpts::default()` never reads them. See
+[Geometric LCP memoization](/caps-sa/concepts/geometric-memoization/) for the
+selection guidance and measured tradeoffs.
+
 ## Traits
 
 ### `Symbol`

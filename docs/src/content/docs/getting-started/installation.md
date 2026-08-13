@@ -17,7 +17,7 @@ Or pin it in `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-caps-sa = "0.6"
+caps-sa = "0.7"
 ```
 
 The crate has a small dependency surface — `rayon` and `tempfile` — and no C/C++ build step.

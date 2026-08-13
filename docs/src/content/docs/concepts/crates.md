@@ -12,10 +12,10 @@ The primary deliverable, published on [crates.io](https://crates.io/crates/caps-
 ```toml
 # Cargo.toml
 [dependencies]
-caps-sa = "0.6"
+caps-sa = "0.7"
 ```
 
-It exposes a family of `build_*` entry points returning either an in-memory `Vec<I>` or streaming positions through a caller closure. This is the form other tools embed — for example, it backs the genome-index suffix-array construction in [`rustar-aligner`](https://github.com/scverse/rustar-aligner), which uses the streaming `build_ext_mem_for_positions` path to pack the SA straight to disk without ever holding it in RAM.
+It exposes a family of `build_*` entry points returning either an in-memory `Vec<I>` or streaming positions through a caller closure. This is the form other tools embed — for example, it backs the genome-index suffix-array construction in [`rustar-aligner`](https://github.com/scverse/rustar-aligner), which uses the filtered, segmented external-memory path to pack the SA straight to disk without ever holding it in RAM.
 
 See the [Library API](/caps-sa/reference/api/) for the full surface.
 

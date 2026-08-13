@@ -46,6 +46,11 @@ All paths produce the same lexicographic SA with the same "shorter suffix sorts 
 
 ## Status
 
-Both the in-memory and external-memory paths are implemented, unit-tested, and differentially verified against a brute-force reference on small and random inputs. On GRCh38 (32 threads, AMD EPYC 9575F) caps-sa is ~7% faster than upstream CaPS-SA's external-memory path while using ~23% less RAM.
+Both the in-memory and external-memory paths are implemented, tested across
+Linux, macOS, and Windows, and differentially verified on small, random,
+segmented, filtered, and finite-context inputs. On the complete ruSTAR-shaped
+GRCh38 + GENCODE v50 construction (32 physical cores, AMD EPYC 9555), caps-sa
+0.7.0 emits 6.18 billion suffix positions in 172.953 seconds with 8.75 GiB peak
+RSS.
 
 Next: [Installation](/caps-sa/getting-started/installation/) · [Quick start](/caps-sa/getting-started/quick-start/) · [The algorithm](/caps-sa/concepts/algorithm/)

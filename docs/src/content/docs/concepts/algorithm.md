@@ -3,7 +3,7 @@ title: The algorithm
 description: How CaPS-SA builds a suffix array — LCP-enhanced merge, sample sort, and the external-memory pipeline.
 ---
 
-caps-sa is a Rust port of **CaPS-SA** (Khan et al., WABI 2023). This page sketches the three ideas that make it fast: an LCP-enhanced merge, a sample-sort wrapper, and an external-memory pipeline that streams the result.
+caps-sa is a Rust port of **CaPS-SA** (Khan et al., WABI 2023). This page sketches the LCP-enhanced merge, sample-sort wrapper, streaming external-memory pipeline, and optional reuse of exact long-LCP intervals.
 
 ## 1. LCP-enhanced merge
 
@@ -32,6 +32,27 @@ The bucket pool collapses the `p` logical partition buckets onto a small set of 
 :::note[Positioned I/O]
 The pooled bucket path uses positioned reads/writes (`pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows) so many workers can share one file handle without a shared cursor. It is portable across Unix and Windows as of v0.6.1.
 :::
+
+## Geometric LCP memoization
+
+The external-memory phase-4 merge can optionally remember exact long-LCP
+intervals. A comparison between positions `a < b` lies on diagonal `b - a`.
+Once a comparison proves that an interval on that diagonal matches and then
+ends at a real mismatch, a later comparison starting inside the interval can
+jump directly to its known endpoint.
+
+The implementation keeps this optimization out of ordinary short comparisons:
+
+1. compare 256 symbols normally before consulting a table;
+2. admit only exact LCPs of at least 1,024 symbols;
+3. activate lookup only after a partition has learned 64 entries; and
+4. cap each partition-local table at 4,096 entries.
+
+Tables belong to individual partition cascades, so there is no cross-thread
+write contention and their lifetime is naturally bounded. The policy is off by
+default because its value depends on the input's repeated-context structure.
+See [Geometric LCP memoization](/caps-sa/concepts/geometric-memoization/) for
+the API, evidence, and selection guidance.
 
 ## The SIMD LCP kernel
 

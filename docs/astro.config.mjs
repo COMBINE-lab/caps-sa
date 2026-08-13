@@ -50,6 +50,7 @@ export default defineConfig({
           label: 'Concepts',
           items: [
             { label: 'The algorithm', slug: 'concepts/algorithm' },
+            { label: 'Geometric LCP memoization', slug: 'concepts/geometric-memoization' },
             { label: 'The library & the CLI', slug: 'concepts/crates' },
           ],
         },
