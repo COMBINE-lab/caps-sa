@@ -26,6 +26,48 @@ use crate::limits::{BoundaryRank, LimitProvider};
 use crate::sample_sort;
 use rayon::prelude::*;
 
+/// Whether the external-memory phase-1 sort may start from fixed-depth packed
+/// prefix keys.
+///
+/// The seed is deliberately opt-in. It adds one `(u64, I)` key record per
+/// selected suffix in every active phase-1 task, and it is useful only when
+/// the text is byte-valued, comparisons are unbounded, and the
+/// [`LimitProvider`] declares a representable [`BoundaryRank`]. Ineligible
+/// builds fall back to the ordinary LCP merge-sort without changing output.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PackedPrefixSeedPolicy {
+    /// Use the ordinary comparison-based phase-1 sort.
+    #[default]
+    Disabled,
+    /// Use packed keys only when the byte values occurring in the text are
+    /// already the dense range `0..alphabet_size`.
+    ///
+    /// This mode never allocates a second text-sized buffer. It is the
+    /// recommended mode for pre-encoded genomic text such as ruSTAR's
+    /// `A=0, C=1, G=2, T=3, N=4, spacer=5` representation.
+    DenseAlphabetOnly,
+    /// Permit an order-preserving dense copy for a gapped byte alphabet, but
+    /// only when its exact text-length allocation fits `max_extra_bytes`.
+    ///
+    /// Dense inputs still avoid the copy. If the budget is too small or the
+    /// allocation cannot be reserved, construction falls back to the ordinary
+    /// phase-1 sort.
+    Remap { max_extra_bytes: usize },
+}
+
+impl PackedPrefixSeedPolicy {
+    /// Opt into the allocation-free dense-alphabet path.
+    pub const fn dense_alphabet_only() -> Self {
+        Self::DenseAlphabetOnly
+    }
+
+    /// Permit a dense ranked-text copy up to the given allocation budget.
+    pub const fn remap(max_extra_bytes: usize) -> Self {
+        Self::Remap { max_extra_bytes }
+    }
+}
+
 /// An order-preserving remap of the bytes that actually occur in a text onto
 /// a dense code range, plus the resulting key geometry.
 ///
@@ -58,7 +100,7 @@ impl Packer {
     /// Build the map for `text`. The field is sized to hold `alphabet`, not
     /// `alphabet - 1`, because every key this module builds reserves one code
     /// for the boundary sentinel.
-    fn new(text: &[u8]) -> Self {
+    fn new(text: &[u8], policy: PackedPrefixSeedPolicy) -> Option<Self> {
         // Which bytes occur? One parallel pass, folded into a 256-entry set.
         let present = text
             .par_chunks(1 << 16)
@@ -98,7 +140,15 @@ impl Packer {
         let ranked = if identity {
             None
         } else {
-            let mut out = vec![0u8; text.len()];
+            let PackedPrefixSeedPolicy::Remap { max_extra_bytes } = policy else {
+                return None;
+            };
+            if text.len() > max_extra_bytes {
+                return None;
+            }
+            let mut out = Vec::new();
+            out.try_reserve_exact(text.len()).ok()?;
+            out.resize(text.len(), 0u8);
             out.par_chunks_mut(1 << 16)
                 .zip(text.par_chunks(1 << 16))
                 .for_each(|(dst, src)| {
@@ -108,12 +158,12 @@ impl Packer {
                 });
             Some(out)
         };
-        Self {
+        Some(Self {
             ranked,
             bits,
             k: 64 / bits as usize,
             alphabet: next as u32,
-        }
+        })
     }
 
     /// Whether a boundary sentinel fits alongside the alphabet in one field.
@@ -164,7 +214,10 @@ impl Packer {
 ///
 /// Computed once per build and handed to [`seed_subarray`], which would
 /// otherwise re-scan the whole text for every subarray.
-pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
+pub(crate) fn seed_params<S: Symbol>(text: &[S], policy: PackedPrefixSeedPolicy) -> Option<Packer> {
+    if policy == PackedPrefixSeedPolicy::Disabled {
+        return None;
+    }
     // Exactly `u8`, not merely one byte wide. `Symbol` is implemented for
     // `i8` too, and a packed key orders its fields as unsigned: `-1` has byte
     // `0xFF` and would sort above `1`, inverting the text's real order.
@@ -176,49 +229,35 @@ pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
     // for reads of the same length.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-    let packer = Packer::new(bytes);
+    let packer = Packer::new(bytes, policy)?;
     packer.has_sentinel().then_some(packer)
 }
 
 /// Sort `sa` into suffix order and fill `lcp`, using a packed fixed-depth key
 /// so that most of the ordering costs no text access at all.
 ///
-/// Returns `false` without touching anything when the key cannot represent
-/// this comparator, so the caller falls back to a plain `merge_sort`.
-///
 /// `sa_w` and `lcp_w` are the caller's existing merge scratch buffers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
     text: &[S],
     lp: &L,
-    packer: Option<&Packer>,
+    packer: &Packer,
+    rank: BoundaryRank,
     sa: &mut [I],
     lcp: &mut [I],
     sa_w: &mut [I],
     lcp_w: &mut [I],
-    max_ctx: usize,
     dispatch: LcpDispatch,
     task_local: bool,
-) -> bool {
-    let Some(packer) = packer else {
-        return false;
-    };
-    // A finite `max_context` truncates comparisons at a depth the key knows
-    // nothing about, so the key's verdict and the merge's could disagree.
-    if max_ctx != usize::MAX {
-        return false;
-    }
-    let Some(rank) = lp.boundary_rank() else {
-        return false;
-    };
+) {
     let len = sa.len();
     if len < 2 {
         if len == 1 {
             lcp[0] = I::zero();
         }
-        return true;
+        return;
     }
-    // SAFETY: `packer` is `Some` only when `S` is exactly `u8`.
+    // SAFETY: a `Packer` is prepared only when `S` is exactly `u8`.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
 
@@ -259,7 +298,7 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
                 &mut sa_w[i..j],
                 &mut lcp[i..j],
                 &mut lcp_w[i..j],
-                max_ctx,
+                usize::MAX,
                 dispatch,
             );
         } else {
@@ -279,7 +318,6 @@ pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
         i = j;
     }
     lcp[0] = I::zero();
-    true
 }
 
 #[cfg(test)]
@@ -319,35 +357,49 @@ mod tests {
         *state >> 33
     }
 
+    fn naive_lcp(text: &[u8], p: usize, q: usize, cap: usize) -> usize {
+        (0..cap)
+            .position(|i| text[p + i] != text[q + i])
+            .unwrap_or(cap)
+    }
+
     /// Sort `positions` with the seed, then check the result is a permutation
-    /// in non-decreasing suffix order under the provider's own comparator.
+    /// in non-decreasing suffix order with an exact adjacent-LCP array under
+    /// the provider's own comparator.
     ///
     /// The assertion is the *property*, not equality with a canonical answer:
     /// `SegmentedText`'s default `boundary_order` returns `Equal` for suffixes
     /// that end together with equal content, so their relative order is
     /// genuinely free and a stable-sort oracle is not a valid reference.
-    fn check_sorted<L: LimitProvider>(text: &[u8], lp: &L, positions: Vec<u32>) {
-        let packer = seed_params(text);
+    fn check_sorted_with_policy<L: LimitProvider>(
+        text: &[u8],
+        lp: &L,
+        positions: Vec<u32>,
+        policy: PackedPrefixSeedPolicy,
+    ) {
+        let packer = seed_params(text, policy);
         assert!(packer.is_some(), "packer should be available for this text");
+        let rank = lp
+            .boundary_rank()
+            .expect("test provider should declare a boundary rank");
         let len = positions.len();
         let mut sa = positions.clone();
         let mut lcp = vec![0u32; len];
         let mut sa_w = vec![0u32; len];
         let mut lcp_w = vec![0u32; len];
         let dispatch = LcpDispatch::detect();
-        let took = seed_subarray(
+        seed_subarray(
             text,
             lp,
-            packer.as_ref(),
+            packer.as_ref().unwrap(),
+            rank,
             &mut sa,
             &mut lcp,
             &mut sa_w,
             &mut lcp_w,
-            usize::MAX,
             dispatch,
             true,
         );
-        assert!(took, "the seed should have taken this input");
 
         let mut seen = sa.clone();
         seen.sort_unstable();
@@ -355,13 +407,26 @@ mod tests {
         want.sort_unstable();
         assert_eq!(seen, want, "seed must permute its input");
 
-        for w in sa.windows(2) {
+        assert_eq!(lcp[0], 0);
+        for (i, w) in sa.windows(2).enumerate() {
             let (a, b) = (w[0] as usize, w[1] as usize);
             assert!(
                 dispatch.suffix_cmp_with(text, lp, a, b, usize::MAX).is_le(),
                 "adjacent pair out of order: {a} then {b}",
             );
+            let cap = lp.lim_at(a).min(lp.lim_at(b));
+            let want_lcp = naive_lcp(text, a, b, cap) as u32;
+            assert_eq!(lcp[i + 1], want_lcp, "wrong adjacent LCP for {a} then {b}",);
         }
+    }
+
+    fn check_sorted<L: LimitProvider>(text: &[u8], lp: &L, positions: Vec<u32>) {
+        check_sorted_with_policy(
+            text,
+            lp,
+            positions,
+            PackedPrefixSeedPolicy::DenseAlphabetOnly,
+        );
     }
 
     #[test]
@@ -416,31 +481,62 @@ mod tests {
     }
 
     #[test]
-    fn seed_declines_a_provider_without_a_rank() {
-        struct NoRank(usize);
-        impl LimitProvider for NoRank {
-            fn lim_at(&self, p: usize) -> usize {
-                self.0 - p
-            }
-        }
-        let text: Vec<u8> = vec![0, 1, 2, 3, 0, 1, 2, 3];
-        let packer = seed_params(&text);
-        let mut sa: Vec<u32> = (0..8).collect();
-        let mut lcp = vec![0u32; 8];
-        let mut sa_w = vec![0u32; 8];
-        let mut lcp_w = vec![0u32; 8];
-        assert!(!seed_subarray(
+    fn seed_policy_bounds_ranked_text_allocation() {
+        let text = vec![0u8, 2, 0, 2, 0, 2, 0, 2];
+        assert!(
+            seed_params(&text, PackedPrefixSeedPolicy::Disabled).is_none(),
+            "disabled policy must not prepare a seed",
+        );
+        assert!(
+            seed_params(&text, PackedPrefixSeedPolicy::DenseAlphabetOnly).is_none(),
+            "dense-only policy must decline a gapped alphabet",
+        );
+        assert!(
+            seed_params(
+                &text,
+                PackedPrefixSeedPolicy::remap(text.len().saturating_sub(1)),
+            )
+            .is_none(),
+            "a remap over budget must decline",
+        );
+        assert!(
+            seed_params(&text, PackedPrefixSeedPolicy::remap(text.len())).is_some(),
+            "an exactly budgeted remap should be available",
+        );
+
+        check_sorted_with_policy(
             &text,
-            &NoRank(text.len()),
-            packer.as_ref(),
-            &mut sa,
-            &mut lcp,
-            &mut sa_w,
-            &mut lcp_w,
-            usize::MAX,
-            LcpDispatch::detect(),
-            true,
-        ));
+            &PlainText::new(text.len()),
+            (0..text.len() as u32).collect(),
+            PackedPrefixSeedPolicy::remap(text.len()),
+        );
+    }
+
+    #[test]
+    fn seed_lcps_are_exact_below_at_and_above_key_depth() {
+        // Three isolated pairs share k-1, k, and k+1 symbols. With alphabet
+        // 0..=2 plus one reserved boundary code, fields are two bits and k=32.
+        let k = 32usize;
+        let segments = [
+            [vec![0; k - 1], vec![1]].concat(),
+            [vec![0; k - 1], vec![2]].concat(),
+            [vec![1; k], vec![0]].concat(),
+            [vec![1; k], vec![2]].concat(),
+            [vec![2; k + 1], vec![0]].concat(),
+            [vec![2; k + 1], vec![1]].concat(),
+        ];
+        let lengths: Vec<usize> = segments.iter().map(Vec::len).collect();
+        let mut starts = Vec::with_capacity(segments.len());
+        let mut text = Vec::new();
+        for segment in &segments {
+            starts.push(text.len() as u32);
+            text.extend_from_slice(segment);
+        }
+        let lp = SegmentedText::from_lengths(text.len(), &lengths);
+        let packer = seed_params(&text, PackedPrefixSeedPolicy::DenseAlphabetOnly).unwrap();
+        assert_eq!(packer.k, k);
+
+        check_sorted(&text, &lp, starts);
     }
 
     /// Segment ends for a spacer-separated text: one past each maximal

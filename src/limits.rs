@@ -77,9 +77,10 @@ pub trait LimitProvider: Sync {
     /// Which side of a real symbol this provider's boundary convention puts
     /// the end of a suffix on, when that convention is expressible.
     ///
-    /// Answering `Some` lets phase 1 sort its subarrays by a packed
-    /// fixed-depth key instead of comparing suffixes through the text. Such a
-    /// key packs `min(k, lim_at(p))` symbols and pads the rest with a reserved
+    /// Answering `Some` makes the provider eligible for the optional
+    /// [`PackedPrefixSeedPolicy`][crate::PackedPrefixSeedPolicy]. Activation
+    /// remains a separate [`ExtMemOpts`][crate::ExtMemOpts] choice. The key
+    /// packs `min(k, lim_at(p))` symbols and pads the rest with a reserved
     /// sentinel placed according to this answer, so key order agrees with
     /// [`boundary_order`][Self::boundary_order] whenever the key decides at
     /// all. Keys that tie still defer to `boundary_order` itself, which is
@@ -93,10 +94,10 @@ pub trait LimitProvider: Sync {
     /// ended, under [`BoundaryRank::ShorterFirst`], and `Greater` iff `a` is
     /// the one that ended, under [`BoundaryRank::LongerFirst`].
     ///
-    /// The default is `None`, which keeps every existing implementation on the
-    /// comparison path. Answer it only if your `boundary_order` decides purely
-    /// by which suffix ended first, with at most a tie-break between suffixes
-    /// that end at the same offset.
+    /// The default is `None`, which declines the seed even when a caller opts
+    /// in. Answer it only if your `boundary_order` decides purely by which
+    /// suffix ended first, with at most a tie-break between suffixes that end
+    /// at the same offset.
     #[inline]
     fn boundary_rank(&self) -> Option<BoundaryRank> {
         None

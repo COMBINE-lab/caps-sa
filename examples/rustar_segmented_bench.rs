@@ -36,8 +36,8 @@ use std::process;
 use std::time::Instant;
 
 use caps_sa::{
-    ExtMemOpts, LimitProvider, Opts, SegmentedText, build_ext_mem_for_filter_with,
-    build_in_memory_for_positions_with,
+    ExtMemOpts, LimitProvider, Opts, PackedPrefixSeedPolicy, SegmentedText,
+    build_ext_mem_for_filter_with, build_in_memory_for_positions_with,
 };
 
 /// rustar-aligner's `StarSegmentedText`: `SegmentedText` limits with
@@ -58,11 +58,9 @@ impl LimitProvider for StarSegmentedText {
         lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))
     }
 
-    /// The one line rustar-aligner adds to opt into packed-key seeding: its
-    /// convention decides purely by which suffix ended first, so the key can
-    /// represent it. Set `CAPS_SA_BENCH_NO_RANK=1` to measure the same build
-    /// with the provider declining, which is what a provider that has not
-    /// opted in gets.
+    /// Declare that this comparator's boundary convention is representable by
+    /// packed keys. Activation remains a separate `ExtMemOpts` policy below.
+    /// Set `CAPS_SA_BENCH_NO_RANK=1` to measure semantic ineligibility.
     #[inline]
     fn boundary_rank(&self) -> Option<caps_sa::BoundaryRank> {
         if std::env::var_os("CAPS_SA_BENCH_NO_RANK").is_some() {
@@ -200,7 +198,8 @@ fn main() {
                 emit(p).expect("checksum sink never fails");
             }
         } else {
-            let mut opts = ExtMemOpts::from_env();
+            let mut opts = ExtMemOpts::from_env()
+                .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
             if let Some(dir) = &args.work_dir {
                 opts = opts.work_dir(dir);
             }

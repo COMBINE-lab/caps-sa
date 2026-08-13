@@ -36,15 +36,35 @@ build_ext_mem(&text, &opts, |sa_pos| {
 })?;
 ```
 
+### Optional: seed phase 1 from packed prefixes
+
+Dense byte alphabets can opt into segment-aware fixed-depth keys for the
+external-memory phase-1 sorts:
+
+```rust
+use caps_sa::{ExtMemOpts, PackedPrefixSeedPolicy};
+
+let opts = ExtMemOpts::default()
+    .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
+```
+
+The mode is disabled by default because it adds one key record per selected
+suffix in each active phase-1 task. It requires unbounded comparisons and a
+`LimitProvider` with a representable `boundary_rank()`; otherwise caps-sa
+falls back automatically. `DenseAlphabetOnly` never creates a text-sized copy.
+See the [library API](/caps-sa/reference/api/#packed-prefix-phase-1-seed) for
+gapped alphabets and custom boundary conventions.
+
 ### Optional: reuse repeated long contexts
 
 For inputs with many long repeated contexts, opt into geometric LCP
 memoization for the final partition merges:
 
 ```rust
-use caps_sa::{ExtMemOpts, LcpMemoizationPolicy};
+use caps_sa::{ExtMemOpts, LcpMemoizationPolicy, PackedPrefixSeedPolicy};
 
 let opts = ExtMemOpts::default()
+    .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly)
     .lcp_memoization(LcpMemoizationPolicy::geometric());
 ```
 
@@ -55,6 +75,11 @@ v50 workload improved by 8.4% in the isolated A/B, while smaller or less
 repetitive inputs can be neutral or slightly slower. See
 [Geometric LCP memoization](/caps-sa/concepts/geometric-memoization/) before
 enabling it broadly.
+
+The policies compose: packed prefixes reduce phase 1, while geometric
+memoization reduces phase 4. On complete ruSTAR-shaped GRCh38 + GENCODE v50,
+the memoized build improved from 171.205 to 134.618 seconds when the packed
+seed was also enabled, with identical output.
 
 ## Library: sort only a subset
 

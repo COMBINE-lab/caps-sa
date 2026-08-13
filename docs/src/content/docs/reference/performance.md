@@ -1,6 +1,6 @@
 ---
 title: Performance
-description: Production-shaped caps-sa 0.7 measurements and the standard upstream comparison.
+description: Production-shaped caps-sa measurements and the standard upstream comparison.
 ---
 
 Unless stated otherwise, numbers are suffix-array construction time and output
@@ -34,6 +34,34 @@ directory for large `SegmentedText` boundary sets.
 On the focused chromosome-21 backbone plus every GENCODE-derived junction
 flank, stable measurements improved from 11.97–12.00 seconds to 7.77–7.80
 seconds. All 359,616,038 emitted positions matched the reference.
+
+## Optional packed-prefix phase-1 seed
+
+The opt-in packed-prefix seed was measured against the current 0.7.0 main on
+the same complete fixture, with one warm-up followed by three interleaved
+measured runs. Values below are medians:
+
+| Configuration | Build | User CPU | Peak RSS | Phase 1 | Phase 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Direct LCP | 198.924 s | 5,153.25 s | 9,142,300 KiB | 49.038 s | 144.923 s |
+| Geometric memo only | 171.205 s | 4,684.95 s | 9,161,688 KiB | 49.034 s | 117.021 s |
+| Packed seed only | 162.650 s | 3,987.38 s | 9,527,240 KiB | 12.204 s | 145.187 s |
+| Packed seed + geometric memo | **134.618 s** | **3,507.54 s** | 9,536,692 KiB | **12.179 s** | **117.265 s** |
+
+The seed reduces phase 1 by 75.1% and improves the memoized ruSTAR
+configuration by 21.4%. Memoization changes phase 4 by 19.25% without the seed
+and 19.23% with it, confirming that the policies compose rather than competing
+for the same work. Every run emitted 6,176,694,310 positions with ordered hash
+`e81c8f9881e322148741a23c92ae2000`.
+
+Peak RSS increased by 366–376 MiB (about 4.1%), matching the bounded
+`(u64, u64)` key records held by the 32 active phase-1 tasks. The dense ruSTAR
+alphabet required no ranked-text copy.
+
+On chr21 without annotations, the direct build improved from a 1.291-second
+median to 0.934 seconds (27.7%). On the chr21 backbone plus every annotation-
+derived flank it improved from 7.709 to 6.025 seconds (21.8%), and the latter
+matched all 359,616,038 reference positions exactly.
 
 ## Geometric memoization
 

@@ -18,7 +18,7 @@ When a fallback scan *is* needed, it runs through the **SIMD LCP fast path** (se
 For inputs too large for a single merge-sort pass, caps-sa wraps the kernel in a **sample sort**. The in-memory path uses the conventional four stages; the external path fuses the first three to avoid a complete intermediate spill. With `p` subproblems:
 
 1. **Presample pivots.** Sort a small deterministic position sample and pick `p − 1` evenly-spaced pivots. These define `p` partition ranges that together cover the whole SA.
-2. **Sort + distribute.** Split positions into `p` subarrays. Sort each in an outer Rayon task, binary-search its pivot splits, and write each sorted slice directly to its final partition bucket.
+2. **Sort + distribute.** Split positions into `p` subarrays. Sort each in an outer Rayon task, binary-search its pivot splits, and write each sorted slice directly to its final partition bucket. Eligible byte texts may opt into a segment-bounded packed-prefix seed: keys decide short prefixes, while equal-key groups retain the complete LCP merge-sort.
 3. **Per-partition merge.** Load each partition's bucket, cascade 2-way LCP-enhanced merges over its sub-slices, and emit the resulting sorted positions through the caller's closure.
 
 Because the partitions are globally ordered, emitting them in turn yields the full SA in lexicographic order, and **peak RAM stays bounded at `~O(text + n/p)` per worker** regardless of input size.
@@ -27,7 +27,7 @@ Because the partitions are globally ordered, emitting them in turn yields the fu
 
 The external-memory path (`build_ext_mem`) is the default for production-scale genomes. Final partition buckets are **disk-spilling**. Positions are read back partition-by-partition only when that partition is merged, then streamed straight out—the suffix array is **never fully materialised in memory**.
 
-The bucket pool collapses the `p` logical partition buckets onto a small set of physical temp files (one per worker by default) to keep kernel-level write contention bounded. Tuning knobs—subproblem count, working directory, physical file count, and LCP memoization policy—are on [`ExtMemOpts`](/caps-sa/reference/api/#extmemopts).
+The bucket pool collapses the `p` logical partition buckets onto a small set of physical temp files (one per worker by default) to keep kernel-level write contention bounded. Tuning knobs—subproblem count, working directory, physical file count, packed-prefix seed, and LCP memoization policy—are on [`ExtMemOpts`](/caps-sa/reference/api/#extmemopts).
 
 :::note[Positioned I/O]
 The pooled bucket path uses positioned reads/writes (`pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows) so many workers can share one file handle without a shared cursor. It is portable across Unix and Windows as of v0.6.1.
