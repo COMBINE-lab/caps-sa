@@ -59,10 +59,6 @@
 
 use crate::Index;
 use crate::ext_mem::profile_log;
-use crate::lcp::Symbol;
-use crate::limits::LimitProvider;
-use crate::runs::Cmp;
-use crate::sample_sort;
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -156,6 +152,8 @@ impl Packer {
         }
     }
 
+    /// Bits per packed field. Used by the key-geometry tests.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn bits(&self) -> u32 {
         self.bits
@@ -237,135 +235,6 @@ impl Packer {
         }
         key
     }
-}
-
-/// The alphabet map for `text`, or `None` when a packed key cannot represent
-/// this text's order.
-///
-/// Computed once per build and handed to [`seed_subarray`], which would
-/// otherwise re-scan the whole text for every subarray.
-pub(crate) fn seed_params<S: Symbol>(text: &[S]) -> Option<Packer> {
-    if size_of::<S>() != 1 {
-        return None;
-    }
-    // SAFETY: `S` is one byte wide, so a byte view over the same memory is
-    // valid for reads of the same length.
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-    Some(Packer::new(bytes))
-}
-
-/// Sort `sa` into suffix order and fill `lcp`, using a packed fixed-depth key
-/// so that most of the ordering costs no text access at all.
-///
-/// This is the external-memory and sample-sort counterpart to [`build_sa`].
-/// Those paths cannot use prefix doubling, which needs a rank for every
-/// position in the text and would break the memory bound they exist to
-/// provide. But they can still avoid the part of the merge kernel that hurts
-/// most: sorting a subarray from singletons, where every leaf merge starts at
-/// `m = 0` and compares two suffixes by scanning the text.
-///
-/// Sorting by the packed key resolves the first `k` symbols with no text
-/// access (32 symbols for DNA), and hands back the LCP for adjacent entries
-/// for free from `(key_a ^ key_b).leading_zeros()`. Only suffixes that agree
-/// through all `k` symbols reach the merge kernel, on the small slice they
-/// occupy.
-///
-/// Returns `false` without touching anything when the comparator is not plain
-/// lexicographic, so the caller falls back to a plain `merge_sort`.
-///
-/// `sa_w` and `lcp_w` are the caller's existing merge scratch buffers.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn seed_subarray<S: Symbol, I: Index, L: LimitProvider>(
-    text: &[S],
-    lp: &L,
-    packer: Option<&Packer>,
-    sa: &mut [I],
-    lcp: &mut [I],
-    sa_w: &mut [I],
-    lcp_w: &mut [I],
-    max_ctx: usize,
-    cmp: Cmp<'_>,
-) -> bool {
-    let Some(packer) = packer else {
-        return false;
-    };
-    let (bits, k) = (packer.bits(), packer.k());
-    if max_ctx != usize::MAX || lp.plain_lex_len() != Some(text.len()) {
-        return false;
-    }
-    let len = sa.len();
-    if len < 2 {
-        if len == 1 {
-            lcp[0] = I::zero();
-        }
-        return true;
-    }
-    // SAFETY: `params` is `Some` only when `S` is one byte wide.
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
-
-    // Order by (key, visible length), the same comparator `build_sa` seeds
-    // with and for the same reason: zero padding makes a short suffix share a
-    // key with any suffix continuing in zeros, and `0` is a real symbol.
-    let n = bytes.len();
-    let visible = |p: usize| -> usize { (n - p).min(k) };
-    let mut keyed: Vec<(u64, u32, I)> = sa
-        .iter()
-        .map(|&p| {
-            let p = p.to_usize();
-            (packer.key_at(bytes, p), visible(p) as u32, p_as(p))
-        })
-        .collect();
-    keyed.sort_unstable();
-    for (slot, e) in sa.iter_mut().zip(keyed.iter()) {
-        *slot = I::from_usize(e.2.to_usize());
-    }
-
-    // Walk equal-key runs. Between runs the LCP falls straight out of the key
-    // difference; inside one it needs the merge kernel.
-    let mut i = 0usize;
-    while i < len {
-        let mut j = i + 1;
-        while j < len && (keyed[j].0, keyed[j].1) == (keyed[i].0, keyed[i].1) {
-            j += 1;
-        }
-        if j - i > 1 {
-            sample_sort::merge_sort(
-                text,
-                lp,
-                &mut sa[i..j],
-                &mut sa_w[i..j],
-                &mut lcp[i..j],
-                &mut lcp_w[i..j],
-                max_ctx,
-                cmp,
-            );
-        } else {
-            lcp[i] = I::zero();
-        }
-        // Boundary entry: LCP against the last element of the previous run.
-        if i > 0 {
-            let a = sa[i - 1].to_usize();
-            let b = sa[i].to_usize();
-            let xor = keyed[i - 1].0 ^ keyed[i].0;
-            debug_assert_ne!(xor, 0, "distinct runs must differ in the key");
-            // `leading_zeros / bits` counts whole matching fields. Cap by both
-            // suffixes' lengths: padding can agree with a real `0` symbol past
-            // the end of the shorter one.
-            let shared = (xor.leading_zeros() / bits) as usize;
-            lcp[i] = I::from_usize(shared.min(lp.lim_at(a)).min(lp.lim_at(b)));
-        }
-        i = j;
-    }
-    lcp[0] = I::zero();
-    true
-}
-
-/// Round-trip a position through the index type used in the seed vector.
-#[inline]
-fn p_as<I: Index>(p: usize) -> I {
-    I::from_usize(p)
 }
 
 /// Largest tied group whose key vector is built on the stack. Groups average
