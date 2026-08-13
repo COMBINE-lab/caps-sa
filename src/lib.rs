@@ -22,6 +22,7 @@ mod ext_mem;
 mod lcp;
 mod lcp_memo;
 mod limits;
+mod radix;
 mod sample_sort;
 
 pub use ext_mem::{
@@ -41,6 +42,74 @@ pub use sample_sort::{
     Opts, build_in_memory, build_in_memory_for_positions, build_in_memory_for_positions_with,
     build_in_memory_for_positions_with_opts, build_in_memory_with, build_in_memory_with_opts,
 };
+
+/// Check that `sa` really is the suffix array of `text`, in `O(n)` time and
+/// without re-running any construction algorithm.
+///
+/// Comparing a candidate against a second implementation only shows the two
+/// agree; comparing adjacent suffixes directly is `O(n · lcp)` and becomes
+/// unusable on the repetitive inputs that matter most. This instead uses the
+/// standard fixpoint characterisation: let `rank` be the inverse of `sa`, and
+/// define `f(p) = (text[p], rank[p + 1])`, with `rank[n]` taken as less than
+/// every real rank. A permutation is the suffix array of `text` if and only if
+/// `f` is strictly increasing along it, because suffix `p` precedes suffix `q`
+/// exactly when `f(p) < f(q)`.
+///
+/// Returns `Err` with a description of the first violation found.
+///
+/// ```
+/// let text = b"banana";
+/// let sa: Vec<u32> = caps_sa::build_in_memory(text);
+/// assert!(caps_sa::verify_sa(text, &sa).is_ok());
+/// assert!(caps_sa::verify_sa(text, &[0u32, 1, 2, 3, 4, 5]).is_err());
+/// ```
+pub fn verify_sa<S, I>(text: &[S], sa: &[I]) -> Result<(), String>
+where
+    S: Ord,
+    I: Index,
+{
+    let n = text.len();
+    if sa.len() != n {
+        return Err(format!("sa has {} entries, text has {n} symbols", sa.len()));
+    }
+    if n == 0 {
+        return Ok(());
+    }
+
+    // Invert `sa`, checking along the way that it is a permutation of `0..n`.
+    let mut rank = vec![usize::MAX; n];
+    for (i, entry) in sa.iter().enumerate() {
+        let p = entry.to_usize();
+        if p >= n {
+            return Err(format!("sa[{i}] = {p} is out of range for text length {n}"));
+        }
+        if rank[p] != usize::MAX {
+            return Err(format!(
+                "position {p} appears at sa[{}] and sa[{i}]",
+                rank[p]
+            ));
+        }
+        rank[p] = i;
+    }
+
+    // `None` stands for the end of the text, which sorts before every rank:
+    // the shorter suffix is the smaller one.
+    let successor =
+        |p: usize| -> Option<usize> { if p + 1 < n { Some(rank[p + 1]) } else { None } };
+    for i in 1..n {
+        let a = sa[i - 1].to_usize();
+        let b = sa[i].to_usize();
+        let key_a = (&text[a], successor(a));
+        let key_b = (&text[b], successor(b));
+        if key_a >= key_b {
+            return Err(format!(
+                "suffixes out of order at sa[{}] = {a} and sa[{i}] = {b}",
+                i - 1,
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Trait implemented by integer types usable as suffix array indices.
 ///

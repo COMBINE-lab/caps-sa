@@ -1,0 +1,601 @@
+//! Radix-seeded prefix doubling for the plain in-memory suffix array.
+//!
+//! The LCP-enhanced merge sort in [`crate::sample_sort`] is the CaPS-SA
+//! kernel and stays the general path: it is the only one that honours a
+//! [`LimitProvider`][crate::limits::LimitProvider], a finite `max_context`,
+//! and symbol types wider than a byte, and it is the only one that produces
+//! an LCP array (which the external-memory path needs).
+//!
+//! But for the single most common request — the standard lexicographic
+//! suffix array of a byte text, with no segmentation and no context bound —
+//! that kernel is doing far more work than the problem requires, in two
+//! distinct ways that the benchmarks separate cleanly:
+//!
+//! * **Step count.** The merge sort performs `n log n` merge steps, and a
+//!   large majority of them are resolved by an actual symbol comparison at a
+//!   random text address. On 80 MB of N-free DNA that is ~2.1e9 steps at
+//!   ~13 ns each.
+//! * **Scan length.** Every leaf merge starts with `m = 0`, so comparing two
+//!   suffixes that share a long prefix costs a scan proportional to that
+//!   prefix. Genome assemblies contain megabyte-scale runs of `N` (and the
+//!   period-61 `N`-then-newline pattern of wrapped FASTA), where a single
+//!   comparison scans millions of bytes. On a 47.5 MB chr21 FASTA this
+//!   pushes the cost per merge step from 13 ns to 222 ns — a 16x penalty
+//!   that is entirely scan time.
+//!
+//! This module attacks both. It sorts by a packed fixed-depth key first
+//! (killing the step count), then resolves the remainder by **prefix
+//! doubling** on ranks (killing the scan length: after the seed, no
+//! comparison ever reads the text again, so a megabyte-long run of `N` costs
+//! exactly as much as random DNA).
+//!
+//! ## The algorithm
+//!
+//! 1. **Pack.** Find the maximum symbol and choose the smallest field width
+//!    in `{1, 2, 4, 8}` bits that can hold it, so `k = 64 / bits` symbols fit
+//!    in one `u64` key. DNA over `{0,1,2,3}` gets 2-bit fields and therefore
+//!    resolves **32 symbols per key** rather than the 8 a raw byte key would.
+//! 2. **Seed.** Sort `(key, position)`. This is a full sort of the suffixes
+//!    by their first `k` symbols, and it touches the text only in one
+//!    sequential pass.
+//! 3. **Double.** Suffixes still tied after depth `d` are ordered by the pair
+//!    `(rank_d(p), rank_d(p + d))`, which resolves them to depth `2d`. Repeat
+//!    until every group is a singleton. Each round reads only the rank array.
+//!
+//! ## Ordering convention
+//!
+//! Keys are big-endian in the field sense (the first symbol occupies the most
+//! significant field) and short suffixes are zero-padded. Since `0` is the
+//! minimum of `u8`, a padding field can never exceed a real symbol's field,
+//! so a padded key compares less-or-equal to any key it shares a prefix with.
+//! That is exactly the crate's "shorter suffix is smaller" convention. A real
+//! `0` symbol is indistinguishable from padding *in the key*, which can only
+//! make two suffixes tie — never invert them — and ties are resolved by the
+//! doubling rounds, which use the true remaining length via the end-of-text
+//! sentinel. So `A = 0` DNA encodings and STAR's `0..5` codes are both safe.
+
+use crate::Index;
+use crate::ext_mem::profile_log;
+use rayon::prelude::*;
+use std::time::Instant;
+
+/// Field width in bits and the number of symbols that fit in a `u64` key.
+///
+/// Restricted to divisors of 64 so a key is an exact number of whole fields
+/// and no symbol ever straddles the key boundary.
+fn pack_params(max_sym: u8) -> (u32, usize) {
+    let bits: u32 = match max_sym {
+        0..=1 => 1,
+        2..=3 => 2,
+        4..=15 => 4,
+        _ => 8,
+    };
+    (bits, 64 / bits as usize)
+}
+
+/// Pack the `k` symbols at `text[p..]` into one order-preserving `u64`,
+/// zero-padding past the end of the text.
+#[inline]
+fn key_at(text: &[u8], p: usize, bits: u32, k: usize) -> u64 {
+    if bits == 8 {
+        // Whole-byte fields: this is just a big-endian load, and the common
+        // case (p + 8 <= n) is a single unaligned u64 read plus a bswap.
+        let mut buf = [0u8; 8];
+        let end = (p + 8).min(text.len());
+        buf[..end - p].copy_from_slice(&text[p..end]);
+        return u64::from_be_bytes(buf);
+    }
+    let end = (p + k).min(text.len());
+    let mut key: u64 = 0;
+    for &s in &text[p..end] {
+        key = (key << bits) | s as u64;
+    }
+    // Shift the packed prefix up so the missing trailing fields read as zero.
+    key << (bits as usize * (k - (end - p)))
+}
+
+/// Bits of the key used for the MSD counting-sort pass, and the resulting
+/// bucket count.
+///
+/// 2048 buckets keeps the write-combining state at 2048 × 2 streams × 128 B
+/// ≈ 512 KB, which stays inside a core's private cache. Going to 16 bits
+/// would need 16 MB of open write lines and thrashes the TLB instead.
+const RADIX_BITS: u32 = 11;
+const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
+
+/// Sort every suffix position by `(packed key, visible length)`, returning the
+/// sorted keys alongside the sorted positions.
+///
+/// This is an MSD counting sort rather than a comparison sort, for three
+/// reasons that all matter at genome scale:
+///
+/// * The source is never materialised. Keys are recomputed from `text` in
+///   both the histogram and the scatter pass, which is a sequential read of
+///   the text instead of a random read of an `n`-element key array.
+/// * Peak memory is the two destination buffers only, 12 bytes per position
+///   with `I = u32`, against the 16 a `(u64, u32, I)` record costs.
+/// * The top-level partition is a counting pass, so it parallelises evenly.
+///   A parallel comparison sort's first partitioning steps are close to
+///   serial, which is exactly where a `n log n` sort loses on many cores.
+fn seed_sort<I: Index>(
+    text: &[u8],
+    bits: u32,
+    k: usize,
+    visible_len: &(dyn Fn(usize) -> usize + Sync),
+) -> (Vec<u64>, Vec<I>) {
+    let n = text.len();
+    let bucket_of = |key: u64| -> usize { (key >> (64 - RADIX_BITS)) as usize };
+
+    // Chunk the position range so each worker builds a private histogram.
+    let n_chunks = (rayon::current_num_threads() * 4).clamp(1, 1024);
+    let chunk_len = n.div_ceil(n_chunks);
+    let bounds: Vec<(usize, usize)> = (0..n)
+        .step_by(chunk_len)
+        .map(|s| (s, (s + chunk_len).min(n)))
+        .collect();
+
+    // Pass 1: per-chunk histograms over the top `RADIX_BITS` of each key.
+    let histograms: Vec<Vec<u32>> = bounds
+        .par_iter()
+        .map(|&(start, end)| {
+            let mut counts = vec![0u32; RADIX_BUCKETS];
+            for p in start..end {
+                counts[bucket_of(key_at(text, p, bits, k))] += 1;
+            }
+            counts
+        })
+        .collect();
+
+    // Exclusive prefix sum, bucket-major then chunk-minor, so every (chunk,
+    // bucket) pair gets a disjoint destination range and the buckets come out
+    // in ascending key order.
+    let mut offsets = vec![0usize; bounds.len() * RADIX_BUCKETS];
+    let mut bucket_start = vec![0usize; RADIX_BUCKETS + 1];
+    {
+        let mut running = 0usize;
+        for b in 0..RADIX_BUCKETS {
+            bucket_start[b] = running;
+            for (c, hist) in histograms.iter().enumerate() {
+                offsets[c * RADIX_BUCKETS + b] = running;
+                running += hist[b] as usize;
+            }
+        }
+        bucket_start[RADIX_BUCKETS] = running;
+        debug_assert_eq!(running, n);
+    }
+
+    // Pass 2: scatter. Each chunk owns a disjoint slice of every bucket, so
+    // the writes never collide even though they are not contiguous.
+    let mut keys: Vec<u64> = vec![0; n];
+    let mut sa: Vec<I> = vec![I::zero(); n];
+    {
+        let key_out = Scatter::new(&mut keys);
+        let sa_out = Scatter::new(&mut sa);
+        bounds
+            .par_iter()
+            .enumerate()
+            .for_each(|(c, &(start, end))| {
+                let mut cursor: Vec<usize> =
+                    offsets[c * RADIX_BUCKETS..(c + 1) * RADIX_BUCKETS].to_vec();
+                for p in start..end {
+                    let key = key_at(text, p, bits, k);
+                    let slot = &mut cursor[bucket_of(key)];
+                    // SAFETY: the prefix sum gives this (chunk, bucket) pair a
+                    // range of exactly its own histogram count, and the cursor
+                    // never leaves it, so no other thread writes this index.
+                    unsafe {
+                        key_out.set(*slot, key);
+                        sa_out.set(*slot, I::from_usize(p));
+                    }
+                    *slot += 1;
+                }
+            });
+    }
+
+    // Pass 3: order within each bucket. Buckets share their top `RADIX_BITS`,
+    // so what remains is the low bits of the key and then the visible-length
+    // tie-break. Buckets are contiguous and independent.
+    let mut rest: &mut [u64] = &mut keys;
+    let mut rest_sa: &mut [I] = &mut sa;
+    let mut slices: Vec<(&mut [u64], &mut [I])> = Vec::with_capacity(RADIX_BUCKETS);
+    for b in 0..RADIX_BUCKETS {
+        let len = bucket_start[b + 1] - bucket_start[b];
+        let (kb, kt) = rest.split_at_mut(len);
+        let (sb, st) = rest_sa.split_at_mut(len);
+        slices.push((kb, sb));
+        rest = kt;
+        rest_sa = st;
+    }
+    slices.into_par_iter().for_each(|(kb, sb)| {
+        if kb.len() < 2 {
+            return;
+        }
+        let mut pairs: Vec<(u64, I)> = kb.iter().copied().zip(sb.iter().copied()).collect();
+        pairs.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| visible_len(a.1.to_usize()).cmp(&visible_len(b.1.to_usize())))
+        });
+        for (i, &(key, pos)) in pairs.iter().enumerate() {
+            kb[i] = key;
+            sb[i] = pos;
+        }
+    });
+
+    (keys, sa)
+}
+
+/// Build the standard lexicographic suffix array of `text` by radix-seeded
+/// prefix doubling.
+///
+/// The caller is responsible for the guards: `text` must be the whole,
+/// non-segmented text, the comparator must be plain lexicographic with
+/// shorter-is-smaller, and there must be no `max_context` bound. See
+/// [`crate::sample_sort::build_in_memory_with`] for where those are checked.
+pub(crate) fn build_sa<I: Index>(text: &[u8]) -> Vec<I> {
+    let n = text.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![I::zero()];
+    }
+
+    let t0 = Instant::now();
+    let max_sym = text.par_iter().copied().max().unwrap_or(0);
+    let (bits, k) = pack_params(max_sym);
+
+    // ---- Seed: sort by the first `k` symbols, then by visible length. ----
+    //
+    // The second component is `min(n - p, k)`, and it is load-bearing rather
+    // than cosmetic. Zero-padding makes a suffix shorter than `k` share a key
+    // with any suffix whose symbols continue with zeros, and `0` is a real
+    // symbol in every DNA encoding. Ordering those by visible length puts the
+    // proper prefix first, which is the shorter-is-smaller convention. For
+    // suffixes at least `k` long the component is `k` for all of them, so it
+    // never separates suffixes that the doubling rounds still need to see as
+    // tied. Without it, `[0, 0]` leaves positions 0 and 1 permanently tied
+    // and the doubling loop cannot terminate.
+    // Only the last `k - 1` positions can have a visible length below `k`, so
+    // the tie-break is a function of the position alone and never has to be
+    // stored alongside the key.
+    let visible_len = |p: usize| -> usize { (n - p).min(k) };
+
+    profile_log(&format!(
+        "radix setup     {:.3}s",
+        t0.elapsed().as_secs_f64()
+    ));
+    let t1 = Instant::now();
+    let (keys, mut sa) = seed_sort::<I>(text, bits, k, &visible_len);
+    profile_log(&format!(
+        "radix seed sort {:.3}s",
+        t1.elapsed().as_secs_f64()
+    ));
+    let t2 = Instant::now();
+
+    // Two seeded entries tie exactly when key and visible length both match.
+    let seed_eq = |a: usize, b: usize| -> bool {
+        keys[a] == keys[b] && visible_len(sa[a].to_usize()) == visible_len(sa[b].to_usize())
+    };
+
+    // `rank[p]` is the index in `sa` of the first element of `p`'s group, so
+    // two suffixes tie at the current depth exactly when their ranks match,
+    // and rank order is the current partial order.
+    let mut rank: Vec<I> = vec![I::zero(); n];
+    // Non-singleton `sa` ranges, the only ones any later round touches.
+    //
+    // Each index decides for itself whether it starts a group; the index that
+    // does then owns the whole group, walks it to find the end, and writes its
+    // members' ranks. Every group has exactly one owner and groups partition
+    // `0..n`, so the scattered writes never collide. `collect` on an indexed
+    // parallel iterator preserves order, so `groups` comes out sorted.
+    let ranks = Scatter::new(&mut rank);
+    let groups: Vec<(usize, usize)> = (0..n)
+        .into_par_iter()
+        .filter_map(|h| {
+            if h > 0 && seed_eq(h - 1, h) {
+                return None;
+            }
+            let mut e = h + 1;
+            while e < n && seed_eq(e, h) {
+                e += 1;
+            }
+            let g = I::from_usize(h);
+            for entry in &sa[h..e] {
+                // SAFETY: `sa` is a permutation of `0..n`, and this thread
+                // owns the whole group `h..e`, so `entry` is a distinct index
+                // no other thread writes.
+                unsafe { ranks.set(entry.to_usize(), g) };
+            }
+            (e - h > 1).then_some((h, e))
+        })
+        .collect();
+    let mut groups = groups;
+    drop(keys);
+    profile_log(&format!(
+        "radix grouping  {:.3}s",
+        t2.elapsed().as_secs_f64()
+    ));
+    let t3 = Instant::now();
+
+    // ---- Double: (rank_d(p), rank_d(p + d)) resolves to depth 2d. ----
+    let mut depth = k;
+    // Scratch for the new rank of each `sa` slot, so a round's reads of
+    // `rank` never observe that same round's writes.
+    let mut next_rank: Vec<I> = vec![I::zero(); n];
+
+    while !groups.is_empty() {
+        // Phase A: sort each tied group by the successor rank, and record the
+        // ranks it should get. Groups are disjoint `sa` ranges, so this is
+        // data-parallel with no synchronisation.
+        let sub: Vec<Vec<(usize, usize)>> = split_disjoint(&mut sa, &mut next_rank, &groups)
+            .into_par_iter()
+            .zip(groups.par_iter())
+            .map(|((sa_g, nr_g), &(start, _))| {
+                let succ = |p: usize| -> u64 {
+                    // End-of-text sorts first: the shorter suffix is smaller.
+                    match p.checked_add(depth) {
+                        Some(q) if q < n => rank[q].to_usize() as u64 + 1,
+                        _ => 0,
+                    }
+                };
+                // Materialise the successor ranks once. `sort_unstable_by_key`
+                // re-evaluates its key function O(len log len) times, and each
+                // evaluation is a random probe into `rank`; paying for it once
+                // per element turns the sort's memory traffic sequential.
+                let mut keyed: Vec<(u64, I)> =
+                    sa_g.iter().map(|&e| (succ(e.to_usize()), e)).collect();
+                keyed.sort_unstable();
+
+                let mut fresh = Vec::new();
+                let mut i = 0;
+                while i < keyed.len() {
+                    let key = keyed[i].0;
+                    let mut j = i + 1;
+                    while j < keyed.len() && keyed[j].0 == key {
+                        j += 1;
+                    }
+                    let g = I::from_usize(start + i);
+                    for slot in &mut nr_g[i..j] {
+                        *slot = g;
+                    }
+                    if j - i > 1 {
+                        fresh.push((start + i, start + j));
+                    }
+                    i = j;
+                }
+                for (slot, &(_, e)) in sa_g.iter_mut().zip(keyed.iter()) {
+                    *slot = e;
+                }
+                fresh
+            })
+            .collect();
+
+        // Phase B: publish the new ranks, now that every read is done.
+        // Groups are disjoint and `sa` is a permutation, so each `rank` slot
+        // is written by exactly one group.
+        let ranks = Scatter::new(&mut rank);
+        groups.par_iter().for_each(|&(start, end)| {
+            for i in start..end {
+                // SAFETY: `sa[start..end]` are distinct positions owned solely
+                // by this group, and the groups partition their index range.
+                unsafe { ranks.set(sa[i].to_usize(), next_rank[i]) };
+            }
+        });
+
+        let before: usize = groups.iter().map(|&(s, e)| e - s).sum();
+        groups = sub.into_iter().flatten().collect();
+        let after: usize = groups.iter().map(|&(s, e)| e - s).sum();
+
+        // A doubling round can only ever refine, so `after <= before`. If a
+        // round refines nothing at all the text has a run longer than the
+        // whole remaining depth budget; doubling still terminates because
+        // `depth` grows geometrically and every suffix eventually runs off
+        // the end of the text, which the sentinel orders. Guard against
+        // overflow rather than against non-progress.
+        debug_assert!(after <= before);
+        match depth.checked_mul(2) {
+            Some(d) if d <= n.saturating_mul(2) => depth = d,
+            _ => {
+                debug_assert!(groups.is_empty(), "doubling exhausted with ties left");
+                break;
+            }
+        }
+    }
+
+    profile_log(&format!(
+        "radix doubling  {:.3}s",
+        t3.elapsed().as_secs_f64()
+    ));
+    sa
+}
+
+/// Write access to disjoint slots of one slice from several rayon threads.
+///
+/// Both users here scatter through a permutation: the target index is
+/// `sa[i]`, not `i`, so the writes cannot be expressed as disjoint sub-slices
+/// and `split_at_mut` does not apply. What makes them safe is that `sa` is a
+/// permutation and the ranges being processed partition its index space, so
+/// every slot is written exactly once across all threads.
+struct Scatter<T> {
+    ptr: *mut T,
+    len: usize,
+}
+
+// SAFETY: `Scatter` hands out writes only through `set`, whose contract is
+// that no two calls target the same index. Under that contract there is no
+// aliasing between threads, so the pointer is safe to share.
+unsafe impl<T: Send> Send for Scatter<T> {}
+unsafe impl<T: Send> Sync for Scatter<T> {}
+
+impl<T> Scatter<T> {
+    fn new(slice: &mut [T]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    /// Write `value` at `index`.
+    ///
+    /// # Safety
+    ///
+    /// No two concurrent calls may pass the same `index`, and the borrow the
+    /// `Scatter` was built from must still be live.
+    #[inline]
+    unsafe fn set(&self, index: usize, value: T) {
+        debug_assert!(index < self.len);
+        unsafe { self.ptr.add(index).write(value) };
+    }
+}
+
+/// Borrow each `(start, end)` range of `sa` and `next_rank` mutably and
+/// simultaneously. The ranges come from a scan of `sa` so they are sorted and
+/// non-overlapping, which is what makes the repeated `split_at_mut` sound.
+fn split_disjoint<'a, I: Index>(
+    sa: &'a mut [I],
+    next_rank: &'a mut [I],
+    groups: &[(usize, usize)],
+) -> Vec<(&'a mut [I], &'a mut [I])> {
+    let mut out = Vec::with_capacity(groups.len());
+    let mut sa_rest = sa;
+    let mut nr_rest = next_rank;
+    let mut consumed = 0usize;
+    for &(start, end) in groups {
+        debug_assert!(
+            start >= consumed,
+            "group ranges must be sorted and disjoint"
+        );
+        let (_, sa_tail) = sa_rest.split_at_mut(start - consumed);
+        let (_, nr_tail) = nr_rest.split_at_mut(start - consumed);
+        let (sa_g, sa_tail) = sa_tail.split_at_mut(end - start);
+        let (nr_g, nr_tail) = nr_tail.split_at_mut(end - start);
+        out.push((sa_g, nr_g));
+        sa_rest = sa_tail;
+        nr_rest = nr_tail;
+        consumed = end;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn brute(text: &[u8]) -> Vec<u32> {
+        let mut sa: Vec<u32> = (0..text.len() as u32).collect();
+        sa.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        sa
+    }
+
+    fn check(text: &[u8]) {
+        let got: Vec<u32> = build_sa(text);
+        assert_eq!(got, brute(text), "mismatch on {text:?}");
+    }
+
+    #[test]
+    fn fixtures() {
+        check(b"");
+        check(b"a");
+        check(b"banana");
+        check(b"mississippi");
+        check(b"abracadabra");
+    }
+
+    #[test]
+    fn pack_params_covers_every_width() {
+        assert_eq!(pack_params(0), (1, 64));
+        assert_eq!(pack_params(1), (1, 64));
+        assert_eq!(pack_params(3), (2, 32));
+        assert_eq!(pack_params(4), (4, 16));
+        assert_eq!(pack_params(15), (4, 16));
+        assert_eq!(pack_params(16), (8, 8));
+        assert_eq!(pack_params(255), (8, 8));
+    }
+
+    /// Texts whose symbols include a real `0`, so padding and a genuine
+    /// minimum symbol are indistinguishable in the packed key. This is the
+    /// case DNA encodings hit (`A = 0`) and the one the ordering argument in
+    /// the module docs turns on.
+    #[test]
+    fn real_zero_symbol_is_not_confused_with_padding() {
+        check(&[0]);
+        check(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        check(&[1, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        check(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        check(&[0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
+        let mut t: Vec<u8> = (0..200).map(|i| (i % 4) as u8).collect();
+        t.extend(std::iter::repeat_n(0u8, 100));
+        check(&t);
+    }
+
+    /// Every text of length <= 10 over a binary alphabet, plus every text of
+    /// length <= 6 over a ternary one. Total coverage of the padding and
+    /// end-of-text logic at the sizes where exhaustive checking is free.
+    #[test]
+    fn exhaustive_small_alphabets() {
+        for n in 0..=10u32 {
+            for mask in 0..(1u32 << n) {
+                let t: Vec<u8> = (0..n).map(|i| ((mask >> i) & 1) as u8).collect();
+                check(&t);
+            }
+        }
+        for n in 0..=6u32 {
+            let total = 3u32.pow(n);
+            for mut code in 0..total {
+                let mut t = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    t.push((code % 3) as u8);
+                    code /= 3;
+                }
+                check(&t);
+            }
+        }
+    }
+
+    #[test]
+    fn random_across_alphabet_widths() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xADD1);
+        for &sigma in &[2u8, 3, 4, 6, 16, 17, 255] {
+            for &n in &[
+                2usize, 7, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000, 20_000,
+            ] {
+                let t: Vec<u8> = (0..n).map(|_| rng.random_range(0..sigma)).collect();
+                check(&t);
+            }
+        }
+    }
+
+    /// Long runs and periodic text are the inputs that make the merge kernel
+    /// quadratic. Doubling must handle them and must terminate.
+    #[test]
+    fn long_runs_and_periodic_text() {
+        check(&vec![0u8; 5000]);
+        check(&vec![7u8; 5000]);
+        check(&(0..5000).map(|i| (i % 2) as u8).collect::<Vec<u8>>());
+        check(&(0..5000).map(|i| (i % 61) as u8).collect::<Vec<u8>>());
+        // A long run flanked by noise: the shape of a poly-N genome block.
+        let mut t: Vec<u8> = (0..500).map(|i| (i % 4) as u8).collect();
+        t.extend(std::iter::repeat_n(4u8, 4000));
+        t.extend((0..500).map(|i| (i % 4) as u8));
+        check(&t);
+        // Wrapped-FASTA shape: 60 `N`s then a newline, repeated.
+        let mut fasta: Vec<u8> = Vec::new();
+        for _ in 0..100 {
+            fasta.extend(std::iter::repeat_n(b'N', 60));
+            fasta.push(b'\n');
+        }
+        check(&fasta);
+    }
+
+    #[test]
+    fn u64_index_matches_u32_index() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xD0AB);
+        let t: Vec<u8> = (0..5000).map(|_| rng.random_range(0..4u8)).collect();
+        let a: Vec<u32> = build_sa(&t);
+        let b: Vec<u64> = build_sa(&t);
+        assert_eq!(a.len(), b.len());
+        assert!(a.iter().zip(&b).all(|(&x, &y)| x as u64 == y));
+    }
+}

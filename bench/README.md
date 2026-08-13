@@ -32,8 +32,16 @@ It reports wall time and peak RSS via `/usr/bin/time`.
 
 Machine: 64-core x86_64 Linux node, 1 socket, AVX2 enabled.
 Builds: upstream `cmake -DCMAKE_BUILD_TYPE=Release`, this crate
-`cargo build --release --example caps_sa` (release profile in the
-workspace `Cargo.toml` enables `lto = "fat"` + `codegen-units = 1`).
+`cargo build --release --example caps_sa`. The `[profile.release]` in
+this repo's `Cargo.toml` sets `lto = "fat"` + `codegen-units = 1`; for
+the SIMD paths also pass `RUSTFLAGS="-C target-cpu=native"`.
+
+> **Correction.** This paragraph used to attribute the LTO settings to a
+> parent workspace. No such workspace exists in the repository, so from
+> the commit that made the crate standalone until the profile was added
+> here, every build made from this repo actually used `lto = false` and
+> `codegen-units = 16`. Numbers taken in that window are not comparable
+> with numbers taken now. Re-measure before quoting them.
 
 All caps-sa runs include the five optimizations applied incrementally
 to the Phase 2b sample-sort baseline:
@@ -398,6 +406,80 @@ much larger padded text) and times `build_ext_mem` (sort everything)
 against `build_ext_mem_for_positions` (sort only the kept positions)
 on the same fixture, showing **6–10× speedups** on padding-dominated
 inputs. The pool change leaves this gap intact.
+
+### chr21 — the two inputs are different problems (in-memory fast path)
+
+Machine: Apple M4 Max (12 P-cores + 4 E-cores, aarch64/NEON, no
+AVX-512), 12 threads, `RUSTFLAGS="-C target-cpu=native"`. Reproduce with
+`bench/chr21.sh`.
+
+Two inputs are built from hg38 chr21, and the distinction matters more
+than any tuning parameter in this document:
+
+| input | size | alphabet | long runs |
+| ----- | ---- | -------- | --------- |
+| `chr21.0123` — forward ++ revcomp, codes `0..=3`, ambiguous bases dropped | 80.2 MB | 4 | none |
+| `chr21.fa` — the raw FASTA, headers and newlines included | 47.5 MB | 6 | 6.6 Mb of `N`, period-61 after 60-column wrapping |
+
+Benchmarking one implementation on the first and another on the second
+compares two different problems. That is worth stating explicitly
+because it is an easy mistake to make: the second input is 40% smaller
+yet used to take 4.6x longer.
+
+Merge kernel vs. the radix-seeded doubling fast path, suffix arrays
+byte-identical and independently `--verify`-checked in both cases:
+
+| input | merge kernel | fast path | speedup | CPU before | CPU after | CPU speedup |
+| ----- | ------------ | --------- | ------- | ---------- | --------- | ----------- |
+| `chr21.0123` | 6.08 s | **0.89 s** | 6.8x | 28.1 s | 5.0 s | 5.6x |
+| `chr21.fa`   | 27.8 s | **1.04 s** | 26.7x | 283.5 s | 5.2 s | **54x** |
+
+The per-merge-step cost is what separates the two rows. Dividing CPU
+time by `n log2 n` merge steps:
+
+```
+chr21.0123   28.1 s / 2.11e9 steps  =  13 ns/step
+chr21.fa    283.5 s / 1.21e9 steps  = 222 ns/step
+```
+
+Same kernel, same machine, 16x apart. The difference is entirely scan
+length: every leaf merge starts with `m = 0`, so two suffixes inside an
+`N` block scan their whole shared prefix, which is megabytes.
+
+Phase breakdown of the fast path (`CAPS_SA_PROFILE=1`):
+
+```
+                    chr21.0123    chr21.fa
+key extraction         0.086 s     0.020 s
+seed sort              0.255 s     0.176 s
+grouping               0.075 s     0.037 s
+doubling rounds        0.475 s     0.807 s
+```
+
+The doubling rounds are the larger share on the FASTA input, as
+expected: `N` blocks stay tied for many rounds. But each round is
+rank-only, so they cost a sort over a shrinking residual rather than a
+text scan, which is why the pathology disappears rather than merely
+shrinking.
+
+### Reading the 97.54% LCP profile correctly
+
+The profile in the next section shows `lcp_u8_avx2` taking 97.54% of
+samples on a human-genome slice. That was read at the time as "LCP
+scanning is expensive", and it drove several rounds of work on making
+the scan wider — AVX2, then AVX-512, then the 32-byte/64-byte hybrid.
+
+The chr21 numbers above suggest a second reading. The LCP kernel is also
+where the two *random* text loads happen, so on short-LCP input those
+samples are load stalls rather than scan length, and a wider vector does
+not help. That is consistent with the AVX-512 ablation further down,
+where the 64-byte-only variant was **16% slower** on `rand100m` and only
+the long-LCP human slice gained. Widening the scan helps when the scan
+is genuinely long; when it is short, the cost is latency and the fix is
+to issue fewer random probes.
+
+The fast path does the latter: it removes the probes entirely rather
+than making each one faster.
 
 ### Where AVX-512 helps and where it doesn't — the measurement
 
