@@ -30,6 +30,7 @@
 
 use std::cmp::Ordering;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -41,7 +42,9 @@ use crate::ext_bucket::{
     BucketPool, BucketRecord, BucketStore, InMemBucket, SaLcp, SaLcpBucketStore,
 };
 use crate::lcp::{LcpDispatch, Symbol};
-use crate::lcp_memo::{GeometricMemo, MemoConfig, MemoStats};
+use crate::lcp_memo::{
+    GeometricMemo, GeometricMemoizationConfig, LcpMemoizationPolicy, MemoConfig, MemoStats,
+};
 use crate::limits::{LimitProvider, PlainText};
 use crate::sample_sort;
 
@@ -86,6 +89,14 @@ pub struct ExtMemOpts {
     /// GRCh38 32-thread benchmark because of channel coordination and
     /// backpressure, so it is opt-in.
     pub ordered_phase4_emit: bool,
+    /// Policy for reusing exact long-LCP intervals during phase-4 partition
+    /// merges. Disabled by default; callers with long repeated contexts can
+    /// opt into [`LcpMemoizationPolicy::Geometric`].
+    pub lcp_memoization: LcpMemoizationPolicy,
+    /// Collect detailed geometric-memoization counters while phase profiling
+    /// is enabled. This is diagnostic instrumentation, separate from the
+    /// production memoization policy, and is disabled by default.
+    pub collect_lcp_memoization_stats: bool,
 }
 
 impl Default for ExtMemOpts {
@@ -96,6 +107,8 @@ impl Default for ExtMemOpts {
             work_dir: std::env::temp_dir(),
             physical_file_count: 0,
             ordered_phase4_emit: false,
+            lcp_memoization: LcpMemoizationPolicy::Disabled,
+            collect_lcp_memoization_stats: false,
         }
     }
 }
@@ -118,9 +131,16 @@ impl ExtMemOpts {
     /// - `CAPS_SA_N_PHYS`: physical backing-file count
     /// - `CAPS_SA_MAX_CONTEXT`: LCP comparison cap
     /// - `CAPS_SA_ORDERED_PHASE4=1|true|yes|on`: bounded ordered phase-4 emit
+    /// - `CAPS_SA_GEOMETRIC_MEMO=1|true|yes|on`: geometric LCP memoization
+    /// - `CAPS_SA_MEMO_PROBE`: ordinary symbols compared before table lookup
+    /// - `CAPS_SA_MEMO_MIN_LCP`: minimum exact LCP admitted to the table
+    /// - `CAPS_SA_MEMO_ACTIVATE_ENTRIES`: entries learned before table lookup
+    /// - `CAPS_SA_MEMO_CAPACITY`: maximum entries per partition table
+    /// - `CAPS_SA_MEMO_STATS=1|true|yes|on`: detailed memoization counters
     ///
-    /// Invalid numeric values are ignored, matching the existing
-    /// benchmark-only `CAPS_SA_N_PHYS` behaviour.
+    /// Invalid numeric values and zero memoization values are ignored,
+    /// preserving the corresponding defaults. Memoization tuning variables
+    /// take effect only when `CAPS_SA_GEOMETRIC_MEMO` enables the policy.
     pub fn from_env() -> Self {
         let mut opts = Self::default();
         if let Some(dir) =
@@ -140,6 +160,23 @@ impl ExtMemOpts {
         if read_env_bool("CAPS_SA_ORDERED_PHASE4") {
             opts.ordered_phase4_emit = true;
         }
+        if read_env_bool("CAPS_SA_GEOMETRIC_MEMO") {
+            let mut config = GeometricMemoizationConfig::default();
+            if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_PROBE") {
+                config.probe_symbols = v;
+            }
+            if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_MIN_LCP") {
+                config.min_lcp_symbols = v;
+            }
+            if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_ACTIVATE_ENTRIES") {
+                config.activate_after_entries = v;
+            }
+            if let Some(v) = read_env_nonzero_usize("CAPS_SA_MEMO_CAPACITY") {
+                config.max_entries_per_partition = v;
+            }
+            opts.lcp_memoization = LcpMemoizationPolicy::Geometric(config);
+        }
+        opts.collect_lcp_memoization_stats = read_env_bool("CAPS_SA_MEMO_STATS");
         opts
     }
 
@@ -172,10 +209,26 @@ impl ExtMemOpts {
         self.ordered_phase4_emit = ordered_phase4_emit;
         self
     }
+
+    /// Builder-style setter for [`Self::lcp_memoization`].
+    pub fn lcp_memoization(mut self, lcp_memoization: LcpMemoizationPolicy) -> Self {
+        self.lcp_memoization = lcp_memoization;
+        self
+    }
+
+    /// Builder-style setter for [`Self::collect_lcp_memoization_stats`].
+    pub fn collect_lcp_memoization_stats(mut self, collect: bool) -> Self {
+        self.collect_lcp_memoization_stats = collect;
+        self
+    }
 }
 
 fn read_env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse().ok()
+}
+
+fn read_env_nonzero_usize(name: &str) -> Option<NonZeroUsize> {
+    NonZeroUsize::new(read_env_usize(name)?)
 }
 
 fn read_env_bool(name: &str) -> bool {
@@ -557,6 +610,8 @@ where
         &mut partition_buckets,
         opts.max_context,
         opts.ordered_phase4_emit,
+        memo_config(opts.lcp_memoization),
+        opts.collect_lcp_memoization_stats,
         &mut emit,
         dispatch,
     );
@@ -624,9 +679,18 @@ where
         &mut partition_buckets,
         opts.max_context,
         opts.ordered_phase4_emit,
+        memo_config(opts.lcp_memoization),
+        opts.collect_lcp_memoization_stats,
         &mut emit,
         dispatch,
     )
+}
+
+fn memo_config(policy: LcpMemoizationPolicy) -> Option<MemoConfig> {
+    match policy {
+        LcpMemoizationPolicy::Disabled => None,
+        LcpMemoizationPolicy::Geometric(config) => Some(config.into()),
+    }
 }
 
 /// In-memory variant of the sample-sort algorithm used by
@@ -1613,12 +1677,15 @@ where
 /// subarrays the per-partition size is `≈ n / p`, so this stays
 /// proportional to `n / 4 = 0.25 n` even at the peak — well below the
 /// in-memory path's `~4 n` working set.
+#[allow(clippy::too_many_arguments)]
 fn phase4_merge_and_emit<S, I, L, B, E, F>(
     text: &[S],
     lp: &L,
     partition_buckets: &mut [B],
     max_ctx: usize,
     ordered_emit: bool,
+    memo_config: Option<MemoConfig>,
+    collect_memo_stats: bool,
     emit: &mut F,
     dispatch: LcpDispatch,
 ) -> Result<(), BuildError<E>>
@@ -1657,9 +1724,9 @@ where
     // wall-time; the ratio between them still tells us where the work is.
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     let profile = std::env::var_os("CAPS_SA_PROFILE").is_some();
+    let memo_profiled = profile && collect_memo_stats && memo_config.is_some();
     let load_us = AtomicU64::new(0);
     let merge_us = AtomicU64::new(0);
-    let memo_config = MemoConfig::from_env();
     let memo_stats = Mutex::new(MemoStats::default());
     let mut emit_secs: f64 = 0.0;
 
@@ -1677,6 +1744,7 @@ where
                 dispatch,
                 memo_config,
                 &memo_stats,
+                memo_profiled,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1692,6 +1760,7 @@ where
                 dispatch,
                 memo_config,
                 &memo_stats,
+                memo_profiled,
                 profile,
                 &load_us,
                 &merge_us,
@@ -1707,15 +1776,14 @@ where
             merge_us.load(AtomicOrdering::Relaxed) as f64 * 1e-6,
             emit_secs,
         ));
-        if let Some(config) = memo_config {
+        if let Some(config) = memo_config.filter(|_| memo_profiled) {
             let stats = *memo_stats.lock().expect("memo profile mutex poisoned");
             profile_log(&format!(
-                "geometric memo probe={} min_lcp={} cap={} activate_entries={} stats={} tables={} active_tables={} table_bins=[{},{},{},{},{},{}] calls={} training_direct={} probe_resolved={} lookups={} direct_hits={} gap_hits={} gap_mismatches={} gap_caps={} misses={} inserts={} extensions={} cap_rejects={} final_entries={} max_entries={} unique_diagonals={} singleton_diagonals={} max_entries_per_diagonal={} lookup_steps={} insert_steps={} insert_shifts={} scanned_matches={} skipped_matches={}",
+                "geometric memo probe={} min_lcp={} cap={} activate_entries={} tables={} active_tables={} table_bins=[{},{},{},{},{},{}] calls={} training_direct={} probe_resolved={} lookups={} direct_hits={} gap_hits={} gap_mismatches={} gap_caps={} misses={} inserts={} extensions={} cap_rejects={} final_entries={} max_entries={} unique_diagonals={} singleton_diagonals={} max_entries_per_diagonal={} lookup_steps={} insert_steps={} insert_shifts={} scanned_matches={} skipped_matches={}",
                 config.probe,
                 config.min_lcp,
                 config.capacity,
                 config.activate_entries,
-                config.collect_stats,
                 stats.tables,
                 stats.active_tables,
                 stats.tables_0_15,
@@ -1762,6 +1830,7 @@ fn phase4_merge_chunk_collect_emit<S, I, L, B, E, F>(
     dispatch: LcpDispatch,
     memo_config: Option<MemoConfig>,
     memo_stats: &Mutex<MemoStats>,
+    memo_profiled: bool,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1788,6 +1857,7 @@ where
                 dispatch,
                 memo_config,
                 memo_stats,
+                memo_profiled,
                 profile,
                 load_us,
                 merge_us,
@@ -1817,6 +1887,7 @@ fn phase4_merge_chunk_ordered_emit<S, I, L, B, E, F>(
     dispatch: LcpDispatch,
     memo_config: Option<MemoConfig>,
     memo_stats: &Mutex<MemoStats>,
+    memo_profiled: bool,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1853,6 +1924,7 @@ where
                         dispatch,
                         memo_config,
                         memo_stats,
+                        memo_profiled,
                         profile,
                         load_us,
                         merge_us,
@@ -1915,6 +1987,7 @@ fn merge_one_partition<S, I, L, B>(
     dispatch: LcpDispatch,
     memo_config: Option<MemoConfig>,
     memo_stats: &Mutex<MemoStats>,
+    memo_profiled: bool,
     profile: bool,
     load_us: &std::sync::atomic::AtomicU64,
     merge_us: &std::sync::atomic::AtomicU64,
@@ -1942,7 +2015,7 @@ where
     let workspace = CascadeWorkspace::<I>::new();
     let result = if let Some(config) = memo_config {
         let mut memo = GeometricMemo::new(config);
-        let result = if config.collect_stats {
+        let result = if memo_profiled {
             workspace.cascade_merge_memoized_profiled(
                 text,
                 lp,
@@ -1963,7 +2036,7 @@ where
                 &mut memo,
             )
         };
-        if profile {
+        if memo_profiled {
             memo_stats
                 .lock()
                 .expect("memo profile mutex poisoned")
@@ -2304,12 +2377,50 @@ impl<I: Index> CascadeWorkspace<I> {
 mod tests {
     use super::*;
     use crate::build_in_memory;
+    use std::ffi::OsString;
     use tempfile::tempdir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|&key| (key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+
+        fn set(&self, key: &'static str, value: &str) {
+            // The test serializes every mutation through ENV_LOCK and restores
+            // all touched variables before releasing it.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                // See EnvGuard::set: this runs while the serial test lock is
+                // still held and restores the process environment exactly.
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+    }
 
     fn ext_mem_sa(text: &[u8], p: usize) -> Vec<u64> {
         let dir = tempdir().unwrap();
         let opts = ExtMemOpts {
             subproblem_count: p,
+            physical_file_count: 1,
             work_dir: dir.path().to_path_buf(),
             ..ExtMemOpts::default()
         };
@@ -2320,6 +2431,101 @@ mod tests {
         })
         .unwrap();
         out
+    }
+
+    fn ext_mem_sa_with_policy(
+        text: &[u8],
+        p: usize,
+        lcp_memoization: LcpMemoizationPolicy,
+    ) -> Vec<u64> {
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts {
+            subproblem_count: p,
+            physical_file_count: 1,
+            work_dir: dir.path().to_path_buf(),
+            lcp_memoization,
+            ..ExtMemOpts::default()
+        };
+        let mut out = Vec::with_capacity(text.len());
+        build_ext_mem(text, &opts, |pos| {
+            out.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn memoization_policy_defaults_to_disabled() {
+        let opts = ExtMemOpts::default();
+        assert_eq!(opts.lcp_memoization, LcpMemoizationPolicy::Disabled);
+        assert!(!opts.collect_lcp_memoization_stats);
+
+        let config = GeometricMemoizationConfig::default();
+        assert_eq!(config.probe_symbols.get(), 256);
+        assert_eq!(config.min_lcp_symbols.get(), 1_024);
+        assert_eq!(config.activate_after_entries.get(), 64);
+        assert_eq!(config.max_entries_per_partition.get(), 4_096);
+    }
+
+    #[test]
+    fn geometric_policy_matches_direct_output() {
+        let mut text = Vec::new();
+        for i in 0..600 {
+            text.extend_from_slice(b"ACGTACGTACGTACGTACGTACGTACGT");
+            text.push((i % 5) as u8);
+        }
+        text.push(200);
+
+        let direct = ext_mem_sa_with_policy(&text, 16, LcpMemoizationPolicy::Disabled);
+        let config = GeometricMemoizationConfig {
+            probe_symbols: NonZeroUsize::new(8).unwrap(),
+            min_lcp_symbols: NonZeroUsize::new(16).unwrap(),
+            activate_after_entries: NonZeroUsize::new(1).unwrap(),
+            max_entries_per_partition: NonZeroUsize::new(128).unwrap(),
+        };
+        let memoized = ext_mem_sa_with_policy(&text, 16, LcpMemoizationPolicy::Geometric(config));
+        assert_eq!(memoized, direct);
+    }
+
+    #[test]
+    fn from_env_parses_memoization_policy_and_rejects_zero_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "CAPS_SA_GEOMETRIC_MEMO",
+            "CAPS_SA_MEMO_PROBE",
+            "CAPS_SA_MEMO_MIN_LCP",
+            "CAPS_SA_MEMO_ACTIVATE_ENTRIES",
+            "CAPS_SA_MEMO_CAPACITY",
+            "CAPS_SA_MEMO_STATS",
+        ];
+        let env = EnvGuard::capture(&keys);
+        env.set("CAPS_SA_GEOMETRIC_MEMO", "true");
+        env.set("CAPS_SA_MEMO_PROBE", "32");
+        env.set("CAPS_SA_MEMO_MIN_LCP", "256");
+        env.set("CAPS_SA_MEMO_ACTIVATE_ENTRIES", "8");
+        env.set("CAPS_SA_MEMO_CAPACITY", "512");
+        env.set("CAPS_SA_MEMO_STATS", "yes");
+
+        let opts = ExtMemOpts::from_env();
+        let LcpMemoizationPolicy::Geometric(config) = opts.lcp_memoization else {
+            panic!("environment should enable geometric memoization");
+        };
+        assert_eq!(config.probe_symbols.get(), 32);
+        assert_eq!(config.min_lcp_symbols.get(), 256);
+        assert_eq!(config.activate_after_entries.get(), 8);
+        assert_eq!(config.max_entries_per_partition.get(), 512);
+        assert!(opts.collect_lcp_memoization_stats);
+
+        env.set("CAPS_SA_MEMO_PROBE", "0");
+        env.set("CAPS_SA_MEMO_MIN_LCP", "0");
+        env.set("CAPS_SA_MEMO_ACTIVATE_ENTRIES", "0");
+        env.set("CAPS_SA_MEMO_CAPACITY", "0");
+        let opts = ExtMemOpts::from_env();
+        let LcpMemoizationPolicy::Geometric(config) = opts.lcp_memoization else {
+            panic!("environment should still enable geometric memoization");
+        };
+        assert_eq!(config, GeometricMemoizationConfig::default());
     }
 
     fn assert_matches_in_memory(text: &[u8], p: usize) {
@@ -2384,6 +2590,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let opts = ExtMemOpts {
             subproblem_count: p,
+            physical_file_count: 1,
             work_dir: dir.path().to_path_buf(),
             ..ExtMemOpts::default()
         };
@@ -2436,6 +2643,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let opts = ExtMemOpts {
             subproblem_count: p,
+            physical_file_count: 1,
             work_dir: dir.path().to_path_buf(),
             ..ExtMemOpts::default()
         };
@@ -2482,6 +2690,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let opts = ExtMemOpts {
             subproblem_count: p,
+            physical_file_count: 1,
             work_dir: dir.path().to_path_buf(),
             ..ExtMemOpts::default()
         };
@@ -2563,6 +2772,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let opts = ExtMemOpts {
             subproblem_count: 2,
+            physical_file_count: 1,
             work_dir: dir.path().to_path_buf(),
             ..ExtMemOpts::default()
         };

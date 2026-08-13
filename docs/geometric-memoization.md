@@ -1,9 +1,10 @@
 # Geometric LCP memoization design
 
 This document turns the endpoint construction in `LCP-memoization.pdf` into
-a prototype that can be evaluated in the production external-memory path.
-The prototype is deliberately phase-4-only and opt-in while its thresholds
-and value are measured.
+an opt-in policy for the production external-memory path. The implementation
+is deliberately phase-4-only: each partition cascade owns an independent,
+bounded table and the ordinary direct kernel remains available without table
+allocation or per-comparison policy dispatch.
 
 ## Exact interval invariant
 
@@ -72,19 +73,40 @@ ruSTAR fixture are small (roughly 150--250 entries each), so one contiguous
 allocation is cheaper than allocating and chasing tree nodes. The strict
 per-table cap bounds insertion shifts and total memory on adversarial input.
 
-## Initial policy and tunables
+## Public policy and tunables
 
-The opt-in prototype is enabled with `CAPS_SA_GEOMETRIC_MEMO=1`.
+Memoization is selected per construction through `ExtMemOpts` and remains
+disabled by default:
 
-| Parameter | Initial value | Environment override |
+```rust
+let opts = caps_sa::ExtMemOpts::default().lcp_memoization(
+    caps_sa::LcpMemoizationPolicy::Geometric(
+        caps_sa::GeometricMemoizationConfig::default(),
+    ),
+);
+```
+
+The four configuration fields use `NonZeroUsize`, so invalid zero-valued
+policies cannot be constructed. Callers can start from `default()` and replace
+individual public fields. The measured defaults are:
+
+| Parameter | Default | `ExtMemOpts::from_env()` override |
 |---|---:|---|
 | Ordinary probe before lookup | 256 symbols | `CAPS_SA_MEMO_PROBE` |
 | Minimum exact LCP admitted | 1,024 symbols | `CAPS_SA_MEMO_MIN_LCP` |
 | Entries per partition | 4,096 | `CAPS_SA_MEMO_CAPACITY` |
 | Entries learned before lookup | 64 | `CAPS_SA_MEMO_ACTIVATE_ENTRIES` |
 
-Per-call instrumentation is enabled separately with `CAPS_SA_MEMO_STATS=1`;
-keeping it off prevents profiling counters from contaminating timing runs.
+`ExtMemOpts::from_env()` also recognizes `CAPS_SA_GEOMETRIC_MEMO=1`. Environment
+variables are parsed only by that explicit constructor; `ExtMemOpts::default()`
+and the build itself never consult them for memoization policy. Invalid and
+zero-valued numeric overrides retain the defaults.
+
+Detailed per-call instrumentation is a separate
+`ExtMemOpts::collect_lcp_memoization_stats` switch (or
+`CAPS_SA_MEMO_STATS=1` through `from_env()`). Counters are collected only when
+phase profiling is also enabled, preventing diagnostic branches from
+contaminating ordinary memoized runs.
 
 When full, the first prototype still extends an existing endpoint but rejects
 new endpoints. Profiling records capacity rejections. If saturation is common,

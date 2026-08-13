@@ -6,47 +6,87 @@
 //! bounds and are never admitted.
 
 use crate::lcp::{LcpDispatch, Symbol};
+use std::num::NonZeroUsize;
 
 const DEFAULT_PROBE: usize = 256;
 const DEFAULT_MIN_LCP: usize = 1_024;
 const DEFAULT_CAPACITY: usize = 4_096;
 const DEFAULT_ACTIVATE_ENTRIES: usize = 64;
 
-/// Runtime controls for the opt-in prototype.
+/// Controls whether phase-4 LCP comparisons use geometric memoization.
+///
+/// Memoization is disabled by default. Callers whose inputs contain many
+/// repeated long contexts can opt in with [`Self::Geometric`].
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum LcpMemoizationPolicy {
+    /// Use the ordinary LCP-enhanced merge kernel without allocating a table.
+    #[default]
+    Disabled,
+    /// Learn and reuse exact LCP intervals within each partition cascade.
+    Geometric(GeometricMemoizationConfig),
+}
+
+/// Tuning controls for [`LcpMemoizationPolicy::Geometric`].
+///
+/// Every field is non-zero by construction. The defaults were selected on a
+/// complete ruSTAR-shaped GRCh38 plus GENCODE workload. Tables are local to a
+/// single phase-4 partition cascade and are dropped when that partition is
+/// emitted.
+///
+/// ```
+/// use caps_sa::{GeometricMemoizationConfig, LcpMemoizationPolicy};
+/// use std::num::NonZeroUsize;
+///
+/// let mut config = GeometricMemoizationConfig::default();
+/// config.probe_symbols = NonZeroUsize::new(512).unwrap();
+/// let policy = LcpMemoizationPolicy::Geometric(config);
+/// # let _ = policy;
+/// ```
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GeometricMemoizationConfig {
+    /// Compare this many symbols normally before consulting the table.
+    pub probe_symbols: NonZeroUsize,
+    /// Admit only exact LCPs at least this long, including any known prefix.
+    pub min_lcp_symbols: NonZeroUsize,
+    /// Begin table lookups only after learning this many entries.
+    pub activate_after_entries: NonZeroUsize,
+    /// Hard entry bound for each phase-4 partition table.
+    pub max_entries_per_partition: NonZeroUsize,
+}
+
+impl Default for GeometricMemoizationConfig {
+    fn default() -> Self {
+        // These constants are all statically non-zero.
+        Self {
+            probe_symbols: NonZeroUsize::new(DEFAULT_PROBE).unwrap(),
+            min_lcp_symbols: NonZeroUsize::new(DEFAULT_MIN_LCP).unwrap(),
+            activate_after_entries: NonZeroUsize::new(DEFAULT_ACTIVATE_ENTRIES).unwrap(),
+            max_entries_per_partition: NonZeroUsize::new(DEFAULT_CAPACITY).unwrap(),
+        }
+    }
+}
+
+/// Internal representation used by the hot path after public options have
+/// been validated by their `NonZeroUsize` types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoConfig {
     pub(crate) probe: usize,
     pub(crate) min_lcp: usize,
     pub(crate) capacity: usize,
     pub(crate) activate_entries: usize,
-    pub(crate) collect_stats: bool,
 }
 
-impl MemoConfig {
-    /// Return a configuration only when geometric memoization is explicitly
-    /// enabled.  Environment controls keep the prototype out of the public API
-    /// while allowing threshold sweeps with one compiled binary.
-    pub(crate) fn from_env() -> Option<Self> {
-        let enabled = std::env::var_os("CAPS_SA_GEOMETRIC_MEMO")?;
-        if matches!(enabled.to_str(), Some("0" | "false" | "off")) {
-            return None;
+impl From<GeometricMemoizationConfig> for MemoConfig {
+    fn from(config: GeometricMemoizationConfig) -> Self {
+        Self {
+            probe: config.probe_symbols.get(),
+            min_lcp: config.min_lcp_symbols.get(),
+            capacity: config.max_entries_per_partition.get(),
+            activate_entries: config.activate_after_entries.get(),
         }
-        Some(Self {
-            probe: env_usize("CAPS_SA_MEMO_PROBE", DEFAULT_PROBE).max(1),
-            min_lcp: env_usize("CAPS_SA_MEMO_MIN_LCP", DEFAULT_MIN_LCP).max(1),
-            capacity: env_usize("CAPS_SA_MEMO_CAPACITY", DEFAULT_CAPACITY).max(1),
-            activate_entries: env_usize("CAPS_SA_MEMO_ACTIVATE_ENTRIES", DEFAULT_ACTIVATE_ENTRIES)
-                .max(1),
-            collect_stats: std::env::var_os("CAPS_SA_MEMO_STATS").is_some(),
-        })
     }
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
 }
 
 /// Counters accumulated without synchronization inside one partition.
@@ -148,33 +188,30 @@ impl GeometricMemo {
     }
 
     pub(crate) fn finish(mut self) -> MemoStats {
-        if self.config.collect_stats {
-            self.stats.tables = 1;
-            self.stats.final_entries = self.entries.len() as u64;
-            self.stats.active_tables = u64::from(self.is_active());
-            match self.entries.len() {
-                0..=15 => self.stats.tables_0_15 = 1,
-                16..=31 => self.stats.tables_16_31 = 1,
-                32..=63 => self.stats.tables_32_63 = 1,
-                64..=127 => self.stats.tables_64_127 = 1,
-                128..=255 => self.stats.tables_128_255 = 1,
-                _ => self.stats.tables_256_plus = 1,
+        self.stats.tables = 1;
+        self.stats.final_entries = self.entries.len() as u64;
+        self.stats.active_tables = u64::from(self.is_active());
+        match self.entries.len() {
+            0..=15 => self.stats.tables_0_15 = 1,
+            16..=31 => self.stats.tables_16_31 = 1,
+            32..=63 => self.stats.tables_32_63 = 1,
+            64..=127 => self.stats.tables_64_127 = 1,
+            128..=255 => self.stats.tables_128_255 = 1,
+            _ => self.stats.tables_256_plus = 1,
+        }
+        let mut group_start = 0usize;
+        while group_start < self.entries.len() {
+            let diagonal = self.entries[group_start].diagonal;
+            let mut group_end = group_start + 1;
+            while group_end < self.entries.len() && self.entries[group_end].diagonal == diagonal {
+                group_end += 1;
             }
-            let mut group_start = 0usize;
-            while group_start < self.entries.len() {
-                let diagonal = self.entries[group_start].diagonal;
-                let mut group_end = group_start + 1;
-                while group_end < self.entries.len() && self.entries[group_end].diagonal == diagonal
-                {
-                    group_end += 1;
-                }
-                let group_len = group_end - group_start;
-                self.stats.unique_diagonals += 1;
-                self.stats.singleton_diagonals += u64::from(group_len == 1);
-                self.stats.max_entries_per_diagonal =
-                    self.stats.max_entries_per_diagonal.max(group_len as u64);
-                group_start = group_end;
-            }
+            let group_len = group_end - group_start;
+            self.stats.unique_diagonals += 1;
+            self.stats.singleton_diagonals += u64::from(group_len == 1);
+            self.stats.max_entries_per_diagonal =
+                self.stats.max_entries_per_diagonal.max(group_len as u64);
+            group_start = group_end;
         }
         self.stats
     }
@@ -599,7 +636,6 @@ mod tests {
             min_lcp: 128,
             capacity: 64,
             activate_entries: 1,
-            collect_stats: true,
         }
     }
 
@@ -697,7 +733,6 @@ mod tests {
             min_lcp: 8,
             capacity: 1_024,
             activate_entries: 1,
-            collect_stats: false,
         });
         for _ in 0..20_000 {
             let p = next() as usize % (text.len() - 1);
