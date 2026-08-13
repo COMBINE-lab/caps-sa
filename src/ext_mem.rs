@@ -43,7 +43,7 @@ use crate::sample_sort;
 /// time without paying the cost of always logging — see
 /// `bench/README.md` "Where AVX-512 helps and where it doesn't" for
 /// how this is used.
-fn profile_log(message: &str) {
+pub(crate) fn profile_log(message: &str) {
     if std::env::var_os("CAPS_SA_PROFILE").is_some() {
         eprintln!("caps-sa profile  {message}");
     }
