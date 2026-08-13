@@ -18,13 +18,17 @@ die() {
 usage() {
     cat <<'EOF'
 Usage:
-  ./bump_and_publish.sh <version> [--publish] [--dry-run]
-  ./bump_and_publish.sh [--publish] [--dry-run] <version>
+  ./bump_and_publish.sh <version> [--publish] [--dry-run] [--replace-unpublished]
+  ./bump_and_publish.sh [--publish] [--dry-run] [--replace-unpublished] <version>
 
 Options:
   --publish  Publish to crates.io after bumping, committing, tagging, and pushing
   --dry-run  Show what would be done without modifying Cargo.toml /
              Cargo.lock, creating commits or tags, pushing, or publishing
+  --replace-unpublished
+             Re-release a version already present in Cargo.toml/Cargo.lock by
+             replacing its existing local/remote Git tag. Use only after
+             independently confirming that the version is not on crates.io.
   -h, --help Show this help message
 EOF
 }
@@ -46,6 +50,7 @@ run() {
 VERSION=""
 PUBLISH=false
 DRY_RUN=false
+REPLACE_UNPUBLISHED=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +59,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            ;;
+        --replace-unpublished)
+            REPLACE_UNPUBLISHED=true
             ;;
         -h|--help)
             usage
@@ -132,11 +140,21 @@ trap cleanup EXIT
 CURRENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
 [[ -n "$CURRENT_VERSION" ]] || die "could not determine current crate version from $ROOT_CARGO"
 
+VERSION_ALREADY_SET=false
 if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
+    VERSION_ALREADY_SET=true
+fi
+
+if [[ "$VERSION_ALREADY_SET" == true && "$REPLACE_UNPUBLISHED" == false ]]; then
     die "crate version is already $VERSION"
 fi
 
+TAG_EXISTS=false
 if git rev-parse "$TAG" >/dev/null 2>&1; then
+    TAG_EXISTS=true
+fi
+
+if [[ "$TAG_EXISTS" == true && "$REPLACE_UNPUBLISHED" == false ]]; then
     die "tag $TAG already exists"
 fi
 
@@ -156,6 +174,9 @@ if [[ "$PUBLISH" == true ]]; then
 else
     echo "Publish               : no"
 fi
+if [[ "$REPLACE_UNPUBLISHED" == true ]]; then
+    echo "Replace unpublished tag: yes"
+fi
 if [[ "$DRY_RUN" == true ]]; then
     echo "Dry-run               : yes"
 else
@@ -173,12 +194,16 @@ CARGO_TARGET_DIR="$TMP_TARGET_DIR" cargo package --offline --allow-dirty --no-ve
 rm -rf "$TMP_TARGET_DIR"
 TMP_TARGET_DIR=""
 
-echo "Updating $ROOT_CARGO"
-echo "  version: $CURRENT_VERSION -> $VERSION"
-echo "Updating $LOCKFILE"
-echo "  ${CRATE_NAME} package entry: $CURRENT_VERSION -> $VERSION"
+if [[ "$VERSION_ALREADY_SET" == true ]]; then
+    echo "$ROOT_CARGO and $LOCKFILE already contain $VERSION"
+else
+    echo "Updating $ROOT_CARGO"
+    echo "  version: $CURRENT_VERSION -> $VERSION"
+    echo "Updating $LOCKFILE"
+    echo "  ${CRATE_NAME} package entry: $CURRENT_VERSION -> $VERSION"
+fi
 
-if [[ "$DRY_RUN" == false ]]; then
+if [[ "$DRY_RUN" == false && "$VERSION_ALREADY_SET" == false ]]; then
     MANIFEST_BACKUP="$(mktemp "${TMPDIR:-/tmp}/caps-sa-Cargo.toml.XXXXXX")"
     LOCKFILE_BACKUP="$(mktemp "${TMPDIR:-/tmp}/caps-sa-Cargo.lock.XXXXXX")"
     cp "$ROOT_CARGO" "$MANIFEST_BACKUP"
@@ -199,16 +224,21 @@ if [[ "$DRY_RUN" == false ]]; then
     rm -f "${LOCKFILE}.bak"
 
     MANIFEST_UPDATED=true
-else
+elif [[ "$DRY_RUN" == true && "$VERSION_ALREADY_SET" == false ]]; then
     echo "Dry-run: would rewrite $ROOT_CARGO and $LOCKFILE"
 fi
 
-if [[ "$DRY_RUN" == false ]]; then
+if [[ "$DRY_RUN" == false && "$VERSION_ALREADY_SET" == false ]]; then
     UPDATED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_CARGO" | head -1)"
     UPDATED_LOCK_VERSION="$(sed -n "/^name = \"${CRATE_NAME}\"$/,/^dependencies = \\[$/s/^version = \"\(.*\)\"/\1/p" "$LOCKFILE" | head -1)"
 
     [[ "$UPDATED_VERSION" == "$VERSION" ]] || die "crate version update failed"
     [[ "$UPDATED_LOCK_VERSION" == "$VERSION" ]] || die "lockfile version update failed"
+fi
+
+if [[ "$VERSION_ALREADY_SET" == true ]]; then
+    CURRENT_LOCK_VERSION="$(sed -n "/^name = \"${CRATE_NAME}\"$/,/^dependencies = \\[$/s/^version = \"\(.*\)\"/\1/p" "$LOCKFILE" | head -1)"
+    [[ "$CURRENT_LOCK_VERSION" == "$VERSION" ]] || die "crate is $VERSION but lockfile entry is $CURRENT_LOCK_VERSION"
 fi
 
 echo
@@ -223,11 +253,24 @@ else
     TMP_TARGET_DIR=""
 fi
 
-run git add "$ROOT_CARGO" "$LOCKFILE"
-run git commit -m "chore(release): bump ${CRATE_NAME} to v${VERSION}"
+if [[ "$VERSION_ALREADY_SET" == false ]]; then
+    run git add "$ROOT_CARGO" "$LOCKFILE"
+    run git commit -m "chore(release): bump ${CRATE_NAME} to v${VERSION}"
 
-if [[ "$DRY_RUN" == false ]]; then
-    COMMIT_CREATED=true
+    if [[ "$DRY_RUN" == false ]]; then
+        COMMIT_CREATED=true
+    fi
+else
+    echo "Using existing $VERSION release commit at $(git rev-parse --short HEAD)"
+fi
+
+if [[ "$REPLACE_UNPUBLISHED" == true && "$TAG_EXISTS" == true ]]; then
+    run git tag -d "$TAG"
+    if [[ "$DRY_RUN" == true ]]; then
+        print_cmd git push origin --delete "$TAG"
+    elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+        run git push origin --delete "$TAG"
+    fi
 fi
 
 run git tag -a "$TAG" -m "Release ${VERSION}"
