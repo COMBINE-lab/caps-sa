@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use std::process;
 use std::time::Instant;
 
-use caps_sa::{ExtMemOpts, build_ext_mem, build_in_memory, build_in_memory_sample_sort};
+use caps_sa::{
+    ExtMemOpts, build_ext_mem, build_ext_mem_for_filter, build_in_memory,
+    build_in_memory_sample_sort, verify_sa,
+};
 
 struct Args {
     input: PathBuf,
@@ -27,6 +30,8 @@ struct Args {
     in_mem_ss: bool,
     subproblem_count: usize,
     threads: Option<usize>,
+    verify: bool,
+    filter_acgt: bool,
 }
 
 fn parse_args() -> Args {
@@ -36,6 +41,8 @@ fn parse_args() -> Args {
     let mut in_mem_ss = false;
     let mut subproblem_count: usize = 0;
     let mut threads: Option<usize> = None;
+    let mut verify = false;
+    let mut filter_acgt = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -45,6 +52,17 @@ fn parse_args() -> Args {
             }
             "--in-mem-ss" => {
                 in_mem_ss = true;
+                i += 1;
+            }
+            "--verify" => {
+                verify = true;
+                i += 1;
+            }
+            // Sort only suffixes starting at a symbol below 4, the shape a
+            // STAR-style genome index uses: A/C/G/T participate, N and
+            // spacers do not.
+            "--filter-acgt" => {
+                filter_acgt = true;
                 i += 1;
             }
             "--subproblem-count" => {
@@ -64,7 +82,7 @@ fn parse_args() -> Args {
             "--help" | "-h" => {
                 eprintln!(
                     "usage: caps_sa <input> <output> [--ext-mem | --in-mem-ss] \
-                     [--subproblem-count N] [--threads N]"
+                     [--subproblem-count N] [--threads N] [--verify]"
                 );
                 process::exit(0);
             }
@@ -88,6 +106,24 @@ fn parse_args() -> Args {
         in_mem_ss,
         subproblem_count,
         threads,
+        verify,
+        filter_acgt,
+    }
+}
+
+/// Independently check the built suffix array in O(n). Off by default so it
+/// never contaminates a timing run; the check is reported separately.
+fn maybe_verify<I: caps_sa::Index>(enabled: bool, text: &[u8], sa: &[I]) {
+    if !enabled {
+        return;
+    }
+    let t = Instant::now();
+    match verify_sa(text, sa) {
+        Ok(()) => eprintln!("verify: OK in {:.3}s", t.elapsed().as_secs_f64()),
+        Err(e) => {
+            eprintln!("verify: FAILED: {e}");
+            process::exit(1);
+        }
     }
 }
 
@@ -124,6 +160,7 @@ fn main() -> std::io::Result<()> {
         let sa: Vec<u32> = build_in_memory(&text);
         build_elapsed = build_start.elapsed();
         n_entries = sa.len();
+        maybe_verify(args.verify, &text, &sa);
         eprintln!(
             "build: mode=in-mem(u32) n={n_entries} entries in {:.3}s",
             build_elapsed.as_secs_f64()
@@ -147,7 +184,18 @@ fn main() -> std::io::Result<()> {
         let mut count = 0usize;
         let mode_label = if args.ext_mem { "ext-mem" } else { "in-mem-ss" };
         let build_start = Instant::now();
-        if args.ext_mem {
+        if args.ext_mem && args.filter_acgt {
+            build_ext_mem_for_filter(
+                &text,
+                |p| text[p as usize] < 4,
+                &opts,
+                |pos| {
+                    count += 1;
+                    writer.borrow_mut().write_all(&pos.to_le_bytes())?;
+                    Ok(())
+                },
+            )?;
+        } else if args.ext_mem {
             build_ext_mem(&text, &opts, |pos| {
                 count += 1;
                 writer.borrow_mut().write_all(&pos.to_le_bytes())?;
@@ -174,6 +222,7 @@ fn main() -> std::io::Result<()> {
         let sa: Vec<u64> = build_in_memory(&text);
         build_elapsed = build_start.elapsed();
         n_entries = sa.len();
+        maybe_verify(args.verify, &text, &sa);
         eprintln!(
             "build: mode=in-mem(u64) n={n_entries} entries in {:.3}s",
             build_elapsed.as_secs_f64()

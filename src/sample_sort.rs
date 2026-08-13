@@ -35,6 +35,7 @@ use crate::lcp::{LcpDispatch, Symbol};
 use crate::lcp_memo::GeometricMemo;
 use crate::limits::{LimitProvider, PlainText};
 use rayon::join;
+use rayon::prelude::*;
 
 /// How many merge steps ahead the text prefetch runs. Large enough to cover a
 /// DRAM round trip at the merge's step rate, small enough that the prefetched
@@ -74,12 +75,36 @@ pub struct Opts {
     /// caller's text doesn't guarantee comparisons terminate via sentinels
     /// within a known window.
     pub max_context: usize,
+
+    /// Peak extra bytes `*_for_positions` may spend to sort a *subset* by
+    /// building the whole suffix array and filtering it.
+    ///
+    /// Prefix doubling cannot be restricted to a subset: a round compares
+    /// `rank[p + d]`, and that successor is generally outside the subset, so
+    /// ranks have to exist for every position in the text. Building the whole
+    /// array and filtering it in one `O(n)` pass sidesteps that, and is much
+    /// faster when the subset is a real fraction of the text — but it is a
+    /// resource decision, not a speed one: the arrays it needs are sized by
+    /// the *text*, not by the subset.
+    ///
+    /// `None`, the default, never makes that trade: subsets always take the
+    /// merge kernel, whose footprint stays proportional to the subset.
+    /// `Some(budget)` allows it when the estimated extra footprint fits, which
+    /// is `n * (3 * size_of::<I>() + 9)` bytes: three index-wide arrays for
+    /// the suffix array, the ranks and the round scratch, eight bytes of key
+    /// per position, and a one-byte membership flag.
+    ///
+    /// Set it from what the caller can actually spare. It was previously a
+    /// silent `subset >= text / 8` rule, which made a large allocation on the
+    /// caller's behalf without telling them.
+    pub subset_full_sa_budget: Option<usize>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
         Self {
             max_context: usize::MAX,
+            subset_full_sa_budget: None,
         }
     }
 }
@@ -121,9 +146,121 @@ where
     I: Index,
     L: LimitProvider,
 {
+    if let Some(sa) = try_doubling_fast_path::<S, I, L>(text, lp, opts) {
+        return sa;
+    }
     let n = text.len();
     let positions: Vec<I> = (0..n).map(I::from_usize).collect();
     build_in_memory_for_positions_with(text, positions, lp, opts)
+}
+
+/// Route a whole-text byte build through [`crate::radix`]'s radix-seeded
+/// prefix doubling, which is dramatically faster on real genomic input, or
+/// return `None` to fall back to the CaPS-SA merge kernel.
+///
+/// Every condition below is a soundness requirement, not a heuristic. The
+/// doubling path implements exactly one comparator — plain lexicographic over
+/// bytes with shorter-is-smaller and no context bound — so anything that can
+/// change the comparator has to decline.
+///
+/// * `max_context` must be unbounded. With a finite bound the merge's
+///   comparator stops being lexicographic: once a scan hits the cap it falls
+///   through to [`LimitProvider::boundary_order`], which compares *lengths*.
+/// * `lp` must report [`plain_lex_len`][LimitProvider::plain_lex_len]. That
+///   rules out `SegmentedText`, whose LCP scans stop at segment boundaries,
+///   and any custom `boundary_order` such as STAR's spacer-as-largest.
+/// * `S` must be exactly `u8`. Wider symbols are excluded because packing
+///   them into an order-preserving key is endianness-dependent: for `u16` on
+///   a little-endian host, `0x0100 > 0x0001` as values but their byte views
+///   compare the other way. The rest of the crate is immune to this only
+///   because [`LcpDispatch`] resolves *equality* over bytes and recovers
+///   ordering through `S: Ord`.
+fn try_doubling_fast_path<S, I, L>(text: &[S], lp: &L, opts: &Opts) -> Option<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    if opts.max_context != usize::MAX {
+        return None;
+    }
+    if lp.plain_lex_len() != Some(text.len()) {
+        return None;
+    }
+    if std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>() {
+        return None;
+    }
+    // SAFETY: `S` is `u8` (just checked by `TypeId`, and `Symbol: 'static`
+    // so the comparison is exact), hence `&[S]` and `&[u8]` have identical
+    // layout, length and validity.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, text.len()) };
+    Some(crate::radix::build_sa(bytes))
+}
+
+/// Sort a *subset* of positions by building the full suffix array with the
+/// doubling path and then keeping only the requested positions.
+///
+/// Doubling cannot be restricted to a subset directly: a round compares
+/// `rank[p + d]`, and that successor is generally not in the subset, so ranks
+/// have to be defined for every position in the text. Building the whole array
+/// and filtering it sidesteps that, and the filter is a single `O(n)` pass
+/// because the full SA is already in the right order.
+///
+/// Gated on [`Opts::subset_full_sa_budget`], which defaults to `None` and so
+/// declines. The arrays this needs are sized by the *text*, not by the subset,
+/// so it is a resource decision the caller has to make: a small subset of a
+/// large text can cost far more this way than sorting it directly would. That
+/// is a budget, not a correctness condition — unlike the guards in
+/// [`try_doubling_fast_path`].
+///
+/// Also declines on duplicate or out-of-range positions, which a
+/// membership filter cannot reproduce faithfully.
+fn try_doubling_subset<S, I, L>(text: &[S], positions: &[I], lp: &L, opts: &Opts) -> Option<Vec<I>>
+where
+    S: Symbol,
+    I: Index,
+    L: LimitProvider,
+{
+    let n = text.len();
+    let m = positions.len();
+    if m == 0 {
+        return None;
+    }
+    // Explicitly budgeted: the arrays below are sized by the text, not by the
+    // subset, so a small subset of a large text can cost far more than
+    // sorting it directly would.
+    let estimate = n.checked_mul(3 * size_of::<I>() + 9)?;
+    if estimate > opts.subset_full_sa_budget? {
+        return None;
+    }
+    if opts.max_context != usize::MAX
+        || lp.plain_lex_len() != Some(n)
+        || std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>()
+    {
+        return None;
+    }
+
+    let mut wanted = vec![false; n];
+    for p in positions {
+        let p = p.to_usize();
+        // Out of range, or the same position twice: a membership filter emits
+        // each position at most once, so it cannot reproduce either faithfully.
+        if p >= n || wanted[p] {
+            return None;
+        }
+        wanted[p] = true;
+    }
+
+    // SAFETY: `S` is `u8`, so `&[S]` and `&[u8]` have identical layout.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(text.as_ptr() as *const u8, n) };
+    let full: Vec<I> = crate::radix::build_sa(bytes);
+    let kept: Vec<I> = full
+        .into_par_iter()
+        .filter(|p| wanted[p.to_usize()])
+        .collect();
+    debug_assert_eq!(kept.len(), m);
+    Some(kept)
 }
 
 /// Sort the caller-supplied `positions` by the lexicographic order of
@@ -176,6 +313,10 @@ where
     I: Index,
     L: LimitProvider,
 {
+    if let Some(sa) = try_doubling_subset::<S, I, L>(text, &positions, lp, opts) {
+        return sa;
+    }
+
     let n = positions.len();
     if n == 0 {
         return Vec::new();
@@ -765,6 +906,21 @@ mod tests {
         }
     }
 
+    /// `Symbol` is implemented for `i8`, and a one-byte-wide check alone would
+    /// let a signed text through a packer that orders its fields as unsigned:
+    /// `-1` has byte `0xFF`, so it would sort above `1`, inverting the text's
+    /// real order. The fast-path guard demands exactly `u8`, so a signed text
+    /// stays on the merge kernel and keeps signed order.
+    #[test]
+    fn signed_symbol_texts_keep_signed_order() {
+        let text: Vec<i8> = vec![-1, 0, -1, 1, -2, 0, 1, -1, 0, -2, 1, 0];
+        let got: Vec<u32> = build_in_memory(&text);
+        let dispatch = LcpDispatch::detect();
+        let mut want: Vec<u32> = (0..text.len() as u32).collect();
+        want.sort_by(|&a, &b| dispatch.suffix_cmp(&text, a as usize, b as usize, usize::MAX));
+        assert_eq!(got, want, "an i8 text must sort by signed order");
+    }
+
     #[test]
     fn suffix_array_respects_finite_max_context() {
         use rand::{RngExt, SeedableRng};
@@ -776,6 +932,7 @@ mod tests {
                 let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..3u8)).collect();
                 let opts = Opts {
                     max_context: max_ctx,
+                    ..Opts::default()
                 };
                 let got: Vec<u32> = build_in_memory_with_opts(&text, &opts);
                 let mut want: Vec<u32> = (0..n as u32).collect();
@@ -852,6 +1009,90 @@ mod tests {
         want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
         let got = build_in_memory_for_positions(text, positions);
         assert_eq!(got, want);
+    }
+
+    /// Duplicated positions must survive: the output is a permutation of the
+    /// *input* multiset, which a membership filter cannot reproduce, so the
+    /// subset fast path has to decline and let the merge kernel run.
+    #[test]
+    fn for_positions_with_duplicates_keeps_multiplicity() {
+        let text = b"mississippi";
+        let positions: Vec<u32> = vec![0, 1, 1, 4, 4, 4, 7];
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(text, positions);
+        assert_eq!(got, want);
+    }
+
+    /// A subset far smaller than the text takes the merge kernel, since
+    /// building the whole suffix array to throw nearly all of it away would
+    /// cost more than sorting the subset directly. Correctness is identical
+    /// either way; this pins the behaviour.
+    #[test]
+    fn for_positions_tiny_subset_of_large_text() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5AB0);
+        let text: Vec<u8> = (0..20_000).map(|_| rng.random_range(0..4u8)).collect();
+        let positions: Vec<u32> = (0..20_000u32).step_by(500).collect();
+        let mut want = positions.clone();
+        want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+        let got = build_in_memory_for_positions(&text, positions);
+        assert_eq!(got, want);
+    }
+
+    /// Positions out of range are the caller's error, but the subset fast path
+    /// must not turn them into a silently wrong answer or an unsafe index.
+    #[test]
+    #[should_panic]
+    fn for_positions_out_of_range_still_panics() {
+        let text = b"banana";
+        let positions: Vec<u32> = vec![0, 1, 99];
+        let _ = build_in_memory_for_positions(text, positions);
+    }
+
+    /// The subset full-SA path is now opt-in through a byte budget. Check both
+    /// that it is correct when allowed, and that it is actually declined when
+    /// the budget is too small to cover its footprint.
+    #[test]
+    fn for_positions_budget_gates_the_full_sa_path() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xB0D6E7);
+        for &n in &[64usize, 500, 4000] {
+            let text: Vec<u8> = (0..n).map(|_| rng.random_range(0..4u8)).collect();
+            let positions: Vec<u32> = (0..n as u32).filter(|p| p % 3 != 0).collect();
+            let mut want = positions.clone();
+            want.sort_by(|&a, &b| text[a as usize..].cmp(&text[b as usize..]));
+
+            // Estimate the path advertises: n * (3 * 4 + 9) for `I = u32`.
+            let need = n * (3 * size_of::<u32>() + 9);
+
+            let generous = Opts {
+                subset_full_sa_budget: Some(need),
+                ..Opts::default()
+            };
+            assert_eq!(
+                build_in_memory_for_positions_with_opts(&text, positions.clone(), &generous),
+                want,
+                "budgeted path wrong at n={n}"
+            );
+
+            let tight = Opts {
+                subset_full_sa_budget: Some(need - 1),
+                ..Opts::default()
+            };
+            assert_eq!(
+                build_in_memory_for_positions_with_opts(&text, positions.clone(), &tight),
+                want,
+                "declined path wrong at n={n}"
+            );
+
+            // Default declines outright.
+            assert_eq!(
+                build_in_memory_for_positions(&text, positions.clone()),
+                want,
+                "default path wrong at n={n}"
+            );
+        }
     }
 
     #[test]
