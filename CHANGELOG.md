@@ -2,6 +2,33 @@
 
 Release notes for the [`caps-sa`](https://crates.io/crates/caps-sa) crate.
 
+## [v0.7.0](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.7.0) — 2026-08-13
+
+### Added
+
+- Opt-in geometric LCP memoization for the external-memory phase-4 merge.
+  `LcpMemoizationPolicy::Geometric` reuses exact long-LCP intervals through
+  bounded, partition-local tables; short comparisons run directly and tables
+  activate lazily. The public `GeometricMemoizationConfig` exposes the probe,
+  admission, activation, and per-partition capacity thresholds. Memoization is
+  disabled by default.
+- Environment and builder controls for selecting and profiling memoization,
+  including `CAPS_SA_GEOMETRIC_MEMO` and the `CAPS_SA_MEMO_*` tunables.
+- Cross-platform CI for debug/release tests, documentation, Clippy, formatting,
+  and Rust 1.89 MSRV coverage.
+
+### Changed
+
+- Phase 1 of the external-memory path now fuses subarray sorting and partition
+  distribution, reducing intermediate work and temporary storage.
+- Merge kernels prefetch upcoming text positions on supported targets.
+- Debug and test builds validate complete LCP arrays at construction boundaries.
+
+### Compatibility
+
+This release adds public fields to `ExtMemOpts`, which can break struct-literal
+construction without `..Default::default()`. Version bumps `0.6.1 → 0.7.0`.
+
 ## [v0.6.1](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.6.1) — 2026-06-01
 
 ### Added
