@@ -25,13 +25,14 @@
 //!
 //! Reports the wall time of the caps-sa build alone, plus the emitted
 //! entry count and an order-sensitive checksum of the emitted position
-//! stream. The checksum is the correctness gate when comparing
-//! optimization variants: identical checksum, identical suffix array.
+//! stream. Matching counts and checksums are a strong regression signal,
+//! not a proof of equality; use an exact stream comparison when validating
+//! a change before release.
 
 use std::cmp::Ordering;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
@@ -67,6 +68,20 @@ struct Args {
     work_dir: Option<PathBuf>,
 }
 
+const USAGE: &str = "usage: rustar_segmented_bench FIXTURE_DIR [--threads N] \
+                     [--repeat N] [--in-mem] [--work-dir DIR]";
+
+fn usage_error(message: &str) -> ! {
+    eprintln!("error: {message}\n{USAGE}");
+    process::exit(2);
+}
+
+fn option_value<'a>(argv: &'a [String], i: usize, option: &str) -> &'a str {
+    argv.get(i + 1)
+        .map(String::as_str)
+        .unwrap_or_else(|| usage_error(&format!("{option} requires a value")))
+}
+
 fn parse_args() -> Args {
     let argv: Vec<String> = env::args().collect();
     let mut positional: Vec<String> = Vec::new();
@@ -78,11 +93,22 @@ fn parse_args() -> Args {
     while i < argv.len() {
         match argv[i].as_str() {
             "--threads" => {
-                threads = Some(argv[i + 1].parse().expect("--threads expects an integer"));
+                let value = option_value(&argv, i, "--threads")
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| usage_error("--threads expects a positive integer"));
+                if value == 0 {
+                    usage_error("--threads expects a positive integer");
+                }
+                threads = Some(value);
                 i += 2;
             }
             "--repeat" => {
-                repeat = argv[i + 1].parse().expect("--repeat expects an integer");
+                repeat = option_value(&argv, i, "--repeat")
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| usage_error("--repeat expects a positive integer"));
+                if repeat == 0 {
+                    usage_error("--repeat expects a positive integer");
+                }
                 i += 2;
             }
             "--in-mem" => {
@@ -90,15 +116,15 @@ fn parse_args() -> Args {
                 i += 1;
             }
             "--work-dir" => {
-                work_dir = Some(PathBuf::from(&argv[i + 1]));
+                work_dir = Some(PathBuf::from(option_value(&argv, i, "--work-dir")));
                 i += 2;
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "usage: rustar_segmented_bench FIXTURE_DIR [--threads N] \
-                     [--repeat N] [--in-mem] [--work-dir DIR]"
-                );
+                eprintln!("{USAGE}");
                 process::exit(0);
+            }
+            option if option.starts_with('-') => {
+                usage_error(&format!("unknown option: {option}"));
             }
             _ => {
                 positional.push(argv[i].clone());
@@ -107,8 +133,7 @@ fn parse_args() -> Args {
         }
     }
     if positional.len() != 1 {
-        eprintln!("error: expected 1 positional arg (fixture dir)");
-        process::exit(2);
+        usage_error("expected exactly one fixture directory");
     }
     Args {
         fixture: PathBuf::from(&positional[0]),
@@ -119,7 +144,7 @@ fn parse_args() -> Args {
     }
 }
 
-fn read_ends(path: &PathBuf) -> Vec<u64> {
+fn read_ends(path: &Path) -> Vec<u64> {
     let raw = fs::read(path).expect("read ends.u64");
     assert!(
         raw.len().is_multiple_of(8),
@@ -143,6 +168,11 @@ fn main() {
     let text = fs::read(args.fixture.join("text.bin")).expect("read text.bin");
     let ends = read_ends(&args.fixture.join("ends.u64"));
     let n = text.len();
+    assert!(n > 0, "text.bin must not be empty");
+    assert!(
+        text.iter().all(|&symbol| symbol <= 5),
+        "text.bin contains a symbol outside ruSTAR's encoded alphabet 0..=5"
+    );
     assert_eq!(
         ends.last().copied(),
         Some(n as u64),
@@ -164,17 +194,16 @@ fn main() {
     };
 
     for round in 0..args.repeat {
-        // Order-sensitive checksum: any reordering of the emitted
-        // stream changes it, so two variants agreeing here produced
-        // the same suffix array.
+        // A wide, order-sensitive checksum is a convenient regression signal.
+        // It is not a proof of equality; release validation should compare the
+        // emitted position streams directly.
         let mut count: u64 = 0;
-        let mut checksum: u64 = 0;
+        let mut checksum = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58du128;
         let mut emit = |p: u64| -> std::io::Result<()> {
             count += 1;
-            checksum = checksum
-                .rotate_left(7)
-                .wrapping_add(p.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-                .wrapping_add(count);
+            checksum ^= p as u128;
+            checksum = checksum.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+            checksum ^= (p as u128) << 64;
             Ok(())
         };
 
@@ -203,7 +232,7 @@ fn main() {
         let elapsed = t0.elapsed();
 
         println!(
-            "round {round}: {:.3} s  entries={count}  checksum=0x{checksum:016x}",
+            "round {round}: {:.3} s  entries={count}  checksum=0x{checksum:032x}",
             elapsed.as_secs_f64()
         );
     }

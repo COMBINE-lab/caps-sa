@@ -28,6 +28,60 @@ The harness runs four configurations on the same input:
 
 It reports wall time and peak RSS via `/usr/bin/time`.
 
+## Replaying the ruSTAR segmented workload
+
+`examples/rustar_segmented_bench.rs` measures the caps-sa call shape used by
+ruSTAR without timing the rest of `genomeGenerate`. It preserves the encoded
+genome plus splice-junction text, segment limits, STAR boundary ordering, and
+ACGT-start filter.
+
+The example reads a fixture directory containing:
+
+- `text.bin`: ruSTAR's complete `u8` text immediately before suffix-array
+  construction (`A=0`, `C=1`, `G=2`, `T=3`, `N=4`, spacer `=5`);
+- `ends.u64`: the strictly increasing cumulative segment ends as little-endian
+  `u64` values, with the final value equal to `text.bin`'s length.
+
+To create a fixture from a particular rustar-aligner revision, temporarily add
+the following immediately after `ends_orig` is computed in
+`dispatch_caps_sa_segmented` and before it is moved into `SegmentedText`:
+
+```rust,ignore
+let fixture_dir = std::path::Path::new("/path/to/fixture");
+std::fs::create_dir_all(fixture_dir)?;
+std::fs::write(fixture_dir.join("text.bin"), original)?;
+
+let mut ends_file = std::io::BufWriter::new(std::fs::File::create(
+    fixture_dir.join("ends.u64"),
+)?);
+for &end in &ends_orig {
+    std::io::Write::write_all(&mut ends_file, &end.to_le_bytes())?;
+}
+std::io::Write::flush(&mut ends_file)?;
+```
+
+Run the normal rustar-aligner `genomeGenerate` command with the desired FASTA,
+annotation, and `sjdbOverhang`; the dump therefore includes rustar-aligner's
+actual parsing, junction preparation and deduplication, padding, junction
+append, and forward/reverse-complement layout. Remove the temporary dump after
+creating the fixture.
+
+Then build and run the standalone replay:
+
+```sh
+cargo build --release --example rustar_segmented_bench
+
+CAPS_SA_PROFILE=1 taskset -c 0-31 \
+  target/release/examples/rustar_segmented_bench /path/to/fixture \
+  --threads 32 --repeat 3 --work-dir /path/to/fast/temp
+```
+
+Omit `taskset` on platforms where it is unavailable. Use `--in-mem` only for
+fixtures that fit comfortably in RAM. Counts and 128-bit order-sensitive
+checksums are useful regression signals, but hashes are not proofs of equality;
+release validation should compare emitted position streams exactly or use a
+direct suffix comparator on a smaller fixture.
+
 ## Results
 
 Machine: 64-core x86_64 Linux node, 1 socket, AVX2 enabled.
