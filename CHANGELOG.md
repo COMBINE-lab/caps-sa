@@ -2,6 +2,39 @@
 
 Release notes for the [`caps-sa`](https://crates.io/crates/caps-sa) crate.
 
+## Unreleased
+
+### Added
+
+- Opt-in `PackedPrefixSeedPolicy` for seeding external-memory phase-1 sorts
+  with segment-aware fixed-depth `u64` prefix keys. The default is
+  `Disabled`; `DenseAlphabetOnly` never allocates a second text-sized buffer,
+  while `remap(max_extra_bytes)` explicitly bounds an order-preserving ranked
+  copy for gapped byte alphabets.
+- `LimitProvider::boundary_rank()` and `BoundaryRank` let a provider declare
+  whether segment ends sort below or above real symbols. This semantic
+  capability is separate from the `ExtMemOpts` activation policy and defaults
+  to `None` for custom providers.
+
+### Changed
+
+- Eligible packed-prefix builds resolve most phase-1 comparisons from one
+  segment-bounded key, use exact key-derived LCPs between runs, and invoke the
+  full comparator only inside equal-key groups. On the complete 6.56-billion-
+  symbol ruSTAR GRCh38 + GENCODE v50 fixture, the seed reduced phase 1 from
+  49.038 to 12.204 seconds and the memoized build from 171.205 to 134.618
+  seconds (21.4%) at 32 physical cores, with identical output.
+- Packed-prefix eligibility is checked before alphabet scanning. Non-`u8`
+  symbols, finite contexts, providers without a representable boundary order,
+  and over-budget remaps fall back to the existing comparison sort.
+
+### Memory
+
+- The packed seed holds one `(u64, I)` record per selected suffix in each
+  active phase-1 task. On the annotated GRCh38 `u64` run this added 366-376
+  MiB (about 4.1%) peak RSS. Callers must opt in so this bounded worker scratch
+  and any explicitly budgeted ranked-text copy are never imposed silently.
+
 ## [v0.7.0](https://github.com/COMBINE-lab/caps-sa/releases/tag/v0.7.0) — 2026-08-13
 
 ### Added

@@ -73,15 +73,45 @@ build_ext_mem(&text, &opts, |sa_pos| {
 })?;
 ```
 
+Byte-valued workloads can optionally seed each external-memory phase-1 sort
+with a fixed-depth packed prefix key. Pre-encoded dense alphabets use no
+text-sized copy:
+
+```rust
+use caps_sa::{ExtMemOpts, PackedPrefixSeedPolicy};
+
+let opts = ExtMemOpts::default()
+    .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
+```
+
+The seed requires unbounded comparisons and a `LimitProvider` whose
+`boundary_rank()` describes how segment ends sort. `PlainText` and
+`SegmentedText` provide the standard shorter-first declaration; custom
+comparators such as STAR's longer-first convention declare their own. Other
+symbol types, finite contexts, unsupported boundary semantics, and ineligible
+alphabets fall back to the comparison sort.
+
+The policy is disabled by default because each active task additionally holds
+one `(u64, I)` key record per selected suffix in its subarray. A gapped byte
+alphabet can use `PackedPrefixSeedPolicy::remap(max_extra_bytes)`, which makes
+the possible text-sized ranked copy explicit and declines it when the budget
+is insufficient.
+
 Inputs with many repeated long contexts can opt into bounded geometric LCP
 memoization during the final partition merges:
 
 ```rust
-use caps_sa::LcpMemoizationPolicy;
+use caps_sa::{LcpMemoizationPolicy, PackedPrefixSeedPolicy};
 
 let opts = ExtMemOpts::default()
+    .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly)
     .lcp_memoization(LcpMemoizationPolicy::geometric());
 ```
+
+The two policies act on different phases and compose on the ruSTAR workload:
+the current 32-core GRCh38 + GENCODE v50 A/B measured 171.205 seconds with
+memoization alone and 134.618 seconds with both enabled (21.4% faster), with
+identical output.
 
 The direct path remains the default: memoization pays only when the workload
 contains enough repeated long contexts. See the

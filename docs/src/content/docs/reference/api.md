@@ -80,12 +80,63 @@ Sample-sort / external-memory tuning. `Default::default()` is tuned for genome-s
 | `work_dir` | `std::env::temp_dir()` | Directory for the temporary bucket files. |
 | `physical_file_count` | `0` → auto | Physical temp files in the bucket pool. `0` picks one per worker; the `p` logical partition buckets collapse onto this pool. |
 | `ordered_phase4_emit` | `false` | Opt into the bounded ordered emitter (lower transient residency on skewed inputs, slightly slower on balanced ones). |
+| `packed_prefix_seed` | `Disabled` | Optional fixed-depth packed-key seed for external-memory phase 1. `DenseAlphabetOnly` adds no text-sized copy. |
 | `lcp_memoization` | `Disabled` | Optional exact long-LCP reuse. `LcpMemoizationPolicy::geometric()` selects the GRCh38-tuned defaults. |
 
 `ExtMemOpts` is non-exhaustive. Construct it with `default()` or `from_env()`
 and use its builder methods rather than an external struct literal.
 
 The `CAPS_SA_N_PHYS` environment variable overrides `physical_file_count` for one-off runs.
+
+#### Packed-prefix phase-1 seed
+
+Packed-prefix seeding is an external-memory-only, opt-in acceleration for byte
+texts. The safe mode expects symbols already encoded as the dense range
+`0..alphabet_size`:
+
+```rust
+use caps_sa::{ExtMemOpts, PackedPrefixSeedPolicy};
+
+let opts = ExtMemOpts::default()
+    .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
+```
+
+Each selected suffix receives a segment-bounded `u64` key. The key decides
+order for prefixes that differ within its fixed depth; equal-key groups retain
+the complete LCP merge comparator. The mode requires:
+
+- symbol type exactly `u8`;
+- `max_context == usize::MAX`;
+- a `LimitProvider::boundary_rank()` declaration; and
+- an alphabet with room for one reserved boundary code.
+
+`PlainText` and `SegmentedText` declare `BoundaryRank::ShorterFirst`. A custom
+STAR-compatible provider whose `boundary_order` places an ending suffix above
+a continuing suffix declares `BoundaryRank::LongerFirst`:
+
+```rust
+fn boundary_rank(&self) -> Option<caps_sa::BoundaryRank> {
+    Some(caps_sa::BoundaryRank::LongerFirst)
+}
+```
+
+`boundary_rank()` describes comparator semantics; it does not activate the
+optimization. Unsupported builds fall back without changing output.
+
+For a gapped byte alphabet,
+`PackedPrefixSeedPolicy::remap(max_extra_bytes)` permits an order-preserving
+dense copy only if its exact text-length allocation fits the supplied budget.
+Allocation failure or an insufficient budget falls back to comparison sort.
+Dense inputs avoid the copy under both policies.
+
+Phase 1 additionally holds one `(u64, I)` record per selected suffix in each
+active subarray. For the 6.18-billion-position ruSTAR `u64` construction at
+8,192 partitions and 32 workers, that is about 11.5 MiB per active worker;
+measured peak RSS increased by 366–376 MiB (about 4.1%).
+
+`ExtMemOpts::from_env()` recognizes `CAPS_SA_PACKED_PREFIX_SEED` for the
+dense-only policy and `CAPS_SA_PACKED_PREFIX_REMAP_BYTES` for an explicit
+remap budget. The latter takes precedence when both are set.
 
 #### Geometric LCP memoization
 

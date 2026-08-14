@@ -20,7 +20,8 @@
 //!
 //! ```text
 //! cargo run --release --example rustar_segmented_bench -- FIXTURE_DIR \
-//!     [--threads N] [--repeat N] [--in-mem] [--work-dir DIR]
+//!     [--threads N] [--repeat N] [--in-mem] [--work-dir DIR] \
+//!     [--packed-prefix-seed | --no-packed-prefix-seed] [--no-boundary-rank]
 //! ```
 //!
 //! Reports the wall time of the caps-sa build alone, plus the emitted
@@ -37,8 +38,8 @@ use std::process;
 use std::time::Instant;
 
 use caps_sa::{
-    ExtMemOpts, LimitProvider, Opts, SegmentedText, build_ext_mem_for_filter_with,
-    build_in_memory_for_positions_with,
+    ExtMemOpts, LimitProvider, Opts, PackedPrefixSeedPolicy, SegmentedText,
+    build_ext_mem_for_filter_with, build_in_memory_for_positions_with,
 };
 
 /// rustar-aligner's `StarSegmentedText`: `SegmentedText` limits with
@@ -46,6 +47,7 @@ use caps_sa::{
 /// ascending position on ties).
 struct StarSegmentedText {
     inner: SegmentedText,
+    boundary_rank: Option<caps_sa::BoundaryRank>,
 }
 
 impl LimitProvider for StarSegmentedText {
@@ -58,6 +60,13 @@ impl LimitProvider for StarSegmentedText {
     fn boundary_order(&self, p_a: usize, lim_a: usize, p_b: usize, lim_b: usize) -> Ordering {
         lim_b.cmp(&lim_a).then(p_a.cmp(&p_b))
     }
+
+    /// Declare that this comparator's boundary convention is representable by
+    /// packed keys. Activation remains a separate `ExtMemOpts` policy below.
+    #[inline]
+    fn boundary_rank(&self) -> Option<caps_sa::BoundaryRank> {
+        self.boundary_rank
+    }
 }
 
 struct Args {
@@ -66,10 +75,14 @@ struct Args {
     repeat: usize,
     in_mem: bool,
     work_dir: Option<PathBuf>,
+    packed_prefix_seed: Option<bool>,
+    no_boundary_rank: bool,
 }
 
 const USAGE: &str = "usage: rustar_segmented_bench FIXTURE_DIR [--threads N] \
-                     [--repeat N] [--in-mem] [--work-dir DIR]";
+                     [--repeat N] [--in-mem] [--work-dir DIR] \
+                     [--packed-prefix-seed | --no-packed-prefix-seed] \
+                     [--no-boundary-rank]";
 
 fn usage_error(message: &str) -> ! {
     eprintln!("error: {message}\n{USAGE}");
@@ -89,6 +102,8 @@ fn parse_args() -> Args {
     let mut repeat = 1usize;
     let mut in_mem = false;
     let mut work_dir = None;
+    let mut packed_prefix_seed = None;
+    let mut no_boundary_rank = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -119,6 +134,24 @@ fn parse_args() -> Args {
                 work_dir = Some(PathBuf::from(option_value(&argv, i, "--work-dir")));
                 i += 2;
             }
+            "--packed-prefix-seed" => {
+                if packed_prefix_seed.is_some() {
+                    usage_error("packed-prefix policy may be specified only once");
+                }
+                packed_prefix_seed = Some(true);
+                i += 1;
+            }
+            "--no-packed-prefix-seed" => {
+                if packed_prefix_seed.is_some() {
+                    usage_error("packed-prefix policy may be specified only once");
+                }
+                packed_prefix_seed = Some(false);
+                i += 1;
+            }
+            "--no-boundary-rank" => {
+                no_boundary_rank = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 process::exit(0);
@@ -135,12 +168,17 @@ fn parse_args() -> Args {
     if positional.len() != 1 {
         usage_error("expected exactly one fixture directory");
     }
+    if in_mem && (packed_prefix_seed.is_some() || no_boundary_rank) {
+        usage_error("packed-prefix controls apply only to the external-memory path");
+    }
     Args {
         fixture: PathBuf::from(&positional[0]),
         threads,
         repeat,
         in_mem,
         work_dir,
+        packed_prefix_seed,
+        no_boundary_rank,
     }
 }
 
@@ -191,6 +229,7 @@ fn main() {
 
     let lp = StarSegmentedText {
         inner: SegmentedText::from_ends(n, ends),
+        boundary_rank: (!args.no_boundary_rank).then_some(caps_sa::BoundaryRank::LongerFirst),
     };
 
     for round in 0..args.repeat {
@@ -216,6 +255,14 @@ fn main() {
             }
         } else {
             let mut opts = ExtMemOpts::from_env();
+            if let Some(enabled) = args.packed_prefix_seed {
+                let policy = if enabled {
+                    PackedPrefixSeedPolicy::DenseAlphabetOnly
+                } else {
+                    PackedPrefixSeedPolicy::Disabled
+                };
+                opts = opts.packed_prefix_seed(policy);
+            }
             if let Some(dir) = &args.work_dir {
                 opts = opts.work_dir(dir);
             }

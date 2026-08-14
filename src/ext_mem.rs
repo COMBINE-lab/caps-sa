@@ -35,7 +35,8 @@ use crate::lcp::{LcpDispatch, Symbol};
 use crate::lcp_memo::{
     GeometricMemo, GeometricMemoizationConfig, LcpMemoizationPolicy, MemoConfig, MemoStats,
 };
-use crate::limits::{LimitProvider, PlainText};
+use crate::limits::{BoundaryRank, LimitProvider, PlainText};
+use crate::pack::{PackedPrefixSeedPolicy, Packer};
 use crate::sample_sort;
 
 /// Emit a phase-timing line to stderr if `CAPS_SA_PROFILE` is set in
@@ -86,6 +87,11 @@ pub struct ExtMemOpts {
     /// GRCh38 32-thread benchmark because of channel coordination and
     /// backpressure, so it is opt-in.
     pub ordered_phase4_emit: bool,
+    /// Policy for seeding external-memory phase 1 with fixed-depth packed
+    /// prefix keys. Disabled by default; pre-encoded dense byte texts can opt
+    /// into [`PackedPrefixSeedPolicy::DenseAlphabetOnly`] without allocating a
+    /// second text-sized buffer.
+    pub packed_prefix_seed: PackedPrefixSeedPolicy,
     /// Policy for reusing exact long-LCP intervals during phase-4 partition
     /// merges. Disabled by default; callers with long repeated contexts can
     /// opt into [`LcpMemoizationPolicy::Geometric`].
@@ -104,6 +110,7 @@ impl Default for ExtMemOpts {
             work_dir: std::env::temp_dir(),
             physical_file_count: 0,
             ordered_phase4_emit: false,
+            packed_prefix_seed: PackedPrefixSeedPolicy::Disabled,
             lcp_memoization: LcpMemoizationPolicy::Disabled,
             collect_lcp_memoization_stats: false,
         }
@@ -128,6 +135,10 @@ impl ExtMemOpts {
     /// - `CAPS_SA_N_PHYS`: physical backing-file count
     /// - `CAPS_SA_MAX_CONTEXT`: LCP comparison cap
     /// - `CAPS_SA_ORDERED_PHASE4=1|true|yes|on`: bounded ordered phase-4 emit
+    /// - `CAPS_SA_PACKED_PREFIX_SEED=1|true|yes|on`: packed phase-1 keys for a
+    ///   dense byte alphabet
+    /// - `CAPS_SA_PACKED_PREFIX_REMAP_BYTES`: packed phase-1 keys with this
+    ///   maximum ranked-text allocation
     /// - `CAPS_SA_GEOMETRIC_MEMO=1|true|yes|on`: geometric LCP memoization
     /// - `CAPS_SA_MEMO_PROBE`: ordinary symbols compared before table lookup
     /// - `CAPS_SA_MEMO_MIN_LCP`: minimum exact LCP admitted to the table
@@ -135,9 +146,11 @@ impl ExtMemOpts {
     /// - `CAPS_SA_MEMO_CAPACITY`: maximum entries per partition table
     /// - `CAPS_SA_MEMO_STATS=1|true|yes|on`: detailed memoization counters
     ///
-    /// Invalid and zero-valued numeric overrides are ignored, preserving the
-    /// corresponding defaults. Memoization tuning variables take effect only
-    /// when `CAPS_SA_GEOMETRIC_MEMO` enables the policy.
+    /// Invalid numeric overrides are ignored. Zero-valued count and
+    /// memoization overrides preserve their defaults; a zero remap budget is
+    /// valid and permits only already-dense inputs. Memoization tuning
+    /// variables take effect only when `CAPS_SA_GEOMETRIC_MEMO` enables the
+    /// policy.
     pub fn from_env() -> Self {
         let mut opts = Self::default();
         if let Some(dir) =
@@ -156,6 +169,11 @@ impl ExtMemOpts {
         }
         if read_env_bool("CAPS_SA_ORDERED_PHASE4") {
             opts.ordered_phase4_emit = true;
+        }
+        if let Some(max_extra_bytes) = read_env_usize("CAPS_SA_PACKED_PREFIX_REMAP_BYTES") {
+            opts.packed_prefix_seed = PackedPrefixSeedPolicy::remap(max_extra_bytes);
+        } else if read_env_bool("CAPS_SA_PACKED_PREFIX_SEED") {
+            opts.packed_prefix_seed = PackedPrefixSeedPolicy::DenseAlphabetOnly;
         }
         if read_env_bool("CAPS_SA_GEOMETRIC_MEMO") {
             let mut config = GeometricMemoizationConfig::default();
@@ -204,6 +222,12 @@ impl ExtMemOpts {
     /// Builder-style setter for [`Self::ordered_phase4_emit`].
     pub fn ordered_phase4_emit(mut self, ordered_phase4_emit: bool) -> Self {
         self.ordered_phase4_emit = ordered_phase4_emit;
+        self
+    }
+
+    /// Builder-style setter for [`Self::packed_prefix_seed`].
+    pub fn packed_prefix_seed(mut self, packed_prefix_seed: PackedPrefixSeedPolicy) -> Self {
+        self.packed_prefix_seed = packed_prefix_seed;
         self
     }
 
@@ -1467,6 +1491,27 @@ where
     (1..p).map(|i| sample[(i * m / p).min(m - 1)]).collect()
 }
 
+/// Prepare the optional packed seed only after all cheap eligibility checks.
+fn packed_prefix_seed_params<S: Symbol, L: LimitProvider>(
+    text: &[S],
+    lp: &L,
+    opts: &ExtMemOpts,
+) -> Option<(Packer, BoundaryRank)> {
+    if opts.packed_prefix_seed == PackedPrefixSeedPolicy::Disabled
+        || opts.max_context != usize::MAX
+        || std::any::TypeId::of::<S>() != std::any::TypeId::of::<u8>()
+    {
+        return None;
+    }
+
+    // `boundary_rank` is a semantic capability declaration, not the enable
+    // switch. Ask only after the caller has opted in and all cheap generic
+    // eligibility checks pass; then scan the alphabet at most once.
+    let rank = lp.boundary_rank()?;
+    let packer = crate::pack::seed_params(text, opts.packed_prefix_seed)?;
+    Some((packer, rank))
+}
+
 /// Sort each phase-1 subarray and distribute its sorted pieces directly to
 /// the final partition buckets.
 ///
@@ -1497,6 +1542,14 @@ where
     let chunk_size = n.div_ceil(p);
     let partition_buckets: Vec<Mutex<B>> = (0..p).map(|j| Mutex::new(mk_bucket(j))).collect();
     let task_local_sort = p >= rayon::current_num_threads().max(1);
+    let packed_seed = packed_prefix_seed_params(text, lp, opts);
+    if opts.packed_prefix_seed != PackedPrefixSeedPolicy::Disabled {
+        profile_log(if packed_seed.is_some() {
+            "phase1 packed-prefix seed active"
+        } else {
+            "phase1 packed-prefix seed unavailable; using comparison sort"
+        });
+    }
 
     (0..p).into_par_iter().try_for_each(|i| -> io::Result<()> {
         let start = (i * chunk_size).min(n);
@@ -1511,7 +1564,22 @@ where
         let mut sa_w = vec![I::zero(); len];
         let mut lcp_arr = vec![I::zero(); len];
         let mut lcp_w = vec![I::zero(); len];
-        if task_local_sort {
+        if let Some((packer, rank)) = packed_seed.as_ref() {
+            crate::pack::seed_subarray(
+                text,
+                lp,
+                packer,
+                *rank,
+                &mut sa,
+                &mut lcp_arr,
+                &mut sa_w,
+                &mut lcp_w,
+                dispatch,
+                task_local_sort,
+            );
+            // Sorted by key, with the merge kernel run only inside equal-key
+            // groups.
+        } else if task_local_sort {
             sample_sort::merge_sort_task_local(
                 text,
                 lp,
@@ -2346,6 +2414,11 @@ mod tests {
             // all touched variables before releasing it.
             unsafe { std::env::set_var(key, value) };
         }
+
+        fn remove(&self, key: &'static str) {
+            // Serialized and restored under ENV_LOCK, as in `set`.
+            unsafe { std::env::remove_var(key) };
+        }
     }
 
     impl Drop for EnvGuard {
@@ -2406,6 +2479,7 @@ mod tests {
     #[test]
     fn memoization_policy_defaults_to_disabled() {
         let opts = ExtMemOpts::default();
+        assert_eq!(opts.packed_prefix_seed, PackedPrefixSeedPolicy::Disabled);
         assert_eq!(opts.lcp_memoization, LcpMemoizationPolicy::Disabled);
         assert!(!opts.collect_lcp_memoization_stats);
 
@@ -2417,6 +2491,105 @@ mod tests {
         assert_eq!(
             LcpMemoizationPolicy::geometric(),
             LcpMemoizationPolicy::Geometric(config)
+        );
+    }
+
+    #[test]
+    fn packed_seed_policy_matches_direct_external_output() {
+        let dense: Vec<u8> = (0..4096).map(|i| ((i * 17 + i / 13) % 6) as u8).collect();
+        let direct = ext_mem_sa(&dense, 17);
+
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts::default()
+            .subproblem_count(17)
+            .physical_file_count(1)
+            .work_dir(dir.path())
+            .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
+        let mut seeded = Vec::with_capacity(dense.len());
+        build_ext_mem(&dense, &opts, |pos| {
+            seeded.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seeded, direct);
+
+        let gapped: Vec<u8> = dense.iter().map(|&b| b.saturating_mul(17)).collect();
+        let direct = ext_mem_sa(&gapped, 17);
+        let dir = tempdir().unwrap();
+        let opts = ExtMemOpts::default()
+            .subproblem_count(17)
+            .physical_file_count(1)
+            .work_dir(dir.path())
+            .packed_prefix_seed(PackedPrefixSeedPolicy::remap(gapped.len()));
+        let mut seeded = Vec::with_capacity(gapped.len());
+        build_ext_mem(&gapped, &opts, |pos| {
+            seeded.push(pos);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seeded, direct);
+    }
+
+    #[test]
+    fn packed_seed_eligibility_precedes_provider_query() {
+        struct UnexpectedRank(usize);
+        impl LimitProvider for UnexpectedRank {
+            fn lim_at(&self, p: usize) -> usize {
+                self.0 - p
+            }
+
+            fn boundary_rank(&self) -> Option<BoundaryRank> {
+                panic!("ineligible seed must not query boundary_rank")
+            }
+        }
+
+        let text = [0u8, 1, 2, 3];
+        let lp = UnexpectedRank(text.len());
+        assert!(packed_prefix_seed_params(&text, &lp, &ExtMemOpts::default()).is_none());
+
+        let finite = ExtMemOpts::default()
+            .max_context(3)
+            .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
+        assert!(packed_prefix_seed_params(&text, &lp, &finite).is_none());
+
+        let signed = [0i8, 1, 2, 3];
+        let enabled =
+            ExtMemOpts::default().packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);
+        assert!(packed_prefix_seed_params(&signed, &lp, &enabled).is_none());
+
+        struct NoRank(usize);
+        impl LimitProvider for NoRank {
+            fn lim_at(&self, p: usize) -> usize {
+                self.0 - p
+            }
+        }
+        assert!(packed_prefix_seed_params(&text, &NoRank(text.len()), &enabled).is_none());
+    }
+
+    #[test]
+    fn from_env_parses_packed_seed_policy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "CAPS_SA_PACKED_PREFIX_SEED",
+            "CAPS_SA_PACKED_PREFIX_REMAP_BYTES",
+        ];
+        let env = EnvGuard::capture(&keys);
+        for &key in &keys {
+            env.remove(key);
+        }
+
+        env.set("CAPS_SA_PACKED_PREFIX_SEED", "true");
+        assert_eq!(
+            ExtMemOpts::from_env().packed_prefix_seed,
+            PackedPrefixSeedPolicy::DenseAlphabetOnly
+        );
+
+        env.set("CAPS_SA_PACKED_PREFIX_REMAP_BYTES", "12345");
+        assert_eq!(
+            ExtMemOpts::from_env().packed_prefix_seed,
+            PackedPrefixSeedPolicy::Remap {
+                max_extra_bytes: 12_345,
+            }
         );
     }
 
