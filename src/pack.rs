@@ -513,8 +513,24 @@ mod tests {
     }
 
     #[test]
-    fn seed_lcps_are_exact_below_at_and_above_key_depth() {
-        // Three isolated pairs share k-1, k, and k+1 symbols. With alphabet
+    fn seed_requires_a_reserved_boundary_code() {
+        let with_sentinel: Vec<u8> = (0..=254).collect();
+        let packer = seed_params(&with_sentinel, PackedPrefixSeedPolicy::DenseAlphabetOnly)
+            .expect("255 byte values leave one u8 code for the boundary");
+        assert_eq!(packer.bits, 8);
+        assert_eq!(packer.k, 8);
+
+        let all_bytes: Vec<u8> = (0..=255).collect();
+        assert!(
+            seed_params(&all_bytes, PackedPrefixSeedPolicy::DenseAlphabetOnly).is_none(),
+            "all 256 byte values leave no boundary code and must fall back",
+        );
+    }
+
+    #[test]
+    fn seed_lcps_are_exact_at_key_depths_and_boundary_ties() {
+        // Three isolated pairs share k-1, k, and k+1 symbols, and the last pair
+        // is identical through a simultaneous segment boundary. With alphabet
         // 0..=2 plus one reserved boundary code, fields are two bits and k=32.
         let k = 32usize;
         let segments = [
@@ -524,6 +540,8 @@ mod tests {
             [vec![1; k], vec![2]].concat(),
             [vec![2; k + 1], vec![0]].concat(),
             [vec![2; k + 1], vec![1]].concat(),
+            vec![0; k + 2],
+            vec![0; k + 2],
         ];
         let lengths: Vec<usize> = segments.iter().map(Vec::len).collect();
         let mut starts = Vec::with_capacity(segments.len());
@@ -532,11 +550,16 @@ mod tests {
             starts.push(text.len() as u32);
             text.extend_from_slice(segment);
         }
-        let lp = SegmentedText::from_lengths(text.len(), &lengths);
         let packer = seed_params(&text, PackedPrefixSeedPolicy::DenseAlphabetOnly).unwrap();
         assert_eq!(packer.k, k);
 
-        check_sorted(&text, &lp, starts);
+        let shorter_first = SegmentedText::from_lengths(text.len(), &lengths);
+        check_sorted(&text, &shorter_first, starts.clone());
+
+        let longer_first = StarSegmented {
+            inner: SegmentedText::from_lengths(text.len(), &lengths),
+        };
+        check_sorted(&text, &longer_first, starts);
     }
 
     /// Segment ends for a spacer-separated text: one past each maximal

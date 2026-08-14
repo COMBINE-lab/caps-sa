@@ -73,7 +73,8 @@ cargo build --release --example rustar_segmented_bench
 
 CAPS_SA_PROFILE=1 taskset -c 0-31 \
   target/release/examples/rustar_segmented_bench /path/to/fixture \
-  --threads 32 --repeat 3 --work-dir /path/to/fast/temp
+  --threads 32 --repeat 3 --work-dir /path/to/fast/temp \
+  --packed-prefix-seed
 ```
 
 Omit `taskset` on platforms where it is unavailable. Use `--in-mem` only for
@@ -81,6 +82,13 @@ fixtures that fit comfortably in RAM. Counts and 128-bit order-sensitive
 checksums are useful regression signals, but hashes are not proofs of equality;
 release validation should compare emitted position streams exactly or use a
 direct suffix comparator on a smaller fixture.
+
+For a packed-prefix A/B, use `--packed-prefix-seed` for the candidate and
+`--no-packed-prefix-seed` for the comparison; these override the corresponding
+`ExtMemOpts::from_env()` policy. Combined with `--packed-prefix-seed`,
+`--no-boundary-rank` is a separate negative control that keeps the policy
+enabled but makes the provider semantically ineligible, verifying the
+automatic fallback path.
 
 ## Results
 

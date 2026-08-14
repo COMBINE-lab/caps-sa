@@ -78,7 +78,7 @@ with a fixed-depth packed prefix key. Pre-encoded dense alphabets use no
 text-sized copy:
 
 ```rust
-use caps_sa::PackedPrefixSeedPolicy;
+use caps_sa::{ExtMemOpts, PackedPrefixSeedPolicy};
 
 let opts = ExtMemOpts::default()
     .packed_prefix_seed(PackedPrefixSeedPolicy::DenseAlphabetOnly);

@@ -37,9 +37,9 @@ seconds. All 359,616,038 emitted positions matched the reference.
 
 ## Optional packed-prefix phase-1 seed
 
-The opt-in packed-prefix seed was measured against the current 0.7.0 main on
-the same complete fixture, with one warm-up followed by three interleaved
-measured runs. Values below are medians:
+The opt-in packed-prefix seed was measured against the released v0.7.0
+baseline on the same complete fixture, with one warm-up followed by three
+interleaved measured runs. Values below are medians:
 
 | Configuration | Build | User CPU | Peak RSS | Phase 1 | Phase 4 |
 | --- | ---: | ---: | ---: | ---: | ---: |
